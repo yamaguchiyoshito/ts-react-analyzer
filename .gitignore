@@ -1,0 +1,10 @@
+node_modules/
+dist/
+
+.cache/
+.ts-analyzer-cache/
+
+analysis.log
+tests/fixtures/sample-app/analysis.log
+tests/fixtures/sample-app/tmp-cli-report/
+tests/fixtures/sample-app/tmp-report-output/
