@@ -7,8 +7,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 
-import { ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, FileScanner, GraphBuilder, QualityReportGenerator, ReportGenerator } from "../src/core/index.js";
-import type { AnalysisResult, Dependency, GraphMetrics, QualityReport } from "../src/types/index.js";
+import { ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, FileScanner, GraphBuilder, QualityDiffGenerator, QualityReportGenerator, ReportGenerator } from "../src/core/index.js";
+import type { AnalysisResult, Dependency, GraphMetrics, QualityDiffReport, QualityReport } from "../src/types/index.js";
 
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const sampleProject = path.join(workspaceRoot, "tests", "fixtures", "sample-app");
@@ -465,6 +465,78 @@ test("QualityReportGenerator writes quality outputs with automatic and manual me
   await fs.rm(config.cacheDir, { recursive: true, force: true });
 });
 
+test("CLI quality collect auto-loads quality.manual.json and merges manual metrics", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-manual-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+      jsx: "react-jsx",
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.tsx"), "export const App = () => <main>app</main>;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "requirements.csv"), "id,status\nREQ-1,implemented\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "quality.manual.json"), JSON.stringify({
+    metrics: [
+      {
+        id: "requirements_traceability",
+        actual: "100%",
+        threshold: "100%",
+        verdict: "pass",
+        summary: "要件台帳と実装の照合が完了しています。",
+        evidence: [
+          {
+            type: "file",
+            label: "requirements",
+            filePath: "./requirements.csv",
+            value: "要件台帳",
+          },
+        ],
+      },
+      {
+        id: "residual_bug_count",
+        actual: "High=0, Medium=1, Low=2",
+        threshold: "High=0",
+        verdict: "pass",
+        summary: "重大障害は残存していません。",
+      },
+    ],
+  }, null, 2), "utf8");
+
+  await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality",
+    "collect",
+    projectRoot,
+    "--output",
+    outputDir,
+    "--prefix",
+    "manual-quality",
+    "--format",
+    "json",
+  ]);
+
+  const report = JSON.parse(await fs.readFile(path.join(outputDir, "manual-quality_quality_report.json"), "utf8")) as QualityReport;
+  const functionalCategory = report.categories.find((category) => category.id === "functional");
+  const requirementsMetric = functionalCategory!.metrics.find((metric) => metric.id === "requirements_traceability");
+  const bugMetric = functionalCategory!.metrics.find((metric) => metric.id === "residual_bug_count");
+
+  assert.equal(requirementsMetric?.automation, "manual");
+  assert.equal(requirementsMetric?.verdict, "pass");
+  assert.equal(requirementsMetric?.actual, "100%");
+  assert.match(requirementsMetric?.evidence?.[0]?.filePath ?? "", /requirements\.csv$/u);
+  assert.equal(bugMetric?.verdict, "pass");
+  assert.equal(bugMetric?.actual, "High=0, Medium=1, Low=2");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
 test("QualityReportGenerator imports JUnit and LCOV artifacts into test metrics", async () => {
   const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-artifacts-"));
   const outputDir = path.join(projectRoot, "out");
@@ -855,6 +927,116 @@ test("QualityReportGenerator excludes test and story files from strict code and 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
 
+test("QualityReportGenerator imports API and security artifacts into automatic metrics", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-api-security-"));
+  const outputDir = path.join(projectRoot, "out");
+  const reportsDir = path.join(projectRoot, "reports");
+
+  await fs.mkdir(path.join(projectRoot, "src", "api"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "mocks"), { recursive: true });
+  await fs.mkdir(reportsDir, { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "openapi.yaml"), "openapi: 3.1.0\ninfo:\n  title: Sample API\n  version: 1.0.0\npaths: {}\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "api", "client.ts"), "import { z } from 'zod';\nconst timeout = 3000;\nconst retry = 2;\nexport const schema = z.object({ timeout: z.number() });\nexport const clientConfig = { timeout, retry };\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "mocks", "handlers.ts"), "import { http } from 'msw';\nexport const handlers = [http.get('/api/orders', () => new Response())];\n", "utf8");
+  await fs.writeFile(path.join(reportsDir, "openapi-diff.json"), JSON.stringify({
+    breakingDifferences: [],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(reportsDir, "npm-audit.json"), JSON.stringify({
+    metadata: {
+      vulnerabilities: {
+        low: 0,
+        moderate: 0,
+        high: 0,
+        critical: 0,
+      },
+    },
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(reportsDir, "trivy-results.json"), JSON.stringify({
+    Results: [{
+      Vulnerabilities: [{
+        VulnerabilityID: "CVE-2024-0001",
+        Severity: "HIGH",
+      }],
+    }],
+  }, null, 2), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "api-security-quality",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const qualityReportGenerator = new QualityReportGenerator();
+  const report = await qualityReportGenerator.generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 925,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "api-security-quality",
+    formats: ["json"],
+  });
+
+  const apiCategory = report.categories.find((category) => category.id === "api");
+  const securityCategory = report.categories.find((category) => category.id === "security");
+  const openApiMetric = apiCategory!.metrics.find((metric) => metric.id === "openapi_contract");
+  const mswMetric = apiCategory!.metrics.find((metric) => metric.id === "msw_alignment");
+  const timeoutMetric = apiCategory!.metrics.find((metric) => metric.id === "timeout_retry");
+  const zodMetric = apiCategory!.metrics.find((metric) => metric.id === "zod_adoption");
+  const vulnerabilityMetric = securityCategory!.metrics.find((metric) => metric.id === "dependency_vulnerabilities");
+
+  assert.equal(openApiMetric?.automation, "automatic");
+  assert.equal(openApiMetric?.verdict, "pass");
+  assert.equal(mswMetric?.automation, "automatic");
+  assert.equal(mswMetric?.verdict, "pass");
+  assert.equal(timeoutMetric?.automation, "automatic");
+  assert.equal(timeoutMetric?.verdict, "pass");
+  assert.equal(zodMetric?.verdict, "pass");
+  assert.equal(vulnerabilityMetric?.automation, "automatic");
+  assert.equal(vulnerabilityMetric?.verdict, "fail");
+  assert.match(vulnerabilityMetric?.actual ?? "", /trivy\(critical=0,high=1\)/u);
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
 test("CLI quality gate exits with code 2 when automatic quality metrics fail", async () => {
   const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-gate-fail-"));
   const outputDir = path.join(projectRoot, "out");
@@ -894,6 +1076,419 @@ test("CLI quality gate exits with code 2 when automatic quality metrics fail", a
   const reportPath = path.join(outputDir, "cli-quality_quality_report.json");
   const gateReport = JSON.parse(await fs.readFile(reportPath, "utf8")) as QualityReport;
   assert.equal(gateReport.summary.overallVerdict, "fail");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityDiffGenerator compares quality reports and marks regressions and improvements", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-diff-"));
+  const outputDir = path.join(projectRoot, "out");
+  const generator = new QualityDiffGenerator();
+
+  const baseline: QualityReport = {
+    timestamp: "2026-03-20T00:00:00.000Z",
+    executionTimeMs: 100,
+    projectRoot,
+    summary: {
+      totalMetrics: 2,
+      passCount: 1,
+      warnCount: 0,
+      failCount: 0,
+      manualCount: 1,
+      notApplicableCount: 0,
+      overallVerdict: "manual",
+    },
+    categories: [
+      {
+        id: "functional",
+        label: "機能品質",
+        verdict: "manual",
+        summary: "手動確認が残っています。",
+        metrics: [
+          {
+            id: "requirements_traceability",
+            category: "functional",
+            label: "要件適合率",
+            actual: "manual",
+            threshold: "100%",
+            verdict: "manual",
+            automation: "manual",
+            summary: "台帳未投入",
+            evidence: [],
+          },
+        ],
+      },
+      {
+        id: "code",
+        label: "コード品質",
+        verdict: "pass",
+        summary: "型エラーなし",
+        metrics: [
+          {
+            id: "typescript_errors",
+            category: "code",
+            label: "TypeScript型エラー数",
+            actual: "0",
+            threshold: "0",
+            verdict: "pass",
+            automation: "automatic",
+            summary: "型エラーはありません。",
+            evidence: [],
+          },
+        ],
+      },
+    ],
+  };
+
+  const current: QualityReport = {
+    timestamp: "2026-03-26T00:00:00.000Z",
+    executionTimeMs: 120,
+    projectRoot,
+    summary: {
+      totalMetrics: 3,
+      passCount: 1,
+      warnCount: 0,
+      failCount: 1,
+      manualCount: 1,
+      notApplicableCount: 0,
+      overallVerdict: "fail",
+    },
+    categories: [
+      {
+        id: "functional",
+        label: "機能品質",
+        verdict: "pass",
+        summary: "要件照合完了",
+        metrics: [
+          {
+            id: "requirements_traceability",
+            category: "functional",
+            label: "要件適合率",
+            actual: "100%",
+            threshold: "100%",
+            verdict: "pass",
+            automation: "manual",
+            summary: "台帳照合完了",
+            evidence: [],
+          },
+        ],
+      },
+      {
+        id: "code",
+        label: "コード品質",
+        verdict: "fail",
+        summary: "型エラーあり",
+        metrics: [
+          {
+            id: "typescript_errors",
+            category: "code",
+            label: "TypeScript型エラー数",
+            actual: "3",
+            threshold: "0",
+            verdict: "fail",
+            automation: "automatic",
+            summary: "型エラーを検出しました。",
+            evidence: [],
+          },
+        ],
+      },
+      {
+        id: "security",
+        label: "セキュリティ品質",
+        verdict: "warn",
+        summary: "新規監査項目",
+        metrics: [
+          {
+            id: "dependency_vulnerabilities",
+            category: "security",
+            label: "依存ライブラリ脆弱性",
+            actual: "npm(high=0,critical=0) / trivy(high=0,critical=0)",
+            threshold: "High=0, Critical=0",
+            verdict: "warn",
+            automation: "automatic",
+            summary: "新しい監査項目です。",
+            evidence: [],
+          },
+        ],
+      },
+    ],
+  };
+
+  const diff = generator.compare(current, baseline, "/tmp/baseline-quality.json", "/tmp/current-quality.json");
+  await generator.writeReports(diff, outputDir, "quality-delta", ["json", "markdown", "html"]);
+
+  assert.equal(diff.summary.regressedMetrics, 1);
+  assert.equal(diff.summary.improvedMetrics, 1);
+  assert.equal(diff.summary.addedMetrics, 1);
+  assert.equal(diff.summary.automaticRegressions, 1);
+  const typeScriptDiff = diff.metrics.find((metric) => metric.id === "typescript_errors");
+  const traceabilityDiff = diff.metrics.find((metric) => metric.id === "requirements_traceability");
+  assert.equal(typeScriptDiff?.trend, "regressed");
+  assert.equal(typeScriptDiff?.status, "changed");
+  assert.equal(traceabilityDiff?.trend, "improved");
+  assert.equal(traceabilityDiff?.status, "changed");
+
+  const files = await fs.readdir(outputDir);
+  assert.ok(files.includes("quality-delta_quality_diff.json"));
+  assert.ok(files.includes("quality-delta_quality_diff.md"));
+  assert.ok(files.includes("quality-delta_quality_diff.html"));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("CLI quality diff compares current report against baseline quality report", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-diff-cli-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.ts"), "export const appName = 'release';\n", "utf8");
+
+  await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality",
+    "collect",
+    projectRoot,
+    "--output",
+    outputDir,
+    "--prefix",
+    "release-quality",
+    "--format",
+    "json",
+  ]);
+
+  await fs.writeFile(path.join(projectRoot, "src", "App.ts"), "export const apiKey = \"production-secret\";\n", "utf8");
+
+  await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality",
+    "diff",
+    projectRoot,
+    "--output",
+    outputDir,
+    "--prefix",
+    "release-quality",
+    "--format",
+    "json,markdown",
+  ]);
+
+  const diff = JSON.parse(
+    await fs.readFile(path.join(outputDir, "release-quality_quality_diff.json"), "utf8"),
+  ) as QualityDiffReport;
+  const secretDiff = diff.metrics.find((metric) => metric.id === "secret_indicators");
+
+  assert.ok(diff.summary.regressedMetrics >= 1);
+  assert.ok(diff.summary.automaticRegressions >= 1);
+  assert.equal(secretDiff?.trend, "regressed");
+  assert.equal(secretDiff?.baselineVerdict, "pass");
+  assert.equal(secretDiff?.currentVerdict, "fail");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("CLI quality gate exits with code 2 when automatic metrics regress from baseline", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-gate-regression-"));
+  const outputDir = path.join(projectRoot, "out");
+  const baselinePath = path.join(outputDir, "regression-quality_quality_report.json");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.ts"), "export const appName = 'release';\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.test.ts"), "import { appName } from './App';\nvoid appName;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "README.md"), "# Release checklist\n", "utf8");
+
+  await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality",
+    "collect",
+    projectRoot,
+    "--output",
+    outputDir,
+    "--prefix",
+    "regression-quality",
+    "--format",
+    "json",
+  ]);
+
+  await fs.rm(path.join(projectRoot, "README.md"), { force: true });
+
+  try {
+    await execFileAsync("node", [
+      path.join(workspaceRoot, "dist", "src", "cli.js"),
+      "quality",
+      "gate",
+      projectRoot,
+      "--output",
+      outputDir,
+      "--prefix",
+      "regression-quality",
+      "--baseline",
+      baselinePath,
+      "--format",
+      "json,markdown",
+    ]);
+    assert.fail("quality gate should fail when automatic metrics regress from the baseline");
+  } catch (error) {
+    const typedError = error as { code?: number };
+    assert.equal(typedError.code, 2);
+  }
+
+  const diff = JSON.parse(
+    await fs.readFile(path.join(outputDir, "regression-quality_quality_diff.json"), "utf8"),
+  ) as QualityDiffReport;
+  const documentationDiff = diff.metrics.find((metric) => metric.id === "documentation_presence");
+
+  assert.ok(diff.summary.automaticRegressions >= 1);
+  assert.equal(documentationDiff?.trend, "regressed");
+  assert.equal(documentationDiff?.baselineVerdict, "pass");
+  assert.equal(documentationDiff?.currentVerdict, "warn");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("CLI quality gate allows monitored regression metrics from analyzer config", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-gate-monitoring-"));
+  const outputDir = path.join(projectRoot, "out");
+  const baselinePath = path.join(outputDir, "monitoring-quality_quality_report.json");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "analyzer.config.json"), JSON.stringify({
+    qualityGateMonitoringMetricIds: ["documentation_presence"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.ts"), "export const appName = 'release';\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.test.ts"), "import { appName } from './App';\nvoid appName;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "README.md"), "# Release checklist\n", "utf8");
+
+  await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality",
+    "collect",
+    projectRoot,
+    "--output",
+    outputDir,
+    "--prefix",
+    "monitoring-quality",
+    "--format",
+    "json",
+  ]);
+
+  await fs.rm(path.join(projectRoot, "README.md"), { force: true });
+
+  await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality",
+    "gate",
+    projectRoot,
+    "--output",
+    outputDir,
+    "--prefix",
+    "monitoring-quality",
+    "--baseline",
+    baselinePath,
+    "--format",
+    "json",
+  ]);
+
+  const diff = JSON.parse(
+    await fs.readFile(path.join(outputDir, "monitoring-quality_quality_diff.json"), "utf8"),
+  ) as QualityDiffReport;
+  const documentationDiff = diff.metrics.find((metric) => metric.id === "documentation_presence");
+
+  assert.equal(documentationDiff?.trend, "regressed");
+  assert.equal(documentationDiff?.baselineVerdict, "pass");
+  assert.equal(documentationDiff?.currentVerdict, "warn");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("CLI quality gate blocking metric list narrows regression gate scope", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-gate-blocking-"));
+  const outputDir = path.join(projectRoot, "out");
+  const baselinePath = path.join(outputDir, "blocking-quality_quality_report.json");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.ts"), "export const appName = 'release';\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.test.ts"), "import { appName } from './App';\nvoid appName;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "README.md"), "# Release checklist\n", "utf8");
+
+  await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality",
+    "collect",
+    projectRoot,
+    "--output",
+    outputDir,
+    "--prefix",
+    "blocking-quality",
+    "--format",
+    "json",
+  ]);
+
+  await fs.rm(path.join(projectRoot, "README.md"), { force: true });
+
+  await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality",
+    "gate",
+    projectRoot,
+    "--output",
+    outputDir,
+    "--prefix",
+    "blocking-quality",
+    "--baseline",
+    baselinePath,
+    "--quality-gate-blocking-metrics",
+    "secret_indicators",
+    "--format",
+    "json",
+  ]);
+
+  const diff = JSON.parse(
+    await fs.readFile(path.join(outputDir, "blocking-quality_quality_diff.json"), "utf8"),
+  ) as QualityDiffReport;
+  const documentationDiff = diff.metrics.find((metric) => metric.id === "documentation_presence");
+
+  assert.equal(documentationDiff?.trend, "regressed");
+  assert.equal(documentationDiff?.baselineVerdict, "pass");
+  assert.equal(documentationDiff?.currentVerdict, "warn");
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });

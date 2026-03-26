@@ -90,6 +90,21 @@ export class ConfigManager {
     if (typeof args.logFile === "string") {
       cliConfig.logFile = args.logFile;
     }
+    if (typeof args.manualInput === "string") {
+      cliConfig.manualInputPath = args.manualInput;
+    }
+    if (typeof args.qualityGateBlockingMetrics === "string") {
+      cliConfig.qualityGateBlockingMetricIds = args.qualityGateBlockingMetrics
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+    }
+    if (typeof args.qualityGateMonitoringMetrics === "string") {
+      cliConfig.qualityGateMonitoringMetricIds = args.qualityGateMonitoringMetrics
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+    }
 
     return cliConfig;
   }
@@ -153,6 +168,21 @@ export class ConfigManager {
     if (env.ANALYZER_LOG_FILE) {
       envConfig.logFile = env.ANALYZER_LOG_FILE;
     }
+    if (env.ANALYZER_MANUAL_INPUT) {
+      envConfig.manualInputPath = env.ANALYZER_MANUAL_INPUT;
+    }
+    if (env.ANALYZER_QUALITY_GATE_BLOCKING_METRICS) {
+      envConfig.qualityGateBlockingMetricIds = env.ANALYZER_QUALITY_GATE_BLOCKING_METRICS
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+    }
+    if (env.ANALYZER_QUALITY_GATE_MONITORING_METRICS) {
+      envConfig.qualityGateMonitoringMetricIds = env.ANALYZER_QUALITY_GATE_MONITORING_METRICS
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+    }
 
     return envConfig;
   }
@@ -177,6 +207,11 @@ export class ConfigManager {
 
         if (key === "outputFormats" && Array.isArray(value)) {
           merged.outputFormats = [...value] as OutputFormat[];
+          continue;
+        }
+
+        if ((key === "qualityGateBlockingMetricIds" || key === "qualityGateMonitoringMetricIds") && Array.isArray(value)) {
+          (merged as unknown as Record<string, unknown>)[key] = [...value];
           continue;
         }
 
@@ -222,6 +257,9 @@ export class ConfigManager {
       enableCache: true,
       cacheDir: "./.ts-analyzer-cache",
       logFile: "./analysis.log",
+      manualInputPath: undefined,
+      qualityGateBlockingMetricIds: [],
+      qualityGateMonitoringMetricIds: [],
       tsCompilerOptions: {},
       pathMappings: {},
     };
@@ -232,6 +270,8 @@ export class ConfigManager {
       ...config,
       excludePatterns: [...config.excludePatterns],
       outputFormats: [...config.outputFormats],
+      qualityGateBlockingMetricIds: [...config.qualityGateBlockingMetricIds],
+      qualityGateMonitoringMetricIds: [...config.qualityGateMonitoringMetricIds],
       tsCompilerOptions: { ...config.tsCompilerOptions },
       pathMappings: { ...config.pathMappings },
     };

@@ -2,14 +2,17 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import ts from "typescript";
 
+import { ApiArtifactAnalyzer } from "./ApiArtifactAnalyzer.js";
 import { BrowserAuditAnalyzer } from "./BrowserAuditAnalyzer.js";
 import { TestArtifactAnalyzer } from "./TestArtifactAnalyzer.js";
 import { TypeCheckAnalyzer } from "./TypeCheckAnalyzer.js";
 import { UiTestArtifactAnalyzer } from "./UiTestArtifactAnalyzer.js";
+import { SecurityArtifactAnalyzer } from "./SecurityArtifactAnalyzer.js";
 import type {
   AnalysisResult,
   GraphMetrics,
   ParsedFile,
+  ManualQualityMetricInput,
   QualityCategoryId,
   QualityCategoryReport,
   QualityEvidence,
@@ -26,6 +29,7 @@ interface QualityGenerationInput {
   graphMetrics: GraphMetrics;
   executionTimeMs: number;
   tsConfigPath?: string;
+  manualInputs?: ManualQualityMetricInput[];
 }
 
 interface QualityGenerationOptions {
@@ -98,6 +102,8 @@ export class QualityReportGenerator {
     const browserAuditSummary = await new BrowserAuditAnalyzer().analyzeProject(input.projectRoot);
     const testArtifactSummary = await new TestArtifactAnalyzer().analyzeProject(input.projectRoot);
     const uiTestArtifactSummary = await new UiTestArtifactAnalyzer().analyzeProject(input.projectRoot);
+    const apiArtifactSummary = await new ApiArtifactAnalyzer().analyzeProject(input.projectRoot, input.parsedFiles);
+    const securityArtifactSummary = await new SecurityArtifactAnalyzer().analyzeProject(input.projectRoot);
     const dangerousHtml = this.collectDangerousHtml(strictQualityParsedFiles);
     const hardcodedJsxText = this.collectHardcodedJsxText(input.parsedFiles);
     const secretIndicators = this.collectSecretIndicators(strictQualityParsedFiles);
@@ -142,10 +148,10 @@ export class QualityReportGenerator {
     for (const metric of this.buildTestMetrics(testPresence, testArtifactSummary, uiTestArtifactSummary)) {
       pushMetric(metric);
     }
-    for (const metric of this.buildApiMetrics(zodAdoption)) {
+    for (const metric of this.buildApiMetrics(zodAdoption, apiArtifactSummary)) {
       pushMetric(metric);
     }
-    for (const metric of this.buildSecurityMetrics(dangerousHtml, secretIndicators)) {
+    for (const metric of this.buildSecurityMetrics(dangerousHtml, secretIndicators, securityArtifactSummary)) {
       pushMetric(metric);
     }
     for (const metric of this.buildI18nMetrics(hardcodedJsxText)) {
@@ -171,13 +177,14 @@ export class QualityReportGenerator {
         metrics,
       } satisfies QualityCategoryReport;
     });
+    const mergedCategoryReports = this.applyManualInputs(categoryReports, input.manualInputs ?? []);
 
     return {
       timestamp: new Date().toISOString(),
       executionTimeMs: input.executionTimeMs,
       projectRoot: input.projectRoot,
-      summary: this.calculateSummary(categoryReports),
-      categories: categoryReports,
+      summary: this.calculateSummary(mergedCategoryReports),
+      categories: mergedCategoryReports,
     };
   }
 
@@ -462,7 +469,10 @@ export class QualityReportGenerator {
     ];
   }
 
-  private buildApiMetrics(zodAdoption: { totalFiles: number; adoptedFiles: number; rate: number }): QualityMetricReport[] {
+  private buildApiMetrics(
+    zodAdoption: { totalFiles: number; adoptedFiles: number; rate: number },
+    apiArtifactSummary: Awaited<ReturnType<ApiArtifactAnalyzer["analyzeProject"]>>,
+  ): QualityMetricReport[] {
     const verdict: QualityVerdict = zodAdoption.totalFiles === 0
       ? "not_applicable"
       : zodAdoption.rate >= 80
@@ -470,12 +480,62 @@ export class QualityReportGenerator {
         : zodAdoption.rate >= 50
           ? "warn"
           : "fail";
+    const openApiMetric = apiArtifactSummary.openApi?.breakingChanges !== null && apiArtifactSummary.openApi
+      ? this.metric(
+        "api",
+        "openapi_contract",
+        "APIレスポンス整合性",
+        `breaking=${apiArtifactSummary.openApi.breakingChanges}`,
+        "breaking=0",
+        apiArtifactSummary.openApi.breakingChanges === 0 ? "pass" : "fail",
+        "OpenAPI diff / validation JSON から breaking change 数を集計しています。",
+        [
+          ...apiArtifactSummary.openApi.diffFiles.map((filePath) => this.fileEvidence("openapi-diff", filePath)),
+          ...apiArtifactSummary.openApi.specFiles.map((filePath) => this.fileEvidence("openapi-spec", filePath)),
+        ],
+      )
+      : this.metric(
+        "api",
+        "openapi_contract",
+        "APIレスポンス整合性",
+        apiArtifactSummary.openApi?.specFiles.length ? "specあり / diffなし" : "証跡未収集",
+        "breaking=0",
+        "manual",
+        apiArtifactSummary.openApi?.specFiles.length
+          ? "OpenAPI spec は見つかりましたが diff / validation 証跡がないため手動入力扱いです。"
+          : "OpenAPI diff / validation 証跡が見つからないため手動入力扱いです。",
+        apiArtifactSummary.openApi?.specFiles.map((filePath) => this.fileEvidence("openapi-spec", filePath)) ?? [],
+      );
+    const mswMetric = apiArtifactSummary.msw.apiFileCount === 0
+      ? this.metric("api", "msw_alignment", "MSWとの整合性（採用シグナル）", "対象API層なし", "N/A", "not_applicable", "API 層ファイルがないため対象外です。", [])
+      : this.metric(
+        "api",
+        "msw_alignment",
+        "MSWとの整合性（採用シグナル）",
+        `handlers=${apiArtifactSummary.msw.handlerCount}`,
+        ">= 1",
+        apiArtifactSummary.msw.handlerCount > 0 ? "pass" : "warn",
+        "MSW handler 定義の存在を API 層ファイル数に対して評価しています。",
+        apiArtifactSummary.msw.handlerFiles.map((filePath) => this.fileEvidence("msw", filePath)),
+      );
+    const timeoutRetryMetric = apiArtifactSummary.timeoutRetry.apiFileCount === 0
+      ? this.metric("api", "timeout_retry", "タイムアウト/リトライ設計有無", "対象API層なし", "N/A", "not_applicable", "API 層ファイルがないため対象外です。", [])
+      : this.metric(
+        "api",
+        "timeout_retry",
+        "タイムアウト/リトライ設計有無",
+        `${apiArtifactSummary.timeoutRetry.resilientFiles.length}/${apiArtifactSummary.timeoutRetry.apiFileCount} files`,
+        ">= 1 file",
+        apiArtifactSummary.timeoutRetry.resilientFiles.length > 0 ? "pass" : "warn",
+        "AbortController / timeout / retry 系シグナルを API 層ファイルから検出しています。",
+        apiArtifactSummary.timeoutRetry.resilientFiles.map((filePath) => this.fileEvidence("timeout-retry", filePath)),
+      );
 
     return [
-      this.manualMetric("api", "openapi_contract", "APIレスポンス整合性", "OpenAPI一致", "OpenAPI 差分取込が未実装です。"),
+      openApiMetric,
       this.manualMetric("api", "error_handling", "エラーハンドリング網羅率", "100%", "API エラー時の実行証跡が必要です。"),
-      this.manualMetric("api", "timeout_retry", "タイムアウト/リトライ設計有無", "定義済み", "HTTP client 設定の機械判定は未実装です。"),
-      this.manualMetric("api", "msw_alignment", "MSWとの整合性", "一致", "MSW ハンドラとの差分検査が未実装です。"),
+      timeoutRetryMetric,
+      mswMetric,
       this.metric("api", "zod_adoption", "データ型検証採用率（zod静的推定）", zodAdoption.totalFiles === 0 ? "対象API層なし" : `${zodAdoption.rate.toFixed(1)}%`, ">= 80%", verdict, "API / validation / schema 系ファイルで zod import を検出しています。", [
         this.noteEvidence("対象ファイル数", String(zodAdoption.totalFiles)),
         this.noteEvidence("採用ファイル数", String(zodAdoption.adoptedFiles)),
@@ -483,15 +543,31 @@ export class QualityReportGenerator {
     ];
   }
 
-  private buildSecurityMetrics(dangerousHtml: AuditFinding[], secretIndicators: AuditFinding[]): QualityMetricReport[] {
+  private buildSecurityMetrics(
+    dangerousHtml: AuditFinding[],
+    secretIndicators: AuditFinding[],
+    securityArtifactSummary: Awaited<ReturnType<SecurityArtifactAnalyzer["analyzeProject"]>>,
+  ): QualityMetricReport[] {
     const dangerousVerdict: QualityVerdict = dangerousHtml.length === 0 ? "pass" : "fail";
     const secretVerdict: QualityVerdict = secretIndicators.length === 0 ? "pass" : "fail";
+    const vulnerabilityMetric = securityArtifactSummary.tools.length > 0
+      ? this.metric(
+        "security",
+        "dependency_vulnerabilities",
+        "依存ライブラリ脆弱性",
+        securityArtifactSummary.tools.map((tool) => `${tool.tool}(critical=${tool.critical},high=${tool.high})`).join(", "),
+        "critical=0, high=0",
+        securityArtifactSummary.tools.some((tool) => tool.critical > 0 || tool.high > 0) ? "fail" : "pass",
+        "npm audit / Trivy の JSON 結果をツール別に評価しています。",
+        securityArtifactSummary.tools.map((tool) => this.fileEvidence(tool.tool, tool.filePath)),
+      )
+      : this.manualMetric("security", "dependency_vulnerabilities", "依存ライブラリ脆弱性", "High=0", "npm audit / Trivy 結果の取込が未実装です。");
 
     return [
       this.metric("security", "dangerous_html", "dangerouslySetInnerHTML使用件数", String(dangerousHtml.length), "0", dangerousVerdict, "JSX 属性 `dangerouslySetInnerHTML` を直接検出しています。", dangerousHtml.slice(0, 10).map((item) => this.fileEvidence("dangerouslySetInnerHTML", item.filePath, `${item.line}行目`))),
       this.manualMetric("security", "csrf_protection", "CSRF対策", "有効", "実行時設定の確認が必要です。"),
       this.manualMetric("security", "auth_flow", "認証・認可フロー検証", "合格", "認証済みシナリオ実行結果が必要です。"),
-      this.manualMetric("security", "dependency_vulnerabilities", "依存ライブラリ脆弱性", "High=0", "npm audit / Trivy 結果の取込が未実装です。"),
+      vulnerabilityMetric,
       this.metric("security", "secret_indicators", "機密情報露出シグナル件数", String(secretIndicators.length), "0", secretVerdict, "API key / private key 断片の静的パターンを検出しています。", secretIndicators.slice(0, 10).map((item) => this.fileEvidence("secret-pattern", item.filePath, `${item.line}行目: ${item.text}`))),
     ];
   }
@@ -599,6 +675,43 @@ export class QualityReportGenerator {
       notApplicableCount,
       overallVerdict,
     };
+  }
+
+  private applyManualInputs(
+    categories: QualityCategoryReport[],
+    manualInputs: ManualQualityMetricInput[],
+  ): QualityCategoryReport[] {
+    if (manualInputs.length === 0) {
+      return categories;
+    }
+
+    const inputMap = new Map(manualInputs.map((input) => [input.id, input]));
+
+    return categories.map((category) => {
+      const metrics = category.metrics.map((metric) => {
+        const manualInput = inputMap.get(metric.id);
+        if (!manualInput || metric.automation !== "manual") {
+          return metric;
+        }
+
+        return {
+          ...metric,
+          actual: manualInput.actual ?? metric.actual,
+          threshold: manualInput.threshold ?? metric.threshold,
+          verdict: manualInput.verdict ?? metric.verdict,
+          summary: manualInput.summary ?? metric.summary,
+          evidence: manualInput.evidence && manualInput.evidence.length > 0 ? manualInput.evidence : metric.evidence,
+          automation: "manual",
+        } satisfies QualityMetricReport;
+      });
+
+      return {
+        ...category,
+        metrics,
+        verdict: this.calculateCategoryVerdict(metrics),
+        summary: this.summarizeCategory(metrics),
+      };
+    });
   }
 
   private renderMarkdown(report: QualityReport): string {
@@ -904,7 +1017,7 @@ export class QualityReportGenerator {
   private collectZodAdoption(parsedFiles: ParsedFile[]): { totalFiles: number; adoptedFiles: number; rate: number } {
     const candidates = parsedFiles.filter((parsedFile) => {
       const normalized = parsedFile.filePath.replace(/\\/gu, "/").toLowerCase();
-      return /(api|infra|service|client|repository|schema|validation)/u.test(normalized)
+      return /(^|\/)(api|infra|service|services|client|clients|repository|repositories|schema|schemas|validation|validations)(\/|$)/u.test(normalized)
         && !this.isTestFile(parsedFile.filePath)
         && !/stories?\./u.test(normalized);
     });

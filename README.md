@@ -11,6 +11,7 @@ React / TypeScript プロジェクト向けの静的解析 CLI です。
 - JSON / Markdown / CSV / HTML レポート
 - baseline 比較による diff レポート
 - impact score による CI ゲート
+- 出荷審査向けの品質レポートと quality gate
 
 ## 要件
 
@@ -75,6 +76,33 @@ node dist/src/cli.js diff ./my-app \
   --fail-on-impact
 ```
 
+### 品質レポート / quality gate / quality diff
+
+`collect` と `report` は品質レポートを生成します。  
+`gate` は自動判定の `FAIL` が 1 件でもあると終了コード `2` を返します。  
+`gate --baseline <path>` は baseline 比較も行い、自動指標が `pass -> warn` や `warn -> fail` に悪化した場合も終了コード `2` を返します。
+`diff` は baseline の `*_quality_report.json` と比較し、悪化・改善・追加観点を差分化します。
+
+現在は次を自動取込します。
+
+- `tsconfig.json` からの TypeScript 型エラー
+- `coverage/lcov.info` などの LCOV
+- `junit.xml` / `test-results/*.xml` などの JUnit XML
+- `reports/axe*.json` などの axe JSON
+- `reports/lighthouse*.json` などの Lighthouse JSON
+- `playwright-report/results.json` などの Playwright JSON
+- `reports/storybook*.json` などの Storybook JSON
+- `openapi-diff.json` / `reports/openapi-diff.json` などの OpenAPI diff JSON
+- `npm-audit.json` / `reports/npm-audit.json` などの `npm audit --json`
+- `trivy.json` / `reports/trivy-results.json` などの Trivy JSON
+
+```bash
+node dist/src/cli.js quality collect ./my-app --output ./out --prefix release --format json,markdown,html,csv
+node dist/src/cli.js quality gate ./my-app --output ./out --prefix release
+node dist/src/cli.js quality gate ./my-app --output ./out --prefix release --baseline ./out/release_quality_report.json
+node dist/src/cli.js quality diff ./my-app --output ./out --prefix release --baseline ./out/release_quality_report.json
+```
+
 ## CLI オプション
 
 全サブコマンド共通:
@@ -89,6 +117,9 @@ node dist/src/cli.js diff ./my-app \
 - `--exclude-patterns <patterns>`: カンマ区切り正規表現
 - `--cache-dir <dir>`: キャッシュディレクトリ
 - `--log-file <path>`: ログファイル
+- `--manual-input <path>`: 手動品質証跡 JSON パス
+- `--quality-gate-blocking-metrics <ids>`: baseline 回帰で gate を落とす指標 ID のカンマ区切り
+- `--quality-gate-monitoring-metrics <ids>`: baseline 回帰を監視専用にする指標 ID のカンマ区切り
 - `--help`: ヘルプ
 
 `diff` 専用:
@@ -96,6 +127,13 @@ node dist/src/cli.js diff ./my-app \
 - `--baseline <path>`: 比較元 `*_report.json`
 - `--impact-threshold <n>`: impact score 閾値
 - `--fail-on-impact`: 閾値超過で終了コード `2`
+
+`quality` 専用:
+
+- `--manual-input <path>`: 手動品質証跡 JSON。未指定時は `<projectDir>/quality.manual.json` を自動読込
+- `--baseline <path>`: `quality gate` / `quality diff` の比較元 `*_quality_report.json`
+- `--quality-gate-blocking-metrics <ids>`: baseline 回帰で gate を落とす指標 ID
+- `--quality-gate-monitoring-metrics <ids>`: baseline 回帰を監視専用にする指標 ID
 
 ## 出力ファイル
 
@@ -125,6 +163,25 @@ node dist/src/cli.js diff ./my-app \
 | `<prefix>_diff.json` | baseline と current の差分を機械処理向けに保持します。file diff、graph delta、impact subtree を含みます |
 | `<prefix>_diff.md` | 差分の要約レポートです。changed files、hot spot delta、impact score を確認できます |
 | `<prefix>_diff.html` | ブラウザで見る差分レポートです。subtree drill-down、priority score、source link を含みます |
+
+### `quality collect` / `quality report` / `quality gate`
+
+| ファイル | 内容 |
+|---|---|
+| `<prefix>_quality_report.json` | 出荷審査向けの品質レポートです。12観点ごとの指標、実績、基準、判定、証跡を保持します |
+| `<prefix>_quality_report.md` | 品質報告書向けの Markdown 出力です。統合評価表と観点別詳細を含みます |
+| `<prefix>_quality_report.html` | ブラウザ閲覧向けの品質レポートです |
+| `<prefix>_quality_summary.csv` | 品質指標の一覧です。カテゴリ、指標、実績、基準、判定、要約を出します |
+
+`quality gate --baseline` を使うと、上記に加えて `quality diff` と同じ差分ファイルも出力します。
+
+### `quality diff`
+
+| ファイル | 内容 |
+|---|---|
+| `<prefix>_quality_diff.json` | baseline と current の品質差分です。指標ごとの悪化・改善・追加・削除を機械処理向けに保持します |
+| `<prefix>_quality_diff.md` | リリース比較向けの Markdown 差分です。悪化指標と観点差分をすぐ確認できます |
+| `<prefix>_quality_diff.html` | ブラウザ閲覧向けの品質差分レポートです |
 
 ## レポート内容
 
@@ -163,6 +220,29 @@ node dist/src/cli.js diff ./my-app \
 - impacted files の優先度スコア
 - root ごとの subtree metrics
 - HTML 上で subtree のフォーカス切り替え
+
+### 品質レポート
+
+- 12観点の統合評価表
+- 自動判定可能な指標の PASS / WARN / FAIL
+- 手動証跡が必要な指標の明示
+- baseline 指定時の自動回帰検知
+- TypeScript 型エラー数、循環依存数、型の逃げ道件数
+- 対応テストファイル存在率、Unitテスト通過率、LCOV line coverage
+- Playwright ベースの E2E 通過率、Storybook Interaction テスト通過率
+- axe ベースの WCAG 違反件数、Lighthouse Performance / LCP / TTI
+- OpenAPI breaking change 数、MSW 採用シグナル、timeout/retry シグナル
+- `npm audit` / Trivy ベースの High / Critical 脆弱性判定
+- `dangerouslySetInnerHTML`、機密情報露出パターン、ハードコード JSX 文字列
+- CI 設定有無、ドキュメント存在、zod 採用率
+
+### 品質差分レポート
+
+- baseline / current の overall verdict 比較
+- 観点ごとの verdict 変化
+- 指標ごとの `improved / regressed / neutral`
+- 自動悪化件数と手動悪化件数
+- 新規追加された指標と削除された指標
 
 ## File Type 分類
 
@@ -208,6 +288,9 @@ node dist/src/cli.js diff ./my-app \
   "maxFileSizeBytes": 10485760,
   "cacheDir": "./.ts-analyzer-cache",
   "logFile": "./analysis.log",
+  "manualInputPath": "./quality.manual.json",
+  "qualityGateBlockingMetricIds": ["secret_indicators", "dependency_vulnerabilities"],
+  "qualityGateMonitoringMetricIds": ["documentation_presence"],
   "excludePatterns": [
     "(?:^|[/\\\\])node_modules(?:$|[/\\\\])",
     "(?:^|[/\\\\])dist(?:$|[/\\\\])"
@@ -236,6 +319,46 @@ node dist/src/cli.js diff ./my-app \
 - `ANALYZER_IMPACT_SCORE_THRESHOLD`
 - `ANALYZER_FAIL_ON_IMPACT_THRESHOLD`
 - `ANALYZER_LOG_FILE`
+- `ANALYZER_MANUAL_INPUT`
+- `ANALYZER_QUALITY_GATE_BLOCKING_METRICS`
+- `ANALYZER_QUALITY_GATE_MONITORING_METRICS`
+
+`qualityGateBlockingMetricIds` が空なら、自動指標の回帰はすべて gate 対象です。  
+`qualityGateMonitoringMetricIds` に入れた指標は、差分には出しますが gate では落としません。  
+両方に同じ指標が入っている場合は `monitoring` を優先します。
+
+## 手動品質証跡
+
+自動化できない指標は `quality.manual.json` で補完できます。
+
+```json
+{
+  "metrics": [
+    {
+      "id": "requirements_traceability",
+      "actual": "100%",
+      "threshold": "100%",
+      "verdict": "pass",
+      "summary": "要件台帳と実装の照合が完了しています。",
+      "evidence": [
+        {
+          "type": "file",
+          "label": "requirements",
+          "filePath": "./requirements.csv",
+          "value": "要件台帳"
+        }
+      ]
+    },
+    {
+      "id": "residual_bug_count",
+      "actual": "High=0, Medium=1, Low=2",
+      "threshold": "High=0",
+      "verdict": "pass",
+      "summary": "重大障害は残存していません。"
+    }
+  ]
+}
+```
 
 ## キャッシュ
 
@@ -269,6 +392,7 @@ npm test
 - graph 出力
 - diff 出力
 - impact threshold による失敗コード
+- quality diff 出力
 
 ## 注意
 

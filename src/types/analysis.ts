@@ -18,6 +18,9 @@ export interface AnalysisConfig {
   enableCache: boolean;
   cacheDir: string;
   logFile: string;
+  manualInputPath?: string;
+  qualityGateBlockingMetricIds: string[];
+  qualityGateMonitoringMetricIds: string[];
   tsConfigPath?: string;
   projectRoot?: string;
   tsCompilerOptions: ts.CompilerOptions;
@@ -454,6 +457,8 @@ export type QualityCategoryId =
 
 export type QualityVerdict = "pass" | "warn" | "fail" | "manual" | "not_applicable";
 export type QualityAutomationLevel = "automatic" | "manual";
+export type QualityDiffStatus = "added" | "removed" | "changed" | "unchanged";
+export type QualityDiffTrend = "improved" | "regressed" | "neutral";
 
 export interface QualityEvidence {
   type: "file" | "metric" | "note";
@@ -498,4 +503,70 @@ export interface QualityReport {
   projectRoot: string;
   summary: QualitySummary;
   categories: QualityCategoryReport[];
+}
+
+export interface ManualQualityMetricInput {
+  id: string;
+  actual?: string;
+  threshold?: string;
+  verdict?: QualityVerdict;
+  summary?: string;
+  evidence?: QualityEvidence[];
+}
+
+export interface QualityMetricDiffEntry {
+  id: string;
+  category: QualityCategoryId;
+  categoryLabel: string;
+  label: string;
+  status: QualityDiffStatus;
+  trend: QualityDiffTrend;
+  baselineActual?: string;
+  currentActual?: string;
+  baselineThreshold?: string;
+  currentThreshold?: string;
+  baselineVerdict?: QualityVerdict;
+  currentVerdict?: QualityVerdict;
+  baselineAutomation?: QualityAutomationLevel;
+  currentAutomation?: QualityAutomationLevel;
+  baselineSummary?: string;
+  currentSummary?: string;
+  changes: string[];
+}
+
+export interface QualityCategoryDiffReport {
+  id: QualityCategoryId;
+  label: string;
+  status: QualityDiffStatus;
+  baselineVerdict?: QualityVerdict;
+  currentVerdict?: QualityVerdict;
+  changedMetrics: number;
+  improvedMetrics: number;
+  regressedMetrics: number;
+  addedMetrics: number;
+  removedMetrics: number;
+  unchangedMetrics: number;
+}
+
+export interface QualityDiffReport {
+  generatedAt: string;
+  baselinePath: string;
+  currentPath: string;
+  baselineTimestamp: string;
+  currentTimestamp: string;
+  summary: {
+    baselineOverallVerdict: QualityVerdict;
+    currentOverallVerdict: QualityVerdict;
+    changedCategories: number;
+    changedMetrics: number;
+    improvedMetrics: number;
+    regressedMetrics: number;
+    automaticRegressions: number;
+    manualRegressions: number;
+    addedMetrics: number;
+    removedMetrics: number;
+    unchangedMetrics: number;
+  };
+  categories: QualityCategoryDiffReport[];
+  metrics: QualityMetricDiffEntry[];
 }

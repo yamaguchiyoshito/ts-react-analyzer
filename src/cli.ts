@@ -2,8 +2,8 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { parseArgs } from "node:util";
 
-import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, QualityReportGenerator, ReportGenerator } from "./core/index.js";
-import type { AnalysisConfig, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, PersistedAnalysisReport } from "./types/index.js";
+import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, ManualQualityInputLoader, QualityDiffGenerator, QualityReportGenerator, ReportGenerator } from "./core/index.js";
+import type { AnalysisConfig, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, PersistedAnalysisReport, QualityDiffReport, QualityMetricDiffEntry, QualityReport } from "./types/index.js";
 
 interface RunArtifacts {
   results: AnalysisResult[];
@@ -22,7 +22,7 @@ Usage:
   ts-react-analyzer analyze <projectDir> [options]
   ts-react-analyzer graph <projectDir> [options]
   ts-react-analyzer diff <projectDir> [options]
-  ts-react-analyzer quality <collect|report|gate> <projectDir> [options]
+  ts-react-analyzer quality <collect|report|gate|diff> <projectDir> [options]
 
 Options:
   --output <dir>                 report output directory
@@ -37,7 +37,12 @@ Options:
   --exclude-patterns <patterns>  comma-separated regex patterns
   --cache-dir <dir>              cache directory
   --log-file <path>              log file path
-  --baseline <path>              baseline report json path for diff
+  --manual-input <path>          manual quality input json path
+  --quality-gate-blocking-metrics <ids>
+                                comma-separated metric ids that must fail gate on regression
+  --quality-gate-monitoring-metrics <ids>
+                                comma-separated metric ids excluded from regression gate
+  --baseline <path>              baseline report json path for diff/gate
   --help                         show help
 `);
 }
@@ -314,14 +319,38 @@ async function diffProject(projectDir: string, config: AnalysisConfig, baselineP
   }
 }
 
-async function qualityProject(projectDir: string, config: AnalysisConfig, mode: "collect" | "report" | "gate"): Promise<number> {
+async function qualityProject(
+  projectDir: string,
+  config: AnalysisConfig,
+  mode: "collect" | "report" | "gate" | "diff",
+  baselinePath?: string,
+): Promise<number> {
   const logger = new Logger(config.verbose ? "DEBUG" : "INFO", config.logFile);
   await logger.initialize();
   const startTime = Date.now();
 
   try {
     logger.info("Quality analysis started", { projectDir, mode });
+    const baselineReport = (mode === "diff" || mode === "gate") && baselinePath
+      ? JSON.parse(await fs.readFile(baselinePath, "utf8")) as QualityReport
+      : undefined;
     const artifacts = await buildArtifacts(projectDir, config, logger);
+    const manualInputPath = config.manualInputPath
+      ? path.resolve(config.manualInputPath)
+      : path.join(projectDir, "quality.manual.json");
+    let manualInputs: ManualQualityMetricInput[] = [];
+
+    try {
+      await fs.access(manualInputPath);
+      manualInputs = await new ManualQualityInputLoader().load(manualInputPath);
+      logger.info("Manual quality input loaded", {
+        manualInputPath,
+        entries: manualInputs.length,
+      });
+    } catch {
+      logger.debug("Manual quality input not found", { manualInputPath });
+    }
+
     const qualityReportGenerator = new QualityReportGenerator();
     const report = await qualityReportGenerator.generateReports({
       projectRoot: projectDir,
@@ -330,20 +359,56 @@ async function qualityProject(projectDir: string, config: AnalysisConfig, mode: 
       graphMetrics: artifacts.graphMetrics,
       executionTimeMs: Date.now() - startTime,
       tsConfigPath: config.tsConfigPath,
+      manualInputs,
     }, {
       outputDir: config.outputDir,
       prefix: config.filePrefix,
-      formats: config.outputFormats,
+      formats: mode === "diff" && !config.outputFormats.includes("json")
+        ? [...config.outputFormats, "json"]
+        : config.outputFormats,
     });
 
     const failingAutomaticMetrics = report.categories
       .flatMap((category) => category.metrics.map((metric) => ({ category: category.label, metric })))
       .filter(({ metric }) => metric.automation === "automatic" && metric.verdict === "fail");
+    const shouldCompareWithBaseline = Boolean(baselineReport && baselinePath && (mode === "diff" || mode === "gate"));
+    const qualityDiffGenerator = shouldCompareWithBaseline ? new QualityDiffGenerator() : undefined;
+    const currentReportPath = path.join(config.outputDir, `${config.filePrefix}_quality_report.json`);
+    const diff = shouldCompareWithBaseline && qualityDiffGenerator
+      ? qualityDiffGenerator.compare(report, baselineReport!, baselinePath!, currentReportPath)
+      : undefined;
+    const blockingRegressionMetrics = diff ? selectBlockingRegressionMetrics(diff, config) : [];
+
+    if (diff && qualityDiffGenerator) {
+      await qualityDiffGenerator.writeReports(diff, config.outputDir, config.filePrefix, config.outputFormats);
+    }
+
+    if (mode === "diff") {
+      if (!baselineReport || !baselinePath) {
+        throw new Error("Quality diff requires a baseline report.");
+      }
+      if (!diff) {
+        throw new Error("Quality diff generation failed.");
+      }
+
+      logger.info("Quality diff completed", {
+        outputDir: config.outputDir,
+        changedCategories: diff.summary.changedCategories,
+        changedMetrics: diff.summary.changedMetrics,
+        regressedMetrics: diff.summary.regressedMetrics,
+        automaticRegressions: diff.summary.automaticRegressions,
+        durationMs: Date.now() - startTime,
+      });
+
+      await logger.close();
+      return 0;
+    }
 
     logger.info("Quality analysis completed", {
       outputDir: config.outputDir,
       overallVerdict: report.summary.overallVerdict,
       automaticFailCount: failingAutomaticMetrics.length,
+      automaticRegressionCount: blockingRegressionMetrics.length,
       durationMs: Date.now() - startTime,
     });
 
@@ -355,6 +420,26 @@ async function qualityProject(projectDir: string, config: AnalysisConfig, mode: 
           actual: metric.actual,
           threshold: metric.threshold,
         })),
+      });
+      await logger.close();
+      return 2;
+    }
+
+    if (mode === "gate" && diff && blockingRegressionMetrics.length > 0) {
+      logger.error("Quality gate failed due to automatic regressions", {
+        baselinePath,
+        blockingMetricIds: config.qualityGateBlockingMetricIds,
+        monitoringMetricIds: config.qualityGateMonitoringMetricIds,
+        offenders: blockingRegressionMetrics
+          .slice(0, 10)
+          .map((metric) => ({
+            category: metric.categoryLabel,
+            metric: metric.label,
+            baselineVerdict: metric.baselineVerdict,
+            currentVerdict: metric.currentVerdict,
+            baselineActual: metric.baselineActual,
+            currentActual: metric.currentActual,
+          })),
       });
       await logger.close();
       return 2;
@@ -416,6 +501,27 @@ function buildGraphWarnings(
   return warnings;
 }
 
+function selectBlockingRegressionMetrics(
+  diff: QualityDiffReport,
+  config: AnalysisConfig,
+): QualityMetricDiffEntry[] {
+  const monitoringMetricIds = new Set(config.qualityGateMonitoringMetricIds);
+  const blockingMetricIds = new Set(config.qualityGateBlockingMetricIds);
+
+  return diff.metrics.filter((metric) => {
+    if (metric.trend !== "regressed" || metric.currentAutomation !== "automatic") {
+      return false;
+    }
+    if (monitoringMetricIds.has(metric.id)) {
+      return false;
+    }
+    if (blockingMetricIds.size > 0) {
+      return blockingMetricIds.has(metric.id);
+    }
+    return true;
+  });
+}
+
 async function main(): Promise<number> {
   const parsed = parseArgs({
     allowPositionals: true,
@@ -432,6 +538,9 @@ async function main(): Promise<number> {
       "exclude-patterns": { type: "string" },
       "cache-dir": { type: "string" },
       "log-file": { type: "string" },
+      "manual-input": { type: "string" },
+      "quality-gate-blocking-metrics": { type: "string" },
+      "quality-gate-monitoring-metrics": { type: "string" },
       baseline: { type: "string" },
       help: { type: "boolean" },
     },
@@ -440,7 +549,17 @@ async function main(): Promise<number> {
   const [command, maybeSubcommand, maybeProjectDir] = parsed.positionals;
   const projectDir = command === "quality" ? maybeProjectDir : maybeSubcommand;
   const qualityMode = command === "quality"
-    ? (maybeSubcommand === "gate" ? "gate" : maybeSubcommand === "report" ? "report" : maybeSubcommand === "collect" ? "collect" : undefined)
+    ? (
+      maybeSubcommand === "gate"
+        ? "gate"
+        : maybeSubcommand === "report"
+          ? "report"
+          : maybeSubcommand === "collect"
+            ? "collect"
+            : maybeSubcommand === "diff"
+              ? "diff"
+              : undefined
+    )
     : undefined;
 
   if (parsed.values.help || !command) {
@@ -478,6 +597,13 @@ async function main(): Promise<number> {
     excludePatterns: typeof parsed.values["exclude-patterns"] === "string" ? parsed.values["exclude-patterns"] : undefined,
     cacheDir: typeof parsed.values["cache-dir"] === "string" ? parsed.values["cache-dir"] : undefined,
     logFile: typeof parsed.values["log-file"] === "string" ? parsed.values["log-file"] : undefined,
+    manualInput: typeof parsed.values["manual-input"] === "string" ? parsed.values["manual-input"] : undefined,
+    qualityGateBlockingMetrics: typeof parsed.values["quality-gate-blocking-metrics"] === "string"
+      ? parsed.values["quality-gate-blocking-metrics"]
+      : undefined,
+    qualityGateMonitoringMetrics: typeof parsed.values["quality-gate-monitoring-metrics"] === "string"
+      ? parsed.values["quality-gate-monitoring-metrics"]
+      : undefined,
   });
 
   const config = configManager.mergeConfigs(
@@ -500,6 +626,9 @@ async function main(): Promise<number> {
   config.outputDir = path.resolve(projectRoot, config.outputDir);
   config.cacheDir = path.resolve(projectRoot, config.cacheDir);
   config.logFile = path.resolve(projectRoot, config.logFile);
+  if (config.manualInputPath) {
+    config.manualInputPath = path.resolve(projectRoot, config.manualInputPath);
+  }
 
   if (command === "graph") {
     return graphProject(projectRoot, config);
@@ -515,7 +644,14 @@ async function main(): Promise<number> {
       printHelp();
       return 1;
     }
-    return qualityProject(projectRoot, config, qualityMode);
+    const baselinePath = qualityMode === "diff"
+      ? typeof parsed.values.baseline === "string"
+        ? path.resolve(parsed.values.baseline)
+        : path.join(config.outputDir, `${config.filePrefix}_quality_report.json`)
+      : qualityMode === "gate" && typeof parsed.values.baseline === "string"
+        ? path.resolve(parsed.values.baseline)
+      : undefined;
+    return qualityProject(projectRoot, config, qualityMode, baselinePath);
   }
 
   return analyzeProject(projectRoot, config);
