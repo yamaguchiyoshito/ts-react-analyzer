@@ -2,7 +2,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { parseArgs } from "node:util";
 
-import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, ReportGenerator } from "./core/index.js";
+import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, QualityReportGenerator, ReportGenerator } from "./core/index.js";
 import type { AnalysisConfig, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, PersistedAnalysisReport } from "./types/index.js";
 
 interface RunArtifacts {
@@ -22,6 +22,7 @@ Usage:
   ts-react-analyzer analyze <projectDir> [options]
   ts-react-analyzer graph <projectDir> [options]
   ts-react-analyzer diff <projectDir> [options]
+  ts-react-analyzer quality <collect|report|gate> <projectDir> [options]
 
 Options:
   --output <dir>                 report output directory
@@ -313,6 +314,63 @@ async function diffProject(projectDir: string, config: AnalysisConfig, baselineP
   }
 }
 
+async function qualityProject(projectDir: string, config: AnalysisConfig, mode: "collect" | "report" | "gate"): Promise<number> {
+  const logger = new Logger(config.verbose ? "DEBUG" : "INFO", config.logFile);
+  await logger.initialize();
+  const startTime = Date.now();
+
+  try {
+    logger.info("Quality analysis started", { projectDir, mode });
+    const artifacts = await buildArtifacts(projectDir, config, logger);
+    const qualityReportGenerator = new QualityReportGenerator();
+    const report = await qualityReportGenerator.generateReports({
+      projectRoot: projectDir,
+      analysisResults: artifacts.results,
+      parsedFiles: artifacts.scanResult.parsed,
+      graphMetrics: artifacts.graphMetrics,
+      executionTimeMs: Date.now() - startTime,
+      tsConfigPath: config.tsConfigPath,
+    }, {
+      outputDir: config.outputDir,
+      prefix: config.filePrefix,
+      formats: config.outputFormats,
+    });
+
+    const failingAutomaticMetrics = report.categories
+      .flatMap((category) => category.metrics.map((metric) => ({ category: category.label, metric })))
+      .filter(({ metric }) => metric.automation === "automatic" && metric.verdict === "fail");
+
+    logger.info("Quality analysis completed", {
+      outputDir: config.outputDir,
+      overallVerdict: report.summary.overallVerdict,
+      automaticFailCount: failingAutomaticMetrics.length,
+      durationMs: Date.now() - startTime,
+    });
+
+    if (mode === "gate" && failingAutomaticMetrics.length > 0) {
+      logger.error("Quality gate failed", {
+        offenders: failingAutomaticMetrics.slice(0, 10).map(({ category, metric }) => ({
+          category,
+          metric: metric.label,
+          actual: metric.actual,
+          threshold: metric.threshold,
+        })),
+      });
+      await logger.close();
+      return 2;
+    }
+
+    await logger.close();
+    return 0;
+  } catch (error) {
+    logger.error("Quality analysis failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    await logger.close();
+    return 1;
+  }
+}
+
 function buildGraphWarnings(
   graphJson: GraphJSON,
   graphStats: {
@@ -379,13 +437,19 @@ async function main(): Promise<number> {
     },
   });
 
-  const [command, projectDir] = parsed.positionals;
+  const [command, maybeSubcommand, maybeProjectDir] = parsed.positionals;
+  const projectDir = command === "quality" ? maybeProjectDir : maybeSubcommand;
+  const qualityMode = command === "quality"
+    ? (maybeSubcommand === "gate" ? "gate" : maybeSubcommand === "report" ? "report" : maybeSubcommand === "collect" ? "collect" : undefined)
+    : undefined;
+
   if (parsed.values.help || !command) {
     printHelp();
     return 0;
   }
 
-  if (!["analyze", "graph", "diff"].includes(command) || !projectDir) {
+  const validCommands = ["analyze", "graph", "diff", "quality"];
+  if (!validCommands.includes(command) || !projectDir || (command === "quality" && !qualityMode)) {
     printHelp();
     return 1;
   }
@@ -445,6 +509,13 @@ async function main(): Promise<number> {
       ? path.resolve(parsed.values.baseline)
       : path.join(config.outputDir, `${config.filePrefix}_report.json`);
     return diffProject(projectRoot, config, baselinePath);
+  }
+  if (command === "quality") {
+    if (!qualityMode) {
+      printHelp();
+      return 1;
+    }
+    return qualityProject(projectRoot, config, qualityMode);
   }
 
   return analyzeProject(projectRoot, config);

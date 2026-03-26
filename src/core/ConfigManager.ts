@@ -209,6 +209,7 @@ export class ConfigManager {
         "(?:^|[/\\\\])\\.next(?:$|[/\\\\])",
         "(?:^|[/\\\\])coverage(?:$|[/\\\\])",
         "(?:^|[/\\\\])\\.git(?:$|[/\\\\])",
+        "(?:^|[/\\\\])storybook-static[/\\\\]assets(?:$|[/\\\\])",
       ],
       outputFormats: ["json", "markdown", "csv"],
       outputDir: "./analysis-reports",

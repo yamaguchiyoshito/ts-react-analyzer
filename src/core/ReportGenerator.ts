@@ -321,7 +321,7 @@ export class ReportGenerator {
 
     const complexity = this.buildRiskBreakdown((result) => this.getRiskLevel(result.complexity.overallComplexity));
     const structure = this.buildRiskBreakdown((result) => this.getStructureRiskLevel(result));
-    const typeSafety = this.buildRiskBreakdown((result) => this.getTypeSafetyRiskLevel(result));
+    const typeSafety = this.buildTypeSafetyRiskBreakdown();
 
     return [
       "## リスク分布",
@@ -458,6 +458,7 @@ export class ReportGenerator {
   private generateTypeSafetySection(): string {
     const totals = this.getTypeSafetyTotals();
     const worstFiles = this.analysisResults
+      .filter((result) => this.isTypeSafetyTargetFile(result.filePath))
       .map((result) => {
         const metrics = result.complexity.typeMetrics;
         const score = this.getTypeSafetyScore(result);
@@ -1198,7 +1199,7 @@ export class ReportGenerator {
         const cluster = this.classifySizeComplexityCluster(result.complexity.codeLines, result.complexity.overallComplexity);
         const dependencies = result.dependencies.length;
         const hooks = result.complexity.hooks.length;
-        const anyCount = result.complexity.typeMetrics.anyTypeCount;
+        const anyCount = this.isTypeSafetyTargetFile(result.filePath) ? result.complexity.typeMetrics.anyTypeCount : 0;
         const score = (result.complexity.overallComplexity * 5)
           + (dependencies * 2)
           + (anyCount * 4)
@@ -1311,20 +1312,26 @@ export class ReportGenerator {
     nonNullAssertionCount: number;
     tsIgnoreCount: number;
   } {
-    return this.analysisResults.reduce((totals, result) => ({
-      anyCount: totals.anyCount + result.complexity.typeMetrics.anyTypeCount,
-      assertionCount: totals.assertionCount + result.complexity.typeMetrics.assertionCount,
-      nonNullAssertionCount: totals.nonNullAssertionCount + result.complexity.typeMetrics.nonNullAssertionCount,
-      tsIgnoreCount: totals.tsIgnoreCount + result.complexity.typeMetrics.tsIgnoreCount,
-    }), {
-      anyCount: 0,
-      assertionCount: 0,
-      nonNullAssertionCount: 0,
-      tsIgnoreCount: 0,
-    });
+    return this.analysisResults
+      .filter((result) => this.isTypeSafetyTargetFile(result.filePath))
+      .reduce((totals, result) => ({
+        anyCount: totals.anyCount + result.complexity.typeMetrics.anyTypeCount,
+        assertionCount: totals.assertionCount + result.complexity.typeMetrics.assertionCount,
+        nonNullAssertionCount: totals.nonNullAssertionCount + result.complexity.typeMetrics.nonNullAssertionCount,
+        tsIgnoreCount: totals.tsIgnoreCount + result.complexity.typeMetrics.tsIgnoreCount,
+      }), {
+        anyCount: 0,
+        assertionCount: 0,
+        nonNullAssertionCount: 0,
+        tsIgnoreCount: 0,
+      });
   }
 
   private getTypeSafetyScore(result: AnalysisResult): number {
+    if (!this.isTypeSafetyTargetFile(result.filePath)) {
+      return 0;
+    }
+
     const metrics = result.complexity.typeMetrics;
     return (metrics.anyTypeCount * 4)
       + (metrics.assertionCount * 2)
@@ -1366,6 +1373,16 @@ export class ReportGenerator {
   private buildRiskBreakdown(selector: (result: AnalysisResult) => "low" | "medium" | "high"): RiskAxisBreakdown {
     return this.analysisResults.reduce<RiskAxisBreakdown>((totals, result) => {
       totals[selector(result)] += 1;
+      return totals;
+    }, { low: 0, medium: 0, high: 0 });
+  }
+
+  private buildTypeSafetyRiskBreakdown(): RiskAxisBreakdown {
+    return this.analysisResults.reduce<RiskAxisBreakdown>((totals, result) => {
+      if (!this.isTypeSafetyTargetFile(result.filePath)) {
+        return totals;
+      }
+      totals[this.getTypeSafetyRiskLevel(result)] += 1;
       return totals;
     }, { low: 0, medium: 0, high: 0 });
   }
@@ -1538,12 +1555,19 @@ export class ReportGenerator {
     return /^index\.(tsx?|jsx?)$/u.test(path.basename(filePath));
   }
 
+  private isTypeSafetyTargetFile(filePath: string): boolean {
+    const fileType = this.classifyFileType(filePath);
+    return fileType !== "Test" && fileType !== "Story";
+  }
+
   private isExpectedSkip(skipped: SkippedFile): boolean {
     return skipped.reason === "Excluded pattern match" && this.isExpectedExcludedPath(skipped.filePath);
   }
 
   private isExpectedExcludedPath(filePath: string): boolean {
-    return /(^|\/)(node_modules|dist|build|\.next|coverage|\.git|\.venv)(\/|$)/u.test(filePath.replace(/\\/gu, "/"));
+    const normalized = filePath.replace(/\\/gu, "/");
+    return /(^|\/)(node_modules|dist|build|\.next|coverage|\.git|\.venv)(\/|$)/u.test(normalized)
+      || /(^|\/)storybook-static\/assets(\/|$)/u.test(normalized);
   }
 
   private buildDecisionSummary(threshold: number): DecisionSummaryReport {
@@ -1557,7 +1581,7 @@ export class ReportGenerator {
       riskSummary: {
         complexity: this.buildRiskBreakdown((result) => this.getRiskLevel(result.complexity.overallComplexity)),
         structure: this.buildRiskBreakdown((result) => this.getStructureRiskLevel(result)),
-        typeSafety: this.buildRiskBreakdown((result) => this.getTypeSafetyRiskLevel(result)),
+        typeSafety: this.buildTypeSafetyRiskBreakdown(),
       },
       typeSafetyAlerts: {
         criticalSignals: typeTotals.anyCount + typeTotals.tsIgnoreCount,

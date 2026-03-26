@@ -1,4 +1,5 @@
 export * from "./AnalysisCache.js";
+export * from "./BrowserAuditAnalyzer.js";
 export * from "./ComplexityAnalyzer.js";
 export * from "./ConfigManager.js";
 export * from "./DependencyAnalyzer.js";
@@ -6,4 +7,8 @@ export * from "./DiffGenerator.js";
 export * from "./FileScanner.js";
 export * from "./GraphBuilder.js";
 export * from "./Logger.js";
+export * from "./QualityReportGenerator.js";
 export * from "./ReportGenerator.js";
+export * from "./TestArtifactAnalyzer.js";
+export * from "./TypeCheckAnalyzer.js";
+export * from "./UiTestArtifactAnalyzer.js";

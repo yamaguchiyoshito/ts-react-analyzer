@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { FileScanner } from "../src/core/index.js";
+import { ConfigManager, FileScanner } from "../src/core/index.js";
 
 test("FileScanner skips excluded, oversized, and symlink-cycle entries", async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-scan-"));
@@ -30,6 +30,35 @@ test("FileScanner skips excluded, oversized, and symlink-cycle entries", async (
   assert.ok(result.skipped.some((entry) => entry.reason.includes("Excluded pattern")));
   assert.ok(result.skipped.some((entry) => entry.reason.includes("File size exceeds")));
   assert.ok(result.skipped.some((entry) => /cycle/u.test(entry.reason)));
+
+  await fs.rm(tempRoot, { recursive: true, force: true });
+});
+
+test("FileScanner excludes storybook-static assets by default", async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-storybook-assets-"));
+  await fs.mkdir(path.join(tempRoot, "src"), { recursive: true });
+  await fs.mkdir(path.join(tempRoot, "storybook-static", "assets"), { recursive: true });
+
+  await fs.writeFile(path.join(tempRoot, "src", "App.tsx"), "export const App = () => <div />;\n", "utf8");
+  await fs.writeFile(path.join(tempRoot, "storybook-static", "assets", "chunk.ts"), "export const Chunk = 1;\n", "utf8");
+
+  const config = new ConfigManager().getDefaults();
+  const scanner = new FileScanner({
+    excludePatterns: config.excludePatterns,
+    maxFileSizeBytes: config.maxFileSizeBytes,
+    cacheDir: path.join(tempRoot, ".cache"),
+    enableCache: false,
+  });
+
+  const result = await scanner.scanProject(tempRoot);
+
+  assert.equal(result.parsed.length, 1);
+  assert.match(result.parsed[0]?.filePath ?? "", /src\/App\.tsx$/u);
+  assert.ok(result.skipped.some((entry) =>
+    entry.filePath.replace(/\\/gu, "/").endsWith("storybook-static/assets")
+      && entry.reason.includes("Excluded pattern")
+      && entry.isDirectory
+  ));
 
   await fs.rm(tempRoot, { recursive: true, force: true });
 });

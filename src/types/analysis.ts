@@ -437,3 +437,65 @@ export interface LogEntry {
   message: string;
   metadata?: Record<string, unknown>;
 }
+
+export type QualityCategoryId =
+  | "functional"
+  | "uiux"
+  | "accessibility"
+  | "performance"
+  | "code"
+  | "test"
+  | "api"
+  | "security"
+  | "i18n"
+  | "operations"
+  | "build"
+  | "dependencies";
+
+export type QualityVerdict = "pass" | "warn" | "fail" | "manual" | "not_applicable";
+export type QualityAutomationLevel = "automatic" | "manual";
+
+export interface QualityEvidence {
+  type: "file" | "metric" | "note";
+  label: string;
+  value: string;
+  filePath?: string;
+}
+
+export interface QualityMetricReport {
+  id: string;
+  category: QualityCategoryId;
+  label: string;
+  actual: string;
+  threshold: string;
+  verdict: QualityVerdict;
+  automation: QualityAutomationLevel;
+  summary: string;
+  evidence: QualityEvidence[];
+}
+
+export interface QualityCategoryReport {
+  id: QualityCategoryId;
+  label: string;
+  verdict: QualityVerdict;
+  summary: string;
+  metrics: QualityMetricReport[];
+}
+
+export interface QualitySummary {
+  totalMetrics: number;
+  passCount: number;
+  warnCount: number;
+  failCount: number;
+  manualCount: number;
+  notApplicableCount: number;
+  overallVerdict: QualityVerdict;
+}
+
+export interface QualityReport {
+  timestamp: string;
+  executionTimeMs: number;
+  projectRoot: string;
+  summary: QualitySummary;
+  categories: QualityCategoryReport[];
+}
