@@ -455,8 +455,9 @@ export type QualityCategoryId =
   | "build"
   | "dependencies";
 
-export type QualityVerdict = "pass" | "warn" | "fail" | "manual" | "not_applicable";
+export type QualityVerdict = "pass" | "partial" | "warn" | "fail" | "manual" | "not_applicable";
 export type QualityAutomationLevel = "automatic" | "manual";
+export type QualityMetricAggregation = "primary" | "derived";
 export type QualityDiffStatus = "added" | "removed" | "changed" | "unchanged";
 export type QualityDiffTrend = "improved" | "regressed" | "neutral";
 
@@ -471,6 +472,7 @@ export interface QualityMetricReport {
   id: string;
   category: QualityCategoryId;
   label: string;
+  aggregation: QualityMetricAggregation;
   actual: string;
   threshold: string;
   verdict: QualityVerdict;
@@ -489,7 +491,10 @@ export interface QualityCategoryReport {
 
 export interface QualitySummary {
   totalMetrics: number;
+  derivedMetricCount: number;
   passCount: number;
+  partialCount: number;
+  partialCategoryCount: number;
   warnCount: number;
   failCount: number;
   manualCount: number;
@@ -519,6 +524,8 @@ export interface QualityMetricDiffEntry {
   category: QualityCategoryId;
   categoryLabel: string;
   label: string;
+  baselineAggregation?: QualityMetricAggregation;
+  currentAggregation?: QualityMetricAggregation;
   status: QualityDiffStatus;
   trend: QualityDiffTrend;
   baselineActual?: string;

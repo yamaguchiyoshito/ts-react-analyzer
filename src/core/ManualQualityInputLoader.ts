@@ -7,7 +7,7 @@ interface ManualQualityInputFile {
   metrics?: ManualQualityMetricInput[];
 }
 
-const ALLOWED_VERDICTS = new Set<QualityVerdict>(["pass", "warn", "fail", "manual", "not_applicable"]);
+const ALLOWED_VERDICTS = new Set<QualityVerdict>(["pass", "partial", "warn", "fail", "manual", "not_applicable"]);
 const ALLOWED_EVIDENCE_TYPES = new Set<QualityEvidence["type"]>(["file", "metric", "note"]);
 
 export class ManualQualityInputLoader {

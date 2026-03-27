@@ -446,7 +446,8 @@ test("QualityReportGenerator writes quality outputs with automatic and manual me
   assert.ok(files.includes("quality_quality_summary.csv"));
 
   const jsonReport = JSON.parse(await fs.readFile(path.join(outputDir, "quality_quality_report.json"), "utf8")) as QualityReport;
-  assert.equal(jsonReport.executionTimeMs, 567);
+  assert.ok(report.executionTimeMs >= 567);
+  assert.equal(jsonReport.executionTimeMs, report.executionTimeMs);
   assert.ok(jsonReport.categories.some((category) => category.label === "テスト品質"));
   assert.ok(jsonReport.categories.some((category) =>
     category.metrics.some((metric) => metric.label === "TypeScript型エラー数"))
@@ -456,9 +457,9 @@ test("QualityReportGenerator writes quality outputs with automatic and manual me
   const csvReport = await fs.readFile(path.join(outputDir, "quality_quality_summary.csv"), "utf8");
   const htmlReport = await fs.readFile(path.join(outputDir, "quality_quality_report.html"), "utf8");
   assert.match(markdownReport, /# React 出荷審査 品質レポート/u);
-  assert.match(markdownReport, /\| 観点 \| 自動指標数 \| PASS \| WARN \| FAIL \| MANUAL \| 判定 \|/u);
+  assert.match(markdownReport, /\| 観点 \| 自動指標数 \| 診断指標数 \| PASS \| PARTIAL \| WARN \| FAIL \| MANUAL \| 判定 \|/u);
   assert.match(markdownReport, /## セキュリティ品質/u);
-  assert.match(csvReport, /^"Category","Metric","Automation","Actual","Threshold","Verdict","Summary"/mu);
+  assert.match(csvReport, /^"Category","Metric","Aggregation","Automation","Actual","Threshold","Verdict","Summary"/mu);
   assert.match(htmlReport, /React 出荷審査 品質レポート/u);
 
   await fs.rm(outputDir, { recursive: true, force: true });
@@ -533,6 +534,7 @@ test("CLI quality collect auto-loads quality.manual.json and merges manual metri
   assert.match(requirementsMetric?.evidence?.[0]?.filePath ?? "", /requirements\.csv$/u);
   assert.equal(bugMetric?.verdict, "pass");
   assert.equal(bugMetric?.actual, "High=0, Medium=1, Low=2");
+  assert.equal(functionalCategory?.verdict, "partial");
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
@@ -910,10 +912,12 @@ test("QualityReportGenerator excludes test and story files from strict code and 
 
   const codeCategory = report.categories.find((category) => category.id === "code");
   const securityCategory = report.categories.find((category) => category.id === "security");
+  const i18nCategory = report.categories.find((category) => category.id === "i18n");
   const typeScriptErrorsMetric = codeCategory!.metrics.find((metric) => metric.id === "typescript_errors");
   const typeEscapeMetric = codeCategory!.metrics.find((metric) => metric.id === "type_escape_count");
   const dangerousHtmlMetric = securityCategory!.metrics.find((metric) => metric.id === "dangerous_html");
   const secretIndicatorsMetric = securityCategory!.metrics.find((metric) => metric.id === "secret_indicators");
+  const hardcodedTextMetric = i18nCategory!.metrics.find((metric) => metric.id === "hardcoded_jsx_text");
 
   assert.equal(typeScriptErrorsMetric?.actual, "0");
   assert.equal(typeScriptErrorsMetric?.verdict, "pass");
@@ -923,6 +927,471 @@ test("QualityReportGenerator excludes test and story files from strict code and 
   assert.equal(dangerousHtmlMetric?.verdict, "pass");
   assert.equal(secretIndicatorsMetric?.actual, "0");
   assert.equal(secretIndicatorsMetric?.verdict, "pass");
+  assert.equal(hardcodedTextMetric?.actual, "0");
+  assert.equal(hardcodedTextMetric?.verdict, "pass");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator treats story files as coverage evidence and ignores storybook support noise", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-heuristics-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src", "components", "ui"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "components", "shared"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "components", "forms"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, ".storybook", "components"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src", ".storybook"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "components", "ui", "Input.tsx"), [
+    "type InputProps = { placeholder?: string; title?: string; lang?: string };",
+    "export function Input(props: InputProps) {",
+    "  return <input {...props} />;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "components", "shared", "TextField.tsx"), [
+    "import { Input } from \"../ui/Input\";",
+    "",
+    "type TextFieldProps = { placeholder?: string; title?: string };",
+    "",
+    "export function TextField(props: TextFieldProps) {",
+    "  return <Input {...props} lang=\"en\" />;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "components", "forms", "InputName.tsx"), [
+    "import { TextField } from \"../shared/TextField\";",
+    "",
+    "export function InputName() {",
+    "  return <TextField placeholder=\"1970\" title=\"1\" />;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "components", "ui", "Input.stories.tsx"), [
+    "import { Input } from \"./Input\";",
+    "",
+    "export const Primary = () => <Input placeholder=\"1970\" title=\"1\" />;",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "components", "shared", "TextField.stories.tsx"), [
+    "import { TextField } from \"./TextField\";",
+    "",
+    "export const Primary = () => <TextField placeholder=\"1970\" title=\"1\" />;",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "components", "forms", "InputName.stories.tsx"), [
+    "import { InputName } from \"./InputName\";",
+    "",
+    "export const Primary = () => <InputName />;",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, ".storybook", "components", "SBMermaid.tsx"), [
+    "import { useEffect, useMemo, useReducer, useRef, useState } from \"react\";",
+    "",
+    "export function SBMermaid() {",
+    "  const ref = useRef<HTMLDivElement | null>(null);",
+    "  const [count, setCount] = useState(0);",
+    "  const [flag, toggle] = useReducer((value) => !value, false);",
+    "  const items = useMemo(() => [\"story helper\"], []);",
+    "  useEffect(() => {",
+    "    if (ref.current) {",
+    "      setCount(ref.current.childElementCount);",
+    "    }",
+    "  }, []);",
+    "  return (",
+    "    <section ref={ref}>",
+    "      <header>Storybook helper text</header>",
+    "      <button onClick={toggle}>toggle</button>",
+    "      <div>{items.join(\",\")}</div>",
+    "      <footer>{String(flag)}:{count}</footer>",
+    "    </section>",
+    "  );",
+    "}",
+  ].join("\n"), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "quality-heuristics",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const qualityReportGenerator = new QualityReportGenerator();
+  const report = await qualityReportGenerator.generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 222,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "quality-heuristics",
+    formats: ["json"],
+  });
+
+  const uiCategory = report.categories.find((category) => category.id === "uiux");
+  const codeCategory = report.categories.find((category) => category.id === "code");
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const i18nCategory = report.categories.find((category) => category.id === "i18n");
+
+  const designSystemMetric = uiCategory!.metrics.find((metric) => metric.id === "design_system_usage_rate");
+  const bespokeMetric = uiCategory!.metrics.find((metric) => metric.id === "bespoke_ui_file_count");
+  const responsibilityMetric = codeCategory!.metrics.find((metric) => metric.id === "high_responsibility_components");
+  const testPresenceMetric = testCategory!.metrics.find((metric) => metric.id === "matching_test_file_presence");
+  const hardcodedTextMetric = i18nCategory!.metrics.find((metric) => metric.id === "hardcoded_jsx_text");
+
+  assert.equal(designSystemMetric?.actual, "100.0%");
+  assert.equal(designSystemMetric?.verdict, "pass");
+  assert.equal(bespokeMetric?.actual, "0");
+  assert.equal(bespokeMetric?.verdict, "pass");
+  assert.equal(responsibilityMetric?.actual, "0");
+  assert.equal(responsibilityMetric?.verdict, "pass");
+  assert.equal(testPresenceMetric?.actual, "100.0%");
+  assert.equal(testPresenceMetric?.verdict, "pass");
+  assert.equal(hardcodedTextMetric?.actual, "0");
+  assert.equal(hardcodedTextMetric?.verdict, "pass");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator weights route and feature coverage above UI primitives", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-weighted-tests-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+      noEmit: true,
+    },
+    include: [],
+  }, null, 2), "utf8");
+
+  const results: AnalysisResult[] = [
+    createAnalysisResult(path.join(projectRoot, "src", "app", "page.tsx"), { name: "Page" }),
+    createAnalysisResult(path.join(projectRoot, "src", "features", "UserCard.tsx"), { name: "UserCard" }),
+    createAnalysisResult(path.join(projectRoot, "src", "components", "ui", "Dialog.tsx"), { name: "DialogCloseButton" }),
+    createAnalysisResult(path.join(projectRoot, "src", "components", "ui", "Dialog.stories.tsx"), { name: "DialogStory" }),
+  ];
+
+  const qualityReportGenerator = new QualityReportGenerator();
+  const report = await qualityReportGenerator.generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: [],
+    graphMetrics: createEmptyGraphMetrics(),
+    executionTimeMs: 144,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "quality-weighted-tests",
+    formats: ["json"],
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const testPresenceMetric = testCategory!.metrics.find((metric) => metric.id === "matching_test_file_presence");
+  const routeMetric = testCategory!.metrics.find((metric) => metric.id === "route_test_file_presence");
+  const featureMetric = testCategory!.metrics.find((metric) => metric.id === "feature_test_file_presence");
+  const formMetric = testCategory!.metrics.find((metric) => metric.id === "form_test_file_presence");
+  const uiMetric = testCategory!.metrics.find((metric) => metric.id === "ui_test_file_presence");
+
+  assert.equal(testPresenceMetric?.actual, "10.0%");
+  assert.equal(testPresenceMetric?.verdict, "fail");
+  assert.ok(testPresenceMetric?.evidence.some((item) => item.label === "対象重み" && item.value === "10.0"));
+  assert.ok(testPresenceMetric?.evidence.some((item) => item.label === "テストあり重み" && item.value === "1.0"));
+  assert.ok(testPresenceMetric?.evidence.some((item) => item.label === "Route重み" && item.value === "0.0 / 5.0 (0.0%)"));
+  assert.ok(testPresenceMetric?.evidence.some((item) => item.label === "Feature重み" && item.value === "0.0 / 4.0 (0.0%)"));
+  assert.ok(testPresenceMetric?.evidence.some((item) => item.label === "UI重み" && item.value === "1.0 / 1.0 (100.0%)"));
+  assert.equal(routeMetric?.actual, "0.0%");
+  assert.equal(routeMetric?.verdict, "fail");
+  assert.equal(featureMetric?.actual, "0.0%");
+  assert.equal(featureMetric?.verdict, "fail");
+  assert.equal(formMetric?.actual, "対象ソースなし");
+  assert.equal(formMetric?.verdict, "not_applicable");
+  assert.equal(uiMetric?.actual, "100.0%");
+  assert.equal(uiMetric?.verdict, "pass");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator marks partially automated categories as PARTIAL when automatic findings are clean", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-partial-clean-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src", "app"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "components", "ui"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, ".github", "workflows"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "README.md"), "# Release checklist\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, ".github", "workflows", "ci.yml"), "name: ci\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "react-env.d.ts"), [
+    "type ElementProps = {",
+    "  children?: unknown;",
+    "  [key: string]: unknown;",
+    "};",
+    "",
+    "declare namespace JSX {",
+    "  interface IntrinsicElements {",
+    "    [elemName: string]: ElementProps;",
+    "  }",
+    "}",
+    "",
+    "declare module \"react/jsx-runtime\" {",
+    "  export const Fragment: unknown;",
+    "  export function jsx(...args: unknown[]): unknown;",
+    "  export function jsxs(...args: unknown[]): unknown;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "components", "ui", "Dialog.tsx"), [
+    "export function DialogCloseButton() {",
+    "  return <button type=\"button\">Close</button>;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "components", "ui", "Dialog.stories.tsx"), [
+    "import { DialogCloseButton } from \"./Dialog\";",
+    "",
+    "export const Primary = () => <DialogCloseButton />;",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "app", "page.tsx"), [
+    "import { DialogCloseButton } from \"../components/ui/Dialog\";",
+    "",
+    "export default function Page() {",
+    "  return <main><DialogCloseButton /></main>;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "app", "page.test.tsx"), [
+    "import Page from \"./page\";",
+    "void Page;",
+  ].join("\n"), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "quality-partial-clean",
+      outputFormats: ["json", "markdown"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const qualityReportGenerator = new QualityReportGenerator();
+  const report = await qualityReportGenerator.generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 333,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "quality-partial-clean",
+    formats: ["json", "markdown"],
+  });
+
+  const operationsCategory = report.categories.find((category) => category.id === "operations");
+  const buildCategory = report.categories.find((category) => category.id === "build");
+  const i18nCategory = report.categories.find((category) => category.id === "i18n");
+  const hardcodedTextMetric = i18nCategory!.metrics.find((metric) => metric.id === "hardcoded_jsx_text");
+  const markdownReport = await fs.readFile(path.join(outputDir, "quality-partial-clean_quality_report.md"), "utf8");
+
+  assert.equal(operationsCategory?.verdict, "partial");
+  assert.equal(buildCategory?.verdict, "partial");
+  assert.equal(report.summary.overallVerdict, "partial");
+  assert.equal(report.summary.partialCount, 0);
+  assert.ok((report.summary.partialCategoryCount ?? 0) > 0);
+  assert.equal(hardcodedTextMetric?.actual, "0");
+  assert.equal(hardcodedTextMetric?.verdict, "pass");
+  assert.match(markdownReport, /- PARTIALカテゴリ: [1-9][0-9]*/u);
+  assert.match(markdownReport, /- PARTIAL指標: 0/u);
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator separates product and library i18n text in the same metric", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-partial-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src", "app"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "components", "ui"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, ".github", "workflows"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "README.md"), "# Release checklist\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, ".github", "workflows", "ci.yml"), "name: ci\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "react-env.d.ts"), [
+    "type ElementProps = {",
+    "  children?: unknown;",
+    "  [key: string]: unknown;",
+    "};",
+    "",
+    "declare namespace JSX {",
+    "  interface IntrinsicElements {",
+    "    [elemName: string]: ElementProps;",
+    "  }",
+    "}",
+    "",
+    "declare module \"react/jsx-runtime\" {",
+    "  export const Fragment: unknown;",
+    "  export function jsx(...args: unknown[]): unknown;",
+    "  export function jsxs(...args: unknown[]): unknown;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "app", "page.tsx"), [
+    "import { DialogCloseButton } from \"../components/ui/Dialog\";",
+    "",
+    "export default function Page() {",
+    "  return <main><h1>Welcome</h1><DialogCloseButton /></main>;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "components", "ui", "Dialog.tsx"), [
+    "export function DialogCloseButton() {",
+    "  return <button type=\"button\">Close</button>;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "components", "ui", "Dialog.stories.tsx"), [
+    "import { DialogCloseButton } from \"./Dialog\";",
+    "",
+    "export const Primary = () => <DialogCloseButton />;",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "app", "page.test.tsx"), [
+    "import Page from \"./page\";",
+    "void Page;",
+  ].join("\n"), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "quality-partial",
+      outputFormats: ["json", "markdown"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const qualityReportGenerator = new QualityReportGenerator();
+  const report = await qualityReportGenerator.generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 333,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "quality-partial",
+    formats: ["json", "markdown"],
+  });
+
+  const operationsCategory = report.categories.find((category) => category.id === "operations");
+  const buildCategory = report.categories.find((category) => category.id === "build");
+  const i18nCategory = report.categories.find((category) => category.id === "i18n");
+  const hardcodedTextMetric = i18nCategory!.metrics.find((metric) => metric.id === "hardcoded_jsx_text");
+
+  assert.equal(operationsCategory?.verdict, "partial");
+  assert.equal(buildCategory?.verdict, "partial");
+  assert.equal(report.summary.overallVerdict, "warn");
+  assert.equal(report.summary.partialCount, 0);
+  assert.ok((report.summary.partialCategoryCount ?? 0) > 0);
+  assert.equal(hardcodedTextMetric?.actual, "1");
+  assert.equal(hardcodedTextMetric?.verdict, "warn");
+  assert.match(hardcodedTextMetric?.summary ?? "", /製品文言 1 件、共通UIラベル 1 件/u);
+  assert.ok(hardcodedTextMetric?.evidence.some((item) => item.label === "product-text"));
+  assert.ok(hardcodedTextMetric?.evidence.some((item) => item.label === "library-text"));
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
@@ -1091,7 +1560,10 @@ test("QualityDiffGenerator compares quality reports and marks regressions and im
     projectRoot,
     summary: {
       totalMetrics: 2,
+      derivedMetricCount: 0,
       passCount: 1,
+      partialCount: 0,
+      partialCategoryCount: 0,
       warnCount: 0,
       failCount: 0,
       manualCount: 1,
@@ -1109,6 +1581,7 @@ test("QualityDiffGenerator compares quality reports and marks regressions and im
             id: "requirements_traceability",
             category: "functional",
             label: "要件適合率",
+            aggregation: "primary",
             actual: "manual",
             threshold: "100%",
             verdict: "manual",
@@ -1128,6 +1601,7 @@ test("QualityDiffGenerator compares quality reports and marks regressions and im
             id: "typescript_errors",
             category: "code",
             label: "TypeScript型エラー数",
+            aggregation: "primary",
             actual: "0",
             threshold: "0",
             verdict: "pass",
@@ -1146,7 +1620,10 @@ test("QualityDiffGenerator compares quality reports and marks regressions and im
     projectRoot,
     summary: {
       totalMetrics: 3,
+      derivedMetricCount: 0,
       passCount: 1,
+      partialCount: 0,
+      partialCategoryCount: 0,
       warnCount: 0,
       failCount: 1,
       manualCount: 1,
@@ -1164,6 +1641,7 @@ test("QualityDiffGenerator compares quality reports and marks regressions and im
             id: "requirements_traceability",
             category: "functional",
             label: "要件適合率",
+            aggregation: "primary",
             actual: "100%",
             threshold: "100%",
             verdict: "pass",
@@ -1183,6 +1661,7 @@ test("QualityDiffGenerator compares quality reports and marks regressions and im
             id: "typescript_errors",
             category: "code",
             label: "TypeScript型エラー数",
+            aggregation: "primary",
             actual: "3",
             threshold: "0",
             verdict: "fail",
@@ -1202,6 +1681,7 @@ test("QualityDiffGenerator compares quality reports and marks regressions and im
             id: "dependency_vulnerabilities",
             category: "security",
             label: "依存ライブラリ脆弱性",
+            aggregation: "primary",
             actual: "npm(high=0,critical=0) / trivy(high=0,critical=0)",
             threshold: "High=0, Critical=0",
             verdict: "warn",
@@ -1234,6 +1714,200 @@ test("QualityDiffGenerator compares quality reports and marks regressions and im
   assert.ok(files.includes("quality-delta_quality_diff.html"));
 
   await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("CLI quality gate ignores derived automatic failures when primary metrics pass", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-gate-derived-only-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src", "app"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "components", "ui"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "README.md"), "# Release checklist\n", "utf8");
+  for (let index = 0; index < 20; index += 1) {
+    const componentName = `Dialog${index}`;
+    await fs.writeFile(
+      path.join(projectRoot, "src", "components", "ui", `${componentName}.tsx`),
+      `export function ${componentName}() { return null; }\n`,
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(projectRoot, "src", "components", "ui", `${componentName}.stories.tsx`),
+      [
+        `import type { Meta } from "@storybook/react";`,
+        `import { ${componentName} } from "./${componentName}";`,
+        "",
+        `const meta = { component: ${componentName} } satisfies Meta<typeof ${componentName}>;`,
+        "export default meta;",
+      ].join("\n"),
+      "utf8",
+    );
+  }
+  await fs.writeFile(
+    path.join(projectRoot, "src", "app", "page.tsx"),
+    [
+      "import { Dialog0 } from \"../components/ui/Dialog0\";",
+      "",
+      "export default function Page() {",
+      "  return Dialog0();",
+      "}",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const result = await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality",
+    "gate",
+    projectRoot,
+    "--output",
+    outputDir,
+    "--prefix",
+    "derived-only",
+    "--format",
+    "json",
+  ]);
+
+  assert.match(result.stdout, /Quality analysis completed/u);
+
+  const report = JSON.parse(
+    await fs.readFile(path.join(outputDir, "derived-only_quality_report.json"), "utf8"),
+  ) as QualityReport;
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const overallMetric = testCategory?.metrics.find((metric) => metric.id === "matching_test_file_presence");
+  const routeMetric = testCategory?.metrics.find((metric) => metric.id === "route_test_file_presence");
+
+  assert.equal(report.summary.failCount, 0);
+  assert.equal(report.summary.totalMetrics + report.summary.derivedMetricCount, testCategory ? report.categories.flatMap((category) => category.metrics).length : 0);
+  assert.equal(overallMetric?.verdict, "pass");
+  assert.equal(routeMetric?.aggregation, "derived");
+  assert.equal(routeMetric?.verdict, "fail");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityDiffGenerator excludes derived regressions from primary summary counts", () => {
+  const generator = new QualityDiffGenerator();
+  const baseline: QualityReport = {
+    timestamp: "2026-03-20T00:00:00.000Z",
+    executionTimeMs: 100,
+    projectRoot: "/tmp/project",
+    summary: {
+      totalMetrics: 1,
+      derivedMetricCount: 1,
+      passCount: 1,
+      partialCount: 0,
+      partialCategoryCount: 0,
+      warnCount: 0,
+      failCount: 0,
+      manualCount: 0,
+      notApplicableCount: 0,
+      overallVerdict: "pass",
+    },
+    categories: [
+      {
+        id: "test",
+        label: "テスト品質",
+        verdict: "pass",
+        summary: "総合テストは合格",
+        metrics: [
+          {
+            id: "matching_test_file_presence",
+            category: "test",
+            label: "対応テストファイル存在率",
+            aggregation: "primary",
+            actual: "85.0%",
+            threshold: ">= 80%",
+            verdict: "pass",
+            automation: "automatic",
+            summary: "総合指標",
+            evidence: [],
+          },
+          {
+            id: "route_test_file_presence",
+            category: "test",
+            label: "Routeテスト対応率",
+            aggregation: "derived",
+            actual: "100.0%",
+            threshold: ">= 80%",
+            verdict: "pass",
+            automation: "automatic",
+            summary: "診断指標",
+            evidence: [],
+          },
+        ],
+      },
+    ],
+  };
+  const current: QualityReport = {
+    timestamp: "2026-03-26T00:00:00.000Z",
+    executionTimeMs: 120,
+    projectRoot: "/tmp/project",
+    summary: {
+      totalMetrics: 1,
+      derivedMetricCount: 1,
+      passCount: 1,
+      partialCount: 0,
+      partialCategoryCount: 0,
+      warnCount: 0,
+      failCount: 0,
+      manualCount: 0,
+      notApplicableCount: 0,
+      overallVerdict: "pass",
+    },
+    categories: [
+      {
+        id: "test",
+        label: "テスト品質",
+        verdict: "pass",
+        summary: "総合テストは合格",
+        metrics: [
+          {
+            id: "matching_test_file_presence",
+            category: "test",
+            label: "対応テストファイル存在率",
+            aggregation: "primary",
+            actual: "85.0%",
+            threshold: ">= 80%",
+            verdict: "pass",
+            automation: "automatic",
+            summary: "総合指標",
+            evidence: [],
+          },
+          {
+            id: "route_test_file_presence",
+            category: "test",
+            label: "Routeテスト対応率",
+            aggregation: "derived",
+            actual: "0.0%",
+            threshold: ">= 80%",
+            verdict: "fail",
+            automation: "automatic",
+            summary: "診断指標",
+            evidence: [],
+          },
+        ],
+      },
+    ],
+  };
+
+  const diff = generator.compare(current, baseline, "/tmp/baseline-quality.json", "/tmp/current-quality.json");
+  const routeDiff = diff.metrics.find((metric) => metric.id === "route_test_file_presence");
+
+  assert.equal(routeDiff?.trend, "regressed");
+  assert.equal(routeDiff?.currentAggregation, "derived");
+  assert.equal(diff.summary.regressedMetrics, 0);
+  assert.equal(diff.summary.automaticRegressions, 0);
 });
 
 test("CLI quality diff compares current report against baseline quality report", async () => {

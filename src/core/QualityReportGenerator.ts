@@ -16,6 +16,7 @@ import type {
   QualityCategoryId,
   QualityCategoryReport,
   QualityEvidence,
+  QualityMetricAggregation,
   QualityMetricReport,
   QualityReport,
   QualitySummary,
@@ -44,6 +45,10 @@ interface AuditFinding {
   text: string;
 }
 
+interface I18nFinding extends AuditFinding {
+  scope: "product" | "library";
+}
+
 interface CategoryDescriptor {
   id: QualityCategoryId;
   label: string;
@@ -53,6 +58,31 @@ interface VisualConsumerSummary {
   total: number;
   designSystemUsers: number;
   bespokeFiles: AuditFinding[];
+}
+
+interface TestPresenceBucketSummary {
+  id: "route" | "feature" | "form" | "ui";
+  label: string;
+  targetFiles: number;
+  matchedFiles: number;
+  weightedTarget: number;
+  weightedMatched: number;
+  rate: number;
+}
+
+interface TestPresenceSummary {
+  targetFiles: number;
+  matchedFiles: number;
+  weightedTarget: number;
+  weightedMatched: number;
+  rate: number;
+  buckets: TestPresenceBucketSummary[];
+}
+
+interface TestPresenceBucketDescriptor {
+  id: TestPresenceBucketSummary["id"];
+  label: string;
+  metricId: string;
 }
 
 const QUALITY_CATEGORIES: CategoryDescriptor[] = [
@@ -70,11 +100,20 @@ const QUALITY_CATEGORIES: CategoryDescriptor[] = [
   { id: "dependencies", label: "依存関係・ライブラリ品質" },
 ];
 
+const TEST_PRESENCE_BUCKETS: TestPresenceBucketDescriptor[] = [
+  { id: "route", label: "Route", metricId: "route_test_file_presence" },
+  { id: "feature", label: "Feature", metricId: "feature_test_file_presence" },
+  { id: "form", label: "Form", metricId: "form_test_file_presence" },
+  { id: "ui", label: "UI", metricId: "ui_test_file_presence" },
+];
+
 export class QualityReportGenerator {
   async generateReports(input: QualityGenerationInput, options: QualityGenerationOptions): Promise<QualityReport> {
+    const startedAt = Date.now();
     await fs.mkdir(options.outputDir, { recursive: true });
 
     const report = await this.buildReport(input);
+    report.executionTimeMs = Math.max(report.executionTimeMs, input.executionTimeMs + (Date.now() - startedAt));
     const formats = options.formats.includes("all")
       ? ["json", "markdown", "csv", "html"]
       : options.formats;
@@ -353,17 +392,11 @@ export class QualityReportGenerator {
   }
 
   private buildTestMetrics(
-    testPresence: { targetFiles: number; matchedFiles: number; rate: number },
+    testPresence: TestPresenceSummary,
     testArtifactSummary: Awaited<ReturnType<TestArtifactAnalyzer["analyzeProject"]>>,
     uiTestArtifactSummary: Awaited<ReturnType<UiTestArtifactAnalyzer["analyzeProject"]>>,
   ): QualityMetricReport[] {
-    const verdict: QualityVerdict = testPresence.targetFiles === 0
-      ? "not_applicable"
-      : testPresence.rate >= 80
-        ? "pass"
-        : testPresence.rate >= 50
-          ? "warn"
-          : "fail";
+    const verdict = this.testPresenceVerdict(testPresence.targetFiles, testPresence.rate);
     const junit = testArtifactSummary.junit;
     const coverage = testArtifactSummary.coverage;
     const playwright = uiTestArtifactSummary.playwright;
@@ -457,10 +490,14 @@ export class QualityReportGenerator {
       : this.manualMetric("test", "e2e_pass_rate", "E2Eテスト通過率", "100%", "Playwright 結果 JSON が見つからないため手動入力扱いです。");
 
     return [
-      this.metric("test", "matching_test_file_presence", "対応テストファイル存在率（静的推定）", testPresence.targetFiles === 0 ? "対象ソースなし" : `${testPresence.rate.toFixed(1)}%`, ">= 80%", verdict, "ファイル対応関係からテスト有無を推定しています。", [
+      this.metric("test", "matching_test_file_presence", "対応テストファイル存在率（重み付き静的推定）", testPresence.targetFiles === 0 ? "対象ソースなし" : `${testPresence.rate.toFixed(1)}%`, ">= 80%", verdict, "ファイル対応関係からテスト有無を重み付きで推定しています。Route / Feature / Form / UI の内訳は下位指標で確認できます。", [
         this.noteEvidence("対象ソース数", String(testPresence.targetFiles)),
         this.noteEvidence("テストありソース数", String(testPresence.matchedFiles)),
+        this.noteEvidence("対象重み", testPresence.weightedTarget.toFixed(1)),
+        this.noteEvidence("テストあり重み", testPresence.weightedMatched.toFixed(1)),
+        ...testPresence.buckets.map((bucket) => this.noteEvidence(`${bucket.label}重み`, `${bucket.weightedMatched.toFixed(1)} / ${bucket.weightedTarget.toFixed(1)} (${bucket.rate.toFixed(1)}%)`)),
       ]),
+      ...testPresence.buckets.map((bucket) => this.buildTestPresenceBucketMetric(bucket)),
       unitPassMetric,
       storybookMetric,
       playwrightMetric,
@@ -572,11 +609,30 @@ export class QualityReportGenerator {
     ];
   }
 
-  private buildI18nMetrics(hardcodedJsxText: AuditFinding[]): QualityMetricReport[] {
-    const verdict: QualityVerdict = hardcodedJsxText.length === 0 ? "pass" : hardcodedJsxText.length <= 3 ? "warn" : "fail";
+  private buildI18nMetrics(hardcodedJsxText: I18nFinding[]): QualityMetricReport[] {
+    const productFindings = hardcodedJsxText.filter((item) => item.scope === "product");
+    const libraryFindings = hardcodedJsxText.filter((item) => item.scope === "library");
+    const verdict: QualityVerdict = productFindings.length === 0 ? "pass" : productFindings.length <= 3 ? "warn" : "fail";
+    const summary = productFindings.length === 0 && libraryFindings.length === 0
+      ? "製品文言・共通UIラベルともに未検出です。"
+      : `製品文言 ${productFindings.length} 件、共通UIラベル ${libraryFindings.length} 件です。判定は製品文言だけを基準にしています。`;
 
     return [
-      this.metric("i18n", "hardcoded_jsx_text", "ハードコード文字列件数（JSX）", String(hardcodedJsxText.length), "0", verdict, "JSX テキストノードと JSX 属性内の文字列リテラルを集計しています。", hardcodedJsxText.slice(0, 10).map((item) => this.fileEvidence("hardcoded-text", item.filePath, `${item.line}行目: ${item.text}`))),
+      this.metric(
+        "i18n",
+        "hardcoded_jsx_text",
+        "ハードコード製品文言件数（JSX）",
+        String(productFindings.length),
+        "0",
+        verdict,
+        summary,
+        [
+          this.noteEvidence("製品文言件数", String(productFindings.length)),
+          this.noteEvidence("共通UIラベル件数", String(libraryFindings.length)),
+          ...productFindings.slice(0, 8).map((item) => this.fileEvidence("product-text", item.filePath, `${item.line}行目: ${item.text}`)),
+          ...libraryFindings.slice(0, 4).map((item) => this.fileEvidence("library-text", item.filePath, `${item.line}行目: ${item.text}`)),
+        ],
+      ),
       this.manualMetric("i18n", "translation_keys", "翻訳キー存在率", "100%", "辞書ファイルとの照合が未実装です。"),
       this.manualMetric("i18n", "pseudo_locale", "疑似ロケール対応", "合格", "疑似ロケール実行結果が必要です。"),
       this.manualMetric("i18n", "formatting", "日付/数値フォーマット適正", "合格", "Intl 利用監査が未実装です。"),
@@ -621,54 +677,90 @@ export class QualityReportGenerator {
   }
 
   private calculateCategoryVerdict(metrics: QualityMetricReport[]): QualityVerdict {
-    if (metrics.some((metric) => metric.verdict === "fail")) {
+    const primaryMetrics = this.primaryMetrics(metrics);
+    const resolvedMetrics = primaryMetrics.filter((metric) => !["manual", "not_applicable"].includes(metric.verdict));
+    const pendingManualCount = primaryMetrics.filter((metric) => metric.verdict === "manual").length;
+
+    if (primaryMetrics.some((metric) => metric.verdict === "fail")) {
       return "fail";
     }
-    if (metrics.some((metric) => metric.verdict === "warn")) {
+    if (primaryMetrics.some((metric) => metric.verdict === "warn")) {
       return "warn";
     }
-    if (metrics.some((metric) => metric.verdict === "pass")) {
-      return "pass";
+    if (primaryMetrics.some((metric) => metric.verdict === "partial")) {
+      return "partial";
     }
-    if (metrics.some((metric) => metric.verdict === "manual")) {
-      return "manual";
+    if (primaryMetrics.length === 0 || resolvedMetrics.length === 0) {
+      if (pendingManualCount > 0) {
+        return "manual";
+      }
+      return primaryMetrics.length === 0 ? "not_applicable" : "not_applicable";
+    }
+    if (pendingManualCount > 0) {
+      return "partial";
+    }
+    if (resolvedMetrics.some((metric) => metric.verdict === "pass")) {
+      return "pass";
     }
     return "not_applicable";
   }
 
   private summarizeCategory(metrics: QualityMetricReport[]): string {
-    const autoMetrics = metrics.filter((metric) => metric.automation === "automatic");
-    const failCount = metrics.filter((metric) => metric.verdict === "fail").length;
-    const warnCount = metrics.filter((metric) => metric.verdict === "warn").length;
-    const manualCount = metrics.filter((metric) => metric.verdict === "manual").length;
+    const primaryMetrics = this.primaryMetrics(metrics);
+    const derivedMetrics = this.derivedMetrics(metrics);
+    const autoMetrics = primaryMetrics.filter((metric) => metric.automation === "automatic");
+    const partialCount = primaryMetrics.filter((metric) => metric.verdict === "partial").length;
+    const failCount = primaryMetrics.filter((metric) => metric.verdict === "fail").length;
+    const warnCount = primaryMetrics.filter((metric) => metric.verdict === "warn").length;
+    const pendingManualCount = primaryMetrics.filter((metric) => metric.verdict === "manual").length;
+    const derivedFailCount = derivedMetrics.filter((metric) => metric.verdict === "fail").length;
+    const derivedWarnCount = derivedMetrics.filter((metric) => metric.verdict === "warn").length;
 
     if (autoMetrics.length === 0) {
-      return `自動判定指標はありません。手動入力待ち ${manualCount} 件です。`;
+      return derivedMetrics.length > 0
+        ? `自動判定指標はありません。手動入力待ち ${pendingManualCount} 件、診断指標 ${derivedMetrics.length} 件です。`
+        : `自動判定指標はありません。手動入力待ち ${pendingManualCount} 件です。`;
     }
 
-    return `自動判定 ${autoMetrics.length} 件。FAIL ${failCount} 件、WARN ${warnCount} 件、MANUAL ${manualCount} 件です。`;
+    const derivedSummary = derivedMetrics.length > 0
+      ? ` 診断指標 ${derivedMetrics.length} 件（FAIL ${derivedFailCount} / WARN ${derivedWarnCount}）です。`
+      : "";
+    return `自動判定 ${autoMetrics.length} 件。FAIL ${failCount} 件、WARN ${warnCount} 件、PARTIAL ${partialCount} 件、MANUAL ${pendingManualCount} 件です。${derivedSummary}`;
   }
 
   private calculateSummary(categories: QualityCategoryReport[]): QualitySummary {
     const metrics = categories.flatMap((category) => category.metrics);
-    const passCount = metrics.filter((metric) => metric.verdict === "pass").length;
-    const warnCount = metrics.filter((metric) => metric.verdict === "warn").length;
-    const failCount = metrics.filter((metric) => metric.verdict === "fail").length;
-    const manualCount = metrics.filter((metric) => metric.verdict === "manual").length;
-    const notApplicableCount = metrics.filter((metric) => metric.verdict === "not_applicable").length;
+    const primaryMetrics = this.primaryMetrics(metrics);
+    const passCount = primaryMetrics.filter((metric) => metric.verdict === "pass").length;
+    const partialCount = primaryMetrics.filter((metric) => metric.verdict === "partial").length;
+    const partialCategoryCount = categories.filter((category) => category.verdict === "partial").length;
+    const warnCount = primaryMetrics.filter((metric) => metric.verdict === "warn").length;
+    const failCount = primaryMetrics.filter((metric) => metric.verdict === "fail").length;
+    const manualCount = primaryMetrics.filter((metric) => metric.verdict === "manual").length;
+    const notApplicableCount = primaryMetrics.filter((metric) => metric.verdict === "not_applicable").length;
+    const categoryVerdicts = categories.map((category) => category.verdict);
 
     let overallVerdict: QualityVerdict = "pass";
-    if (failCount > 0) {
+    if (categoryVerdicts.includes("fail")) {
       overallVerdict = "fail";
-    } else if (warnCount > 0) {
+    } else if (categoryVerdicts.includes("warn")) {
       overallVerdict = "warn";
+    } else if (categoryVerdicts.includes("partial") || (categoryVerdicts.includes("pass") && categoryVerdicts.includes("manual"))) {
+      overallVerdict = "partial";
+    } else if (categoryVerdicts.includes("pass")) {
+      overallVerdict = "pass";
     } else if (passCount === 0 && manualCount > 0) {
       overallVerdict = "manual";
+    } else if (categoryVerdicts.every((verdict) => verdict === "not_applicable")) {
+      overallVerdict = "not_applicable";
     }
 
     return {
-      totalMetrics: metrics.length,
+      totalMetrics: primaryMetrics.length,
+      derivedMetricCount: metrics.length - primaryMetrics.length,
       passCount,
+      partialCount,
+      partialCategoryCount,
       warnCount,
       failCount,
       manualCount,
@@ -718,17 +810,20 @@ export class QualityReportGenerator {
     const lines: string[] = [
       "# React 出荷審査 品質レポート",
       "",
-      "| 観点 | 自動指標数 | PASS | WARN | FAIL | MANUAL | 判定 |",
-      "|------|------------|------|------|------|--------|------|",
+      "| 観点 | 自動指標数 | 診断指標数 | PASS | PARTIAL | WARN | FAIL | MANUAL | 判定 |",
+      "|------|------------|--------------|------|---------|------|------|--------|------|",
     ];
 
     for (const category of report.categories) {
-      const autoCount = category.metrics.filter((metric) => metric.automation === "automatic").length;
-      const passCount = category.metrics.filter((metric) => metric.verdict === "pass").length;
-      const warnCount = category.metrics.filter((metric) => metric.verdict === "warn").length;
-      const failCount = category.metrics.filter((metric) => metric.verdict === "fail").length;
-      const manualCount = category.metrics.filter((metric) => metric.verdict === "manual").length;
-      lines.push(`| ${category.label} | ${autoCount} | ${passCount} | ${warnCount} | ${failCount} | ${manualCount} | ${this.verdictMark(category.verdict)} |`);
+      const primaryMetrics = this.primaryMetrics(category.metrics);
+      const derivedCount = this.derivedMetrics(category.metrics).length;
+      const autoCount = primaryMetrics.filter((metric) => metric.automation === "automatic").length;
+      const passCount = primaryMetrics.filter((metric) => metric.verdict === "pass").length;
+      const partialCount = primaryMetrics.filter((metric) => metric.verdict === "partial").length;
+      const warnCount = primaryMetrics.filter((metric) => metric.verdict === "warn").length;
+      const failCount = primaryMetrics.filter((metric) => metric.verdict === "fail").length;
+      const manualCount = primaryMetrics.filter((metric) => metric.verdict === "manual").length;
+      lines.push(`| ${category.label} | ${autoCount} | ${derivedCount} | ${passCount} | ${partialCount} | ${warnCount} | ${failCount} | ${manualCount} | ${this.verdictMark(category.verdict)} |`);
     }
 
     lines.push(
@@ -736,7 +831,10 @@ export class QualityReportGenerator {
       "## 集計",
       "",
       `- 総指標数: ${report.summary.totalMetrics}`,
+      `- 派生指標数: ${report.summary.derivedMetricCount}`,
       `- PASS: ${report.summary.passCount}`,
+      `- PARTIALカテゴリ: ${report.summary.partialCategoryCount}`,
+      `- PARTIAL指標: ${report.summary.partialCount}`,
       `- WARN: ${report.summary.warnCount}`,
       `- FAIL: ${report.summary.failCount}`,
       `- MANUAL: ${report.summary.manualCount}`,
@@ -750,15 +848,15 @@ export class QualityReportGenerator {
         "",
         category.summary,
         "",
-        "| 指標 | 実績 | 基準 | 判定 | 方式 |",
-        "|------|------|------|------|------|",
+        "| 指標 | 集計 | 実績 | 基準 | 判定 | 方式 |",
+        "|------|------|------|------|------|------|",
       );
       for (const metric of category.metrics) {
-        lines.push(`| ${metric.label} | ${this.escapePipe(metric.actual)} | ${this.escapePipe(metric.threshold)} | ${this.verdictMark(metric.verdict)} | ${metric.automation} |`);
+        lines.push(`| ${metric.label} | ${metric.aggregation === "derived" ? "派生" : "親"} | ${this.escapePipe(metric.actual)} | ${this.escapePipe(metric.threshold)} | ${this.verdictMark(metric.verdict)} | ${metric.automation} |`);
       }
       lines.push("");
       for (const metric of category.metrics) {
-        lines.push(`### ${metric.label}`, "", `- 判定: ${this.verdictLabel(metric.verdict)}`, `- 説明: ${metric.summary}`);
+        lines.push(`### ${metric.label}`, "", `- 集計: ${metric.aggregation === "derived" ? "派生" : "親"}`, `- 判定: ${this.verdictLabel(metric.verdict)}`, `- 説明: ${metric.summary}`);
         if (metric.evidence.length > 0) {
           lines.push("- 証跡:");
           for (const evidence of metric.evidence) {
@@ -775,11 +873,12 @@ export class QualityReportGenerator {
 
   private renderCsv(report: QualityReport): string {
     const rows = [
-      ["Category", "Metric", "Automation", "Actual", "Threshold", "Verdict", "Summary"],
+      ["Category", "Metric", "Aggregation", "Automation", "Actual", "Threshold", "Verdict", "Summary"],
       ...report.categories.flatMap((category) =>
         category.metrics.map((metric) => [
           category.label,
           metric.label,
+          metric.aggregation,
           metric.automation,
           metric.actual,
           metric.threshold,
@@ -794,19 +893,22 @@ export class QualityReportGenerator {
 
   private renderHtml(report: QualityReport): string {
     const rows = report.categories.map((category) => {
-      const autoCount = category.metrics.filter((metric) => metric.automation === "automatic").length;
-      const passCount = category.metrics.filter((metric) => metric.verdict === "pass").length;
-      const warnCount = category.metrics.filter((metric) => metric.verdict === "warn").length;
-      const failCount = category.metrics.filter((metric) => metric.verdict === "fail").length;
-      const manualCount = category.metrics.filter((metric) => metric.verdict === "manual").length;
-      return `<tr><td>${this.escapeHtml(category.label)}</td><td>${autoCount}</td><td>${passCount}</td><td>${warnCount}</td><td>${failCount}</td><td>${manualCount}</td><td>${this.escapeHtml(this.verdictLabel(category.verdict))}</td></tr>`;
+      const primaryMetrics = this.primaryMetrics(category.metrics);
+      const derivedCount = this.derivedMetrics(category.metrics).length;
+      const autoCount = primaryMetrics.filter((metric) => metric.automation === "automatic").length;
+      const passCount = primaryMetrics.filter((metric) => metric.verdict === "pass").length;
+      const partialCount = primaryMetrics.filter((metric) => metric.verdict === "partial").length;
+      const warnCount = primaryMetrics.filter((metric) => metric.verdict === "warn").length;
+      const failCount = primaryMetrics.filter((metric) => metric.verdict === "fail").length;
+      const manualCount = primaryMetrics.filter((metric) => metric.verdict === "manual").length;
+      return `<tr><td>${this.escapeHtml(category.label)}</td><td>${autoCount}</td><td>${derivedCount}</td><td>${passCount}</td><td>${partialCount}</td><td>${warnCount}</td><td>${failCount}</td><td>${manualCount}</td><td>${this.escapeHtml(this.verdictLabel(category.verdict))}</td></tr>`;
     }).join("\n");
 
     const detailSections = report.categories.map((category) => {
       const metricRows = category.metrics.map((metric) =>
-        `<tr><td>${this.escapeHtml(metric.label)}</td><td>${this.escapeHtml(metric.actual)}</td><td>${this.escapeHtml(metric.threshold)}</td><td>${this.escapeHtml(this.verdictLabel(metric.verdict))}</td><td>${this.escapeHtml(metric.automation)}</td></tr>`
+        `<tr><td>${this.escapeHtml(metric.label)}</td><td>${this.escapeHtml(metric.aggregation === "derived" ? "派生" : "親")}</td><td>${this.escapeHtml(metric.actual)}</td><td>${this.escapeHtml(metric.threshold)}</td><td>${this.escapeHtml(this.verdictLabel(metric.verdict))}</td><td>${this.escapeHtml(metric.automation)}</td></tr>`
       ).join("\n");
-      return `<section><h2>${this.escapeHtml(category.label)}</h2><p>${this.escapeHtml(category.summary)}</p><table><thead><tr><th>指標</th><th>実績</th><th>基準</th><th>判定</th><th>方式</th></tr></thead><tbody>${metricRows}</tbody></table></section>`;
+      return `<section><h2>${this.escapeHtml(category.label)}</h2><p>${this.escapeHtml(category.summary)}</p><table><thead><tr><th>指標</th><th>集計</th><th>実績</th><th>基準</th><th>判定</th><th>方式</th></tr></thead><tbody>${metricRows}</tbody></table></section>`;
     }).join("\n");
 
     return `<!DOCTYPE html>
@@ -828,14 +930,17 @@ export class QualityReportGenerator {
   <h1>React 出荷審査 品質レポート</h1>
   <div class="meta">
     <div class="card"><strong>OVERALL</strong><br />${this.escapeHtml(this.verdictLabel(report.summary.overallVerdict))}</div>
+    <div class="card"><strong>PRIMARY</strong><br />${report.summary.totalMetrics}</div>
+    <div class="card"><strong>DERIVED</strong><br />${report.summary.derivedMetricCount}</div>
     <div class="card"><strong>PASS</strong><br />${report.summary.passCount}</div>
+    <div class="card"><strong>PARTIAL CAT</strong><br />${report.summary.partialCategoryCount}</div>
     <div class="card"><strong>WARN</strong><br />${report.summary.warnCount}</div>
     <div class="card"><strong>FAIL</strong><br />${report.summary.failCount}</div>
     <div class="card"><strong>MANUAL</strong><br />${report.summary.manualCount}</div>
   </div>
   <table>
     <thead>
-      <tr><th>観点</th><th>自動指標数</th><th>PASS</th><th>WARN</th><th>FAIL</th><th>MANUAL</th><th>判定</th></tr>
+      <tr><th>観点</th><th>自動指標数</th><th>診断指標数</th><th>PASS</th><th>PARTIAL</th><th>WARN</th><th>FAIL</th><th>MANUAL</th><th>判定</th></tr>
     </thead>
     <tbody>${rows}</tbody>
   </table>
@@ -864,29 +969,44 @@ export class QualityReportGenerator {
     return findings;
   }
 
-  private collectHardcodedJsxText(parsedFiles: ParsedFile[]): AuditFinding[] {
-    const findings: AuditFinding[] = [];
+  private collectHardcodedJsxText(parsedFiles: ParsedFile[]): I18nFinding[] {
+    const findings: I18nFinding[] = [];
+    const userFacingAttributeNames = new Set([
+      "placeholder",
+      "title",
+      "alt",
+      "aria-label",
+      "aria-description",
+      "aria-placeholder",
+      "label",
+      "description",
+      "helpertext",
+      "emptytext",
+    ]);
 
-    for (const parsedFile of parsedFiles) {
+    for (const parsedFile of parsedFiles.filter((item) => this.isI18nTargetFile(item.filePath))) {
+      const scope = this.classifyI18nFindingScope(parsedFile.filePath);
       const visit = (node: ts.Node): void => {
         if (ts.isJsxText(node)) {
           const text = node.getText().replace(/\s+/gu, " ").trim();
-          if (text) {
+          if (text && this.isLikelyUserFacingText(text)) {
             findings.push({
               filePath: parsedFile.filePath,
               line: ts.getLineAndCharacterOfPosition(parsedFile.sourceFile, node.getStart()).line + 1,
               text,
+              scope,
             });
           }
         }
 
         if (ts.isJsxAttribute(node) && node.initializer && ts.isStringLiteral(node.initializer)) {
           const attributeName = this.getJsxAttributeName(node.name);
-          if (!["className", "id", "href", "src", "role", "variant", "size", "type", "name"].includes(attributeName)) {
+          if (userFacingAttributeNames.has(attributeName) && this.isLikelyUserFacingText(node.initializer.text)) {
             findings.push({
               filePath: parsedFile.filePath,
               line: ts.getLineAndCharacterOfPosition(parsedFile.sourceFile, node.getStart()).line + 1,
               text: `${attributeName}="${node.initializer.text}"`,
+              scope,
             });
           }
         }
@@ -929,6 +1049,8 @@ export class QualityReportGenerator {
     let total = 0;
     let designSystemUsers = 0;
     const bespokeFiles: AuditFinding[] = [];
+    const analysisByFile = new Map(analysisResults.map((result) => [result.filePath, result]));
+    const designSystemMemo = new Map<string, boolean>();
 
     for (const result of analysisResults) {
       if (result.complexity.components.length === 0) {
@@ -936,20 +1058,12 @@ export class QualityReportGenerator {
       }
 
       const fileType = this.classifyFileType(result.filePath);
-      if (["Test", "Story", "Fixture", "Config", "UI component"].includes(fileType)) {
+      if (!this.isVisualConsumerTargetFile(result.filePath)) {
         continue;
       }
 
       total += 1;
-      const hasDesignSystemImport = result.dependencies.some((dependency) => {
-        const normalizedModule = dependency.modulePath.replace(/\\/gu, "/");
-        const normalizedTarget = dependency.target.replace(/\\/gu, "/");
-        return normalizedModule.includes("components/ui")
-          || normalizedModule.includes("shared/ui")
-          || normalizedModule.includes("design-system")
-          || normalizedTarget.includes("/components/ui/")
-          || normalizedTarget.includes("/shared/ui/");
-      });
+      const hasDesignSystemImport = this.hasDesignSystemBacking(result.filePath, analysisByFile, designSystemMemo, new Set());
 
       if (hasDesignSystemImport) {
         designSystemUsers += 1;
@@ -974,6 +1088,9 @@ export class QualityReportGenerator {
     const findings: AuditFinding[] = [];
 
     for (const result of analysisResults) {
+      if (!this.isResponsibilityTargetFile(result.filePath)) {
+        continue;
+      }
       for (const component of result.complexity.components) {
         if (component.hookCount >= 4 || component.jsxElements >= 12 || component.renderComplexity.complexity >= 5) {
           findings.push({
@@ -988,29 +1105,57 @@ export class QualityReportGenerator {
     return findings;
   }
 
-  private collectTestPresence(analysisResults: AnalysisResult[]): { targetFiles: number; matchedFiles: number; rate: number } {
+  private collectTestPresence(analysisResults: AnalysisResult[]): TestPresenceSummary {
     const targetFiles = analysisResults.filter((result) => this.isTestTargetFile(result.filePath));
-    const testKeys = new Set<string>();
+    const coverageKeys = new Set<string>();
+    const buckets = TEST_PRESENCE_BUCKETS.map<TestPresenceBucketSummary>((descriptor) => ({
+      id: descriptor.id,
+      label: descriptor.label,
+      targetFiles: 0,
+      matchedFiles: 0,
+      weightedTarget: 0,
+      weightedMatched: 0,
+      rate: 0,
+    }));
+    const bucketById = new Map(buckets.map((bucket) => [bucket.id, bucket]));
 
     for (const result of analysisResults) {
-      if (this.isTestFile(result.filePath)) {
-        testKeys.add(this.toTestKey(result.filePath));
-        testKeys.add(path.basename(this.toTestKey(result.filePath)));
+      if (this.isTestFile(result.filePath) || this.isStoryFile(result.filePath)) {
+        for (const key of this.buildCoverageArtifactKeys(result.filePath)) {
+          coverageKeys.add(key);
+        }
       }
     }
 
     let matchedFiles = 0;
+    let weightedTarget = 0;
+    let weightedMatched = 0;
     for (const result of targetFiles) {
-      const testKey = this.toTestKey(result.filePath);
-      if (testKeys.has(testKey) || testKeys.has(path.basename(testKey))) {
+      const weight = this.testCoverageWeight(result.filePath);
+      const bucket = bucketById.get(this.testCoverageBucket(result.filePath));
+      weightedTarget += weight;
+      bucket!.targetFiles += 1;
+      bucket!.weightedTarget += weight;
+      const matchKeys = this.buildSourceMatchKeys(result.filePath);
+      if (matchKeys.some((key) => coverageKeys.has(key))) {
         matchedFiles += 1;
+        weightedMatched += weight;
+        bucket!.matchedFiles += 1;
+        bucket!.weightedMatched += weight;
       }
+    }
+
+    for (const bucket of buckets) {
+      bucket.rate = bucket.weightedTarget > 0 ? (bucket.weightedMatched / bucket.weightedTarget) * 100 : 0;
     }
 
     return {
       targetFiles: targetFiles.length,
       matchedFiles,
-      rate: targetFiles.length > 0 ? (matchedFiles / targetFiles.length) * 100 : 0,
+      weightedTarget,
+      weightedMatched,
+      rate: weightedTarget > 0 ? (weightedMatched / weightedTarget) * 100 : 0,
+      buckets,
     };
   }
 
@@ -1107,65 +1252,130 @@ export class QualityReportGenerator {
   private classifyFileType(filePath: string): string {
     const normalized = filePath.replace(/\\/gu, "/");
     const lower = normalized.toLowerCase();
-    const base = path.basename(lower);
+    const rawBase = path.basename(normalized);
+    const base = rawBase.toLowerCase();
+    const stem = base.replace(/\.[cm]?[jt]sx?$/u, "");
+    const rawStem = rawBase.replace(/\.[cm]?[jt]sx?$/u, "");
 
-    if (this.isTestFile(filePath)) {
+    const isTestFile = /(?:^|\.)(test|spec)\.[cm]?[jt]sx?$/u.test(base)
+      || /(^|\/)(__tests__|tests)\//u.test(lower);
+    const isStoryFile = /\.stories\.[cm]?[jt]sx?$/u.test(base)
+      || /(^|\/)(stories|storybook)\//u.test(lower);
+    const isFixtureFile = /(^|\/)(__fixtures__|fixtures)\//u.test(lower)
+      || /\.fixture\.[cm]?[jt]sx?$/u.test(base);
+    const isStorybookSupportFile = (lower.startsWith(".storybook/") || lower.includes("/.storybook/"))
+      && /\.(?:[cm]?[jt]sx?)$/u.test(base)
+      && !/^(main|preview|manager|vitest\.setup)\.[cm]?[jt]sx?$/u.test(base);
+    const isConfigFile = base === "tsconfig.json"
+      || base === "jsconfig.json"
+      || base.startsWith("eslint.config.")
+      || base.startsWith(".eslintrc")
+      || base.startsWith(".prettierrc")
+      || base.startsWith("vite.config.")
+      || base.startsWith("vitest.config.")
+      || base.startsWith("jest.config.")
+      || lower.includes("/.storybook/")
+      || lower.startsWith(".storybook/")
+      || base.includes(".config.");
+    const isBarrelFile = lower.endsWith("/index.ts")
+      || lower.endsWith("/index.tsx")
+      || lower.endsWith("/index.js")
+      || lower.endsWith("/index.jsx");
+    const isRouteFile = /(^|\/)(app|pages)\//u.test(lower)
+      || /^(app|root|page|loading|error|template|route)\.[cm]?[jt]sx?$/u.test(base);
+    const isSchemaFile = /(^|\/)schemas?(\/|$)/u.test(lower)
+      || /\.schema\.[cm]?[jt]sx?$/u.test(base);
+    const isValidationFile = /(^|\/)(validations?|validators?)(\/|$)/u.test(lower)
+      || /\.(validation|validator)\.[cm]?[jt]sx?$/u.test(base);
+    const isUiLibraryFile = /(^|\/)components\/ui(\/|$)/u.test(lower)
+      || /(^|\/)components\/commons(\/|$)/u.test(lower);
+    const isLayoutFile = /(^|\/)(layouts?|layout)(\/|$)/u.test(lower)
+      || /(^|\/)(header|sidebar|footer|navbar)\.[cm]?[jt]sx?$/u.test(base)
+      || /(^|\/).*(layout|container|shell)\.[cm]?[jt]sx?$/u.test(base);
+    const isFeatureFile = /(^|\/)(features?|modules?|domains?|scenes?|containers?)(\/|$)/u.test(lower);
+    const isHookFile = /^use[A-Z0-9]/u.test(rawStem)
+      || /(^|\/)hooks?(\/|$)/u.test(lower);
+    const isContextStateFile = /(^|\/)contexts?(\/|$)/u.test(lower)
+      || /(provider|context|store)\.[cm]?[jt]sx?$/u.test(base)
+      || /(provider|context|store)$/u.test(stem);
+    const isApiInfrastructureFile = /(^|\/)(bases\/api|api|services?|repositories?|clients?)(\/|$)/u.test(lower);
+    const isUtilsFile = /(^|\/)(lib|utils?|helpers?)(\/|$)/u.test(lower);
+    const isTypeSupportFile = /\.d\.[cm]?ts$/u.test(base)
+      || base.includes("shims")
+      || base.includes("global.d.ts");
+    const isUiComponentFile = /(^|\/)components(\/|$)/u.test(lower);
+    const isFormFile = /(^|\/)(components\/forms?|forms?|form-components)(\/|$)/u.test(lower)
+      || stem === "form"
+      || stem.endsWith("form");
+
+    if (isTestFile) {
       return "Test";
     }
-    if (/\.stories\.[jt]sx?$/u.test(lower) || lower.includes("/storybook/")) {
+    if (isStoryFile) {
       return "Story";
     }
-    if (lower.includes("__fixtures__") || /\.fixture\.[jt]sx?$/u.test(lower)) {
+    if (isFixtureFile) {
       return "Fixture";
     }
-    if (/(^|\/)(vite|webpack|rollup|eslint|jest|vitest|playwright|babel|tailwind|postcss|tsconfig)(\.|$)/u.test(base) || lower.includes("/config/")) {
+    if (isStorybookSupportFile) {
+      return "Storybook Support";
+    }
+    if (isConfigFile) {
       return "Config";
     }
-    if (lower.includes("/components/ui/") || lower.includes("/shared/ui/")) {
-      return "UI component";
-    }
-    if (lower.includes("/layouts/") || lower.includes("/layout/")) {
-      return "Layout";
-    }
-    if (lower.includes("/forms/") || lower.includes("/form/")) {
-      return "Form";
-    }
-    if (lower.includes("/features/") || lower.includes("/feature/")) {
-      return "Feature";
-    }
-    if (lower.includes("/routes/") || /\/app\/.+\/page\.[jt]sx?$/u.test(lower)) {
-      return "Route";
-    }
-    if (lower.includes("/hooks/") || /^use[a-z0-9-]+/u.test(base)) {
-      return "Hook";
-    }
-    if (lower.includes("/schemas/") || lower.includes("/schema/")) {
-      return "Schema";
-    }
-    if (lower.includes("/validations/") || lower.includes("/validation/")) {
-      return "Validation";
-    }
-    if (lower.includes("/api/") || lower.includes("/infra/") || lower.includes("/service/") || lower.includes("/client/") || lower.includes("/repository/")) {
-      return "API/Infrastructure";
-    }
-    if (lower.includes("/utils/") || lower.includes("/lib/")) {
-      return "Utils";
-    }
-    if (lower.endsWith("/index.ts") || lower.endsWith("/index.tsx") || lower.endsWith("/index.js") || lower.endsWith("/index.jsx")) {
+    if (isBarrelFile) {
       return "Barrel";
     }
-    if (lower.includes("/components/")) {
+    if (isRouteFile) {
+      return "Route";
+    }
+    if (isSchemaFile) {
+      return "Schema";
+    }
+    if (isValidationFile) {
+      return "Validation";
+    }
+    if (isLayoutFile) {
+      if (isUiLibraryFile) {
+        return "UI component";
+      }
+      return "Layout";
+    }
+    if (isFeatureFile) {
+      return "Feature";
+    }
+    if (isHookFile) {
+      return "Hook";
+    }
+    if (isContextStateFile) {
+      return "Context/State";
+    }
+    if (isApiInfrastructureFile) {
+      return "API/Infrastructure";
+    }
+    if (isUtilsFile) {
+      return "Utils";
+    }
+    if (isTypeSupportFile) {
+      return "Type Support";
+    }
+    if (isUiComponentFile && !isFormFile) {
       return "UI component";
+    }
+    if (isFormFile) {
+      return "Form";
     }
     return "Shared";
   }
 
   private isStoryFile(filePath: string): boolean {
-    return this.classifyFileType(filePath) === "Story";
+    const fileType = this.classifyFileType(filePath);
+    return fileType === "Story" || fileType === "Storybook Support";
   }
 
   private isStrictQualityCheckTargetFile(filePath: string): boolean {
-    return !this.isTestFile(filePath) && !this.isStoryFile(filePath);
+    const fileType = this.classifyFileType(filePath);
+    return !["Test", "Story", "Storybook Support", "Fixture", "Config"].includes(fileType);
   }
 
   private filterTypeCheckSummary(
@@ -1190,15 +1400,195 @@ export class QualityReportGenerator {
 
   private isTestTargetFile(filePath: string): boolean {
     const fileType = this.classifyFileType(filePath);
-    return !["Test", "Story", "Fixture", "Config", "Barrel"].includes(fileType);
+    return !["Test", "Story", "Storybook Support", "Fixture", "Config", "Barrel", "Utils", "Type Support"].includes(fileType);
   }
 
-  private toTestKey(filePath: string): string {
-    const normalized = filePath.replace(/\\/gu, "/");
-    return normalized
-      .replace(/(^|\/)(src|tests?)\//u, "$1")
-      .replace(/\.(?:test|spec|stories|story|fixture)\.[jt]sx?$/u, "")
-      .replace(/\.[jt]sx?$/u, "");
+  private buildCoverageArtifactKeys(filePath: string): string[] {
+    const normalizedPath = this.normalizeMatchPath(filePath)
+      .split("/")
+      .filter((segment) => segment !== "__tests__" && segment !== "tests" && segment !== ".storybook")
+      .join("/")
+      .replace(/\.(test|spec|stories|story|fixture)$/iu, "");
+    const keys = new Set<string>([normalizedPath]);
+
+    if (normalizedPath.startsWith("src/")) {
+      keys.add(normalizedPath.slice(4));
+    } else if (!normalizedPath.startsWith("/") && normalizedPath.length > 0) {
+      keys.add(`src/${normalizedPath}`);
+    }
+
+    return Array.from(keys).filter(Boolean);
+  }
+
+  private buildSourceMatchKeys(filePath: string): string[] {
+    const normalized = this.normalizeMatchPath(filePath);
+    const keys = new Set<string>([normalized]);
+
+    if (normalized.startsWith("src/")) {
+      keys.add(normalized.slice(4));
+    } else if (!normalized.startsWith("/") && normalized.length > 0) {
+      keys.add(`src/${normalized}`);
+    }
+
+    return Array.from(keys).filter(Boolean);
+  }
+
+  private normalizeMatchPath(filePath: string): string {
+    return filePath
+      .replace(/\\/gu, "/")
+      .replace(/\.[cm]?[jt]sx?$/iu, "")
+      .toLowerCase();
+  }
+
+  private isVisualConsumerTargetFile(filePath: string): boolean {
+    const fileType = this.classifyFileType(filePath);
+    return ["Route", "Feature", "Form"].includes(fileType);
+  }
+
+  private isResponsibilityTargetFile(filePath: string): boolean {
+    const fileType = this.classifyFileType(filePath);
+    return ["Route", "Feature", "Form", "UI component", "Layout"].includes(fileType);
+  }
+
+  private isI18nTargetFile(filePath: string): boolean {
+    const fileType = this.classifyFileType(filePath);
+    return ["Route", "Feature", "Form", "UI component", "Layout", "Shared"].includes(fileType);
+  }
+
+  private classifyI18nFindingScope(filePath: string): "product" | "library" {
+    const fileType = this.classifyFileType(filePath);
+    if (fileType === "UI component") {
+      return "library";
+    }
+
+    const normalized = filePath.replace(/\\/gu, "/").toLowerCase();
+    if (normalized.includes("/components/ui/")
+      || normalized.includes("/shared/ui/")
+      || normalized.includes("/components/commons/")) {
+      return "library";
+    }
+    return "product";
+  }
+
+  private testCoverageWeight(filePath: string): number {
+    const fileType = this.classifyFileType(filePath);
+    switch (fileType) {
+      case "Route":
+        return 5;
+      case "Feature":
+        return 4;
+      case "Form":
+        return 3;
+      case "Layout":
+      case "API/Infrastructure":
+      case "Schema":
+      case "Validation":
+      case "Hook":
+      case "Context/State":
+        return 2;
+      case "UI component":
+      case "Shared":
+      default:
+        return 1;
+    }
+  }
+
+  private testPresenceVerdict(targetFiles: number, rate: number): QualityVerdict {
+    if (targetFiles === 0) {
+      return "not_applicable";
+    }
+    if (rate >= 80) {
+      return "pass";
+    }
+    if (rate >= 50) {
+      return "warn";
+    }
+    return "fail";
+  }
+
+  private buildTestPresenceBucketMetric(bucket: TestPresenceBucketSummary): QualityMetricReport {
+    return this.metric(
+      "test",
+      TEST_PRESENCE_BUCKETS.find((descriptor) => descriptor.id === bucket.id)?.metricId ?? `${bucket.id}_test_file_presence`,
+      `${bucket.label}テスト対応率（重み付き静的推定）`,
+      bucket.targetFiles === 0 ? "対象ソースなし" : `${bucket.rate.toFixed(1)}%`,
+      ">= 80%",
+      this.testPresenceVerdict(bucket.targetFiles, bucket.rate),
+      `${bucket.label} 層のファイル対応関係からテスト有無を重み付きで推定しています。`,
+      [
+        this.noteEvidence("対象ソース数", String(bucket.targetFiles)),
+        this.noteEvidence("テストありソース数", String(bucket.matchedFiles)),
+        this.noteEvidence("対象重み", bucket.weightedTarget.toFixed(1)),
+        this.noteEvidence("テストあり重み", bucket.weightedMatched.toFixed(1)),
+      ],
+      "derived",
+    );
+  }
+
+  private testCoverageBucket(filePath: string): TestPresenceBucketSummary["id"] {
+    const fileType = this.classifyFileType(filePath);
+    switch (fileType) {
+      case "Route":
+        return "route";
+      case "Form":
+        return "form";
+      case "UI component":
+      case "Layout":
+      case "Shared":
+        return "ui";
+      case "Feature":
+      case "Hook":
+      case "Context/State":
+      case "API/Infrastructure":
+      case "Schema":
+      case "Validation":
+      default:
+        return "feature";
+    }
+  }
+
+  private hasDesignSystemBacking(
+    filePath: string,
+    analysisByFile: Map<string, AnalysisResult>,
+    memo: Map<string, boolean>,
+    visiting: Set<string>,
+  ): boolean {
+    if (memo.has(filePath)) {
+      return memo.get(filePath) ?? false;
+    }
+    if (visiting.has(filePath)) {
+      return false;
+    }
+
+    const result = analysisByFile.get(filePath);
+    if (!result) {
+      memo.set(filePath, false);
+      return false;
+    }
+
+    visiting.add(filePath);
+    const hasBacking = result.dependencies.some((dependency) => {
+      const normalizedModule = dependency.modulePath.replace(/\\/gu, "/").toLowerCase();
+      const normalizedTarget = dependency.target.replace(/\\/gu, "/").toLowerCase();
+      if (normalizedModule.includes("components/ui")
+        || normalizedModule.includes("shared/ui")
+        || normalizedModule.includes("components/commons")
+        || normalizedModule.includes("design-system")
+        || normalizedTarget.includes("/components/ui/")
+        || normalizedTarget.includes("/shared/ui/")
+        || normalizedTarget.includes("/components/commons/")) {
+        return true;
+      }
+
+      return !dependency.isExternal && this.hasDesignSystemBacking(dependency.target, analysisByFile, memo, visiting);
+    });
+    visiting.delete(filePath);
+    memo.set(filePath, hasBacking);
+    return hasBacking;
+  }
+
+  private isLikelyUserFacingText(text: string): boolean {
+    return /\p{Letter}/u.test(text);
   }
 
   private manualMetric(
@@ -1220,11 +1610,13 @@ export class QualityReportGenerator {
     verdict: QualityVerdict,
     summary: string,
     evidence: QualityEvidence[],
+    aggregation: QualityMetricAggregation = "primary",
   ): QualityMetricReport {
     return {
       id,
       category,
       label,
+      aggregation,
       actual,
       threshold,
       verdict,
@@ -1251,10 +1643,20 @@ export class QualityReportGenerator {
     };
   }
 
+  private primaryMetrics(metrics: QualityMetricReport[]): QualityMetricReport[] {
+    return metrics.filter((metric) => metric.aggregation !== "derived");
+  }
+
+  private derivedMetrics(metrics: QualityMetricReport[]): QualityMetricReport[] {
+    return metrics.filter((metric) => metric.aggregation === "derived");
+  }
+
   private verdictMark(verdict: QualityVerdict): string {
     switch (verdict) {
       case "pass":
         return "○";
+      case "partial":
+        return "◐";
       case "warn":
         return "△";
       case "fail":
@@ -1270,6 +1672,8 @@ export class QualityReportGenerator {
     switch (verdict) {
       case "pass":
         return "PASS";
+      case "partial":
+        return "PARTIAL";
       case "warn":
         return "WARN";
       case "fail":

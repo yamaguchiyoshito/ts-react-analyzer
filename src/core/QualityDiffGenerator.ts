@@ -42,6 +42,7 @@ export class QualityDiffGenerator {
         metrics.filter((metric) => metric.category === categoryId),
       )
     );
+    const primaryMetrics = metrics.filter((metric) => this.isPrimaryDiffMetric(metric));
 
     return {
       generatedAt: new Date().toISOString(),
@@ -53,18 +54,18 @@ export class QualityDiffGenerator {
         baselineOverallVerdict: baseline.summary.overallVerdict,
         currentOverallVerdict: current.summary.overallVerdict,
         changedCategories: categories.filter((category) => category.status !== "unchanged").length,
-        changedMetrics: metrics.filter((metric) => metric.status !== "unchanged").length,
-        improvedMetrics: metrics.filter((metric) => metric.trend === "improved").length,
-        regressedMetrics: metrics.filter((metric) => metric.trend === "regressed").length,
-        automaticRegressions: metrics.filter((metric) =>
+        changedMetrics: primaryMetrics.filter((metric) => metric.status !== "unchanged").length,
+        improvedMetrics: primaryMetrics.filter((metric) => metric.trend === "improved").length,
+        regressedMetrics: primaryMetrics.filter((metric) => metric.trend === "regressed").length,
+        automaticRegressions: primaryMetrics.filter((metric) =>
           metric.trend === "regressed" && metric.currentAutomation === "automatic"
         ).length,
-        manualRegressions: metrics.filter((metric) =>
+        manualRegressions: primaryMetrics.filter((metric) =>
           metric.trend === "regressed" && metric.currentAutomation === "manual"
         ).length,
-        addedMetrics: metrics.filter((metric) => metric.status === "added").length,
-        removedMetrics: metrics.filter((metric) => metric.status === "removed").length,
-        unchangedMetrics: metrics.filter((metric) => metric.status === "unchanged").length,
+        addedMetrics: primaryMetrics.filter((metric) => metric.status === "added").length,
+        removedMetrics: primaryMetrics.filter((metric) => metric.status === "removed").length,
+        unchangedMetrics: primaryMetrics.filter((metric) => metric.status === "unchanged").length,
       },
       categories,
       metrics,
@@ -125,6 +126,9 @@ export class QualityDiffGenerator {
     if ((baseline?.automation ?? undefined) !== (current?.automation ?? undefined)) {
       changes.push(`automation: ${baseline?.automation ?? "none"} -> ${current?.automation ?? "none"}`);
     }
+    if ((baseline?.aggregation ?? undefined) !== (current?.aggregation ?? undefined)) {
+      changes.push(`aggregation: ${baseline?.aggregation ?? "none"} -> ${current?.aggregation ?? "none"}`);
+    }
     if ((baseline?.summary ?? undefined) !== (current?.summary ?? undefined)) {
       changes.push("summary updated");
     }
@@ -154,6 +158,8 @@ export class QualityDiffGenerator {
       category: categoryId,
       categoryLabel: this.resolveCategoryLabel(current, baseline),
       label: current?.label ?? baseline?.label ?? metric.id,
+      baselineAggregation: baseline?.aggregation,
+      currentAggregation: current?.aggregation,
       status,
       trend: this.calculateTrend(current?.verdict, baseline?.verdict),
       baselineActual: baseline?.actual,
@@ -222,12 +228,14 @@ export class QualityDiffGenerator {
       case "pass":
       case "not_applicable":
         return 0;
-      case "manual":
+      case "partial":
         return 1;
-      case "warn":
+      case "manual":
         return 2;
-      case "fail":
+      case "warn":
         return 3;
+      case "fail":
+        return 4;
     }
   }
 
@@ -236,6 +244,10 @@ export class QualityDiffGenerator {
     baseline: QualityMetricReport | undefined,
   ): string {
     return this.categoryLabel(current?.category ?? baseline?.category);
+  }
+
+  private isPrimaryDiffMetric(metric: QualityMetricDiffEntry): boolean {
+    return (metric.currentAggregation ?? metric.baselineAggregation ?? "primary") === "primary";
   }
 
   private categoryLabel(categoryId?: QualityCategoryId): string {

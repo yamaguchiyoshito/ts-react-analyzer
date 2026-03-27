@@ -370,7 +370,7 @@ async function qualityProject(
 
     const failingAutomaticMetrics = report.categories
       .flatMap((category) => category.metrics.map((metric) => ({ category: category.label, metric })))
-      .filter(({ metric }) => metric.automation === "automatic" && metric.verdict === "fail");
+      .filter(({ metric }) => metric.aggregation === "primary" && metric.automation === "automatic" && metric.verdict === "fail");
     const shouldCompareWithBaseline = Boolean(baselineReport && baselinePath && (mode === "diff" || mode === "gate"));
     const qualityDiffGenerator = shouldCompareWithBaseline ? new QualityDiffGenerator() : undefined;
     const currentReportPath = path.join(config.outputDir, `${config.filePrefix}_quality_report.json`);
@@ -509,6 +509,9 @@ function selectBlockingRegressionMetrics(
   const blockingMetricIds = new Set(config.qualityGateBlockingMetricIds);
 
   return diff.metrics.filter((metric) => {
+    if ((metric.currentAggregation ?? metric.baselineAggregation ?? "primary") !== "primary") {
+      return false;
+    }
     if (metric.trend !== "regressed" || metric.currentAutomation !== "automatic") {
       return false;
     }
