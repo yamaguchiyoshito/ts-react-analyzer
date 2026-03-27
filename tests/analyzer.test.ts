@@ -531,10 +531,61 @@ test("CLI quality collect auto-loads quality.manual.json and merges manual metri
   assert.equal(requirementsMetric?.automation, "manual");
   assert.equal(requirementsMetric?.verdict, "pass");
   assert.equal(requirementsMetric?.actual, "100%");
-  assert.match(requirementsMetric?.evidence?.[0]?.filePath ?? "", /requirements\.csv$/u);
+  assert.equal(requirementsMetric?.evidence?.[0]?.filePath, "requirements.csv");
+  assert.equal(requirementsMetric?.evidence?.[0]?.value, "要件台帳");
   assert.equal(bugMetric?.verdict, "pass");
   assert.equal(bugMetric?.actual, "High=0, Medium=1, Low=2");
   assert.equal(functionalCategory?.verdict, "partial");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator renders automatic file evidences with project-relative paths", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-relative-paths-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, ".github", "workflows"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+      jsx: "react-jsx",
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "README.md"), "# sample\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, ".github", "workflows", "ci.yml"), "name: ci\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.tsx"), "export const App = () => <main>app</main>;\n", "utf8");
+
+  await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality",
+    "collect",
+    projectRoot,
+    "--output",
+    outputDir,
+    "--prefix",
+    "relative-paths",
+    "--format",
+    "json",
+  ]);
+
+  const report = JSON.parse(await fs.readFile(path.join(outputDir, "relative-paths_quality_report.json"), "utf8")) as QualityReport;
+  const operationsCategory = report.categories.find((category) => category.id === "operations");
+  const buildCategory = report.categories.find((category) => category.id === "build");
+  const docsMetric = operationsCategory!.metrics.find((metric) => metric.id === "documentation_presence");
+  const ciMetric = buildCategory!.metrics.find((metric) => metric.id === "ci_presence");
+  const escapedRoot = projectRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+
+  assert.equal(docsMetric?.evidence?.[0]?.filePath, "README.md");
+  assert.equal(ciMetric?.evidence?.[0]?.filePath, ".github/workflows");
+  assert.equal(docsMetric?.evidence?.[0]?.value, "README.md");
+  assert.equal(ciMetric?.evidence?.[0]?.value, ".github/workflows");
+  assert.doesNotMatch(docsMetric?.evidence?.[0]?.value ?? "", new RegExp(`^${escapedRoot}`));
+  assert.doesNotMatch(ciMetric?.evidence?.[0]?.value ?? "", new RegExp(`^${escapedRoot}`));
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
@@ -619,6 +670,94 @@ test("QualityReportGenerator imports JUnit and LCOV artifacts into test metrics"
   assert.equal(coverageMetric?.automation, "automatic");
   assert.equal(coverageMetric?.actual, "90.0%");
   assert.equal(coverageMetric?.verdict, "pass");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator detects Vitest when JUnit XML is absent", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-vitest-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "package.json"), JSON.stringify({
+    name: "vitest-sample",
+    private: true,
+    scripts: {
+      test: "vitest run",
+      "test:unit": "vitest",
+    },
+    devDependencies: {
+      vitest: "^3.0.0",
+    },
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "vitest.config.ts"), "export default {};\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "value.ts"), "export const value = (input: number) => input + 1;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "value.test.ts"), "import { describe, expect, test } from 'vitest';\nvoid describe; void expect; void test;\n", "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "vitest-quality",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const qualityReportGenerator = new QualityReportGenerator();
+  const report = await qualityReportGenerator.generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 500,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "vitest-quality",
+    formats: ["json"],
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const unitPassMetric = testCategory!.metrics.find((metric) => metric.id === "unit_pass_rate");
+
+  assert.equal(unitPassMetric?.automation, "manual");
+  assert.equal(unitPassMetric?.actual, "Vitest検出 / 結果未収集");
+  assert.equal(unitPassMetric?.summary, "Vitest は検出されましたが、JUnit XML などの実行結果が見つからないため通過率は算出できません。");
+  assert.ok(unitPassMetric?.evidence.some((item) => item.label === "vitest" && item.filePath === "package.json"));
+  assert.ok(unitPassMetric?.evidence.some((item) => item.label === "vitest" && item.filePath === "vitest.config.ts"));
+  assert.ok(unitPassMetric?.evidence.some((item) => item.label === "vitest-script" && /test:unit: vitest/u.test(item.value)));
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });

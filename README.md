@@ -79,15 +79,16 @@ node dist/src/cli.js diff ./my-app \
 ### 品質レポート / quality gate / quality diff
 
 `collect` と `report` は品質レポートを生成します。  
-`gate` は自動判定の `FAIL` が 1 件でもあると終了コード `2` を返します。  
-`gate --baseline <path>` は baseline 比較も行い、自動指標が `pass -> warn` や `warn -> fail` に悪化した場合も終了コード `2` を返します。
-`diff` は baseline の `*_quality_report.json` と比較し、悪化・改善・追加観点を差分化します。
+`gate` は親指標の自動判定 `FAIL` が 1 件でもあると終了コード `2` を返します。  
+`gate --baseline <path>` は baseline 比較も行い、親指標の自動指標が `pass -> warn` や `warn -> fail` に悪化した場合も終了コード `2` を返します。`--quality-gate-monitoring-metrics` に入れた指標は差分には出しますが gate では落としません。  
+`diff` は baseline の `*_quality_report.json` と比較し、悪化・改善・追加観点を差分化します。差分集計の件数は親指標だけを数え、派生指標は診断用として保持します。
 
 現在は次を自動取込します。
 
 - `tsconfig.json` からの TypeScript 型エラー
 - `coverage/lcov.info` などの LCOV
 - `junit.xml` / `test-results/*.xml` などの JUnit XML
+- `package.json` / `vitest.config.*` / `vitest.workspace.*` からの Vitest 検出
 - `reports/axe*.json` などの axe JSON
 - `reports/lighthouse*.json` などの Lighthouse JSON
 - `playwright-report/results.json` などの Playwright JSON
@@ -168,8 +169,8 @@ node dist/src/cli.js quality diff ./my-app --output ./out --prefix release --bas
 
 | ファイル | 内容 |
 |---|---|
-| `<prefix>_quality_report.json` | 出荷審査向けの品質レポートです。12観点ごとの指標、実績、基準、判定、証跡を保持します |
-| `<prefix>_quality_report.md` | 品質報告書向けの Markdown 出力です。統合評価表と観点別詳細を含みます |
+| `<prefix>_quality_report.json` | 出荷審査向けの品質レポートです。12観点ごとの指標、実績、基準、判定、証跡を保持します。証跡の `filePath` は `projectDir` 基準の相対パスに正規化されます |
+| `<prefix>_quality_report.md` | 品質報告書向けの Markdown 出力です。統合評価表、`PARTIAL` カテゴリ数、親指標 / 派生指標の区別、観点別詳細を含みます |
 | `<prefix>_quality_report.html` | ブラウザ閲覧向けの品質レポートです |
 | `<prefix>_quality_summary.csv` | 品質指標の一覧です。カテゴリ、指標、実績、基準、判定、要約を出します |
 
@@ -179,7 +180,7 @@ node dist/src/cli.js quality diff ./my-app --output ./out --prefix release --bas
 
 | ファイル | 内容 |
 |---|---|
-| `<prefix>_quality_diff.json` | baseline と current の品質差分です。指標ごとの悪化・改善・追加・削除を機械処理向けに保持します |
+| `<prefix>_quality_diff.json` | baseline と current の品質差分です。指標ごとの悪化・改善・追加・削除を機械処理向けに保持します。件数集計は親指標のみ、派生指標は診断情報として保持します |
 | `<prefix>_quality_diff.md` | リリース比較向けの Markdown 差分です。悪化指標と観点差分をすぐ確認できます |
 | `<prefix>_quality_diff.html` | ブラウザ閲覧向けの品質差分レポートです |
 
@@ -224,17 +225,22 @@ node dist/src/cli.js quality diff ./my-app --output ./out --prefix release --bas
 ### 品質レポート
 
 - 12観点の統合評価表
+- 親指標と派生指標の分離
+- `PARTIAL` 指標と `PARTIAL` カテゴリの明示
 - 自動判定可能な指標の PASS / WARN / FAIL
 - 手動証跡が必要な指標の明示
 - baseline 指定時の自動回帰検知
 - TypeScript 型エラー数、循環依存数、型の逃げ道件数
 - 対応テストファイル存在率、Unitテスト通過率、LCOV line coverage
+- Route / Feature / Form / UI の派生テスト対応率
+- JUnit XML 不在時の Vitest 検出シグナル
 - Playwright ベースの E2E 通過率、Storybook Interaction テスト通過率
 - axe ベースの WCAG 違反件数、Lighthouse Performance / LCP / TTI
 - OpenAPI breaking change 数、MSW 採用シグナル、timeout/retry シグナル
 - `npm audit` / Trivy ベースの High / Critical 脆弱性判定
 - `dangerouslySetInnerHTML`、機密情報露出パターン、ハードコード JSX 文字列
 - CI 設定有無、ドキュメント存在、zod 採用率
+- 証跡ファイルパスの `projectDir` 基準相対化
 
 ### 品質差分レポート
 
@@ -325,7 +331,8 @@ node dist/src/cli.js quality diff ./my-app --output ./out --prefix release --bas
 
 `qualityGateBlockingMetricIds` が空なら、自動指標の回帰はすべて gate 対象です。  
 `qualityGateMonitoringMetricIds` に入れた指標は、差分には出しますが gate では落としません。  
-両方に同じ指標が入っている場合は `monitoring` を優先します。
+両方に同じ指標が入っている場合は `monitoring` を優先します。  
+baseline 回帰と `quality diff` の件数集計は親指標だけを数え、派生指標は診断用です。
 
 ## 手動品質証跡
 
@@ -359,6 +366,8 @@ node dist/src/cli.js quality diff ./my-app --output ./out --prefix release --bas
   ]
 }
 ```
+
+出力される品質レポートでは、証跡の `filePath` と表示値は `projectDir` 基準の相対パスへ正規化されます。
 
 ## キャッシュ
 

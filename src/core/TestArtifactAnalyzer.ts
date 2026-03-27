@@ -16,19 +16,27 @@ export interface CoverageSummary {
   files: string[];
 }
 
+export interface VitestSummary {
+  files: string[];
+  scripts: string[];
+}
+
 export interface TestArtifactSummary {
   junit: JUnitSummary | null;
   coverage: CoverageSummary | null;
+  vitest: VitestSummary | null;
 }
 
 export class TestArtifactAnalyzer {
   async analyzeProject(projectRoot: string): Promise<TestArtifactSummary> {
     const junitFiles = await this.findJUnitFiles(projectRoot);
     const coverageFiles = await this.findCoverageFiles(projectRoot);
+    const vitest = await this.detectVitest(projectRoot);
 
     return {
       junit: junitFiles.length > 0 ? await this.parseJUnitFiles(junitFiles) : null,
       coverage: coverageFiles.length > 0 ? await this.parseCoverageFiles(coverageFiles) : null,
+      vitest,
     };
   }
 
@@ -141,6 +149,69 @@ export class TestArtifactAnalyzer {
       lineHit,
       lineCoverage: lineFound > 0 ? (lineHit / lineFound) * 100 : null,
       files,
+    };
+  }
+
+  private async detectVitest(projectRoot: string): Promise<VitestSummary | null> {
+    const files = new Set<string>();
+    const scripts = new Set<string>();
+    const packageJsonPath = path.join(projectRoot, "package.json");
+
+    if (await this.exists(packageJsonPath)) {
+      try {
+        const packageJson = JSON.parse(await fs.readFile(packageJsonPath, "utf8")) as Record<string, unknown>;
+        const dependencyFields = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
+        for (const field of dependencyFields) {
+          const record = packageJson[field];
+          if (record && typeof record === "object" && "vitest" in record) {
+            files.add(packageJsonPath);
+            break;
+          }
+        }
+
+        const packageScripts = packageJson.scripts;
+        if (packageScripts && typeof packageScripts === "object") {
+          for (const [name, command] of Object.entries(packageScripts)) {
+            if (typeof command === "string" && /\bvitest\b/u.test(command)) {
+              files.add(packageJsonPath);
+              scripts.add(`${name}: ${command}`);
+            }
+          }
+        }
+      } catch {
+        // noop
+      }
+    }
+
+    const configCandidates = [
+      "vitest.config.ts",
+      "vitest.config.tsx",
+      "vitest.config.js",
+      "vitest.config.jsx",
+      "vitest.config.mjs",
+      "vitest.config.cjs",
+      "vitest.config.mts",
+      "vitest.config.cts",
+      "vitest.workspace.ts",
+      "vitest.workspace.js",
+      "vitest.workspace.mts",
+      "vitest.workspace.cts",
+    ];
+
+    for (const candidate of configCandidates) {
+      const resolved = path.join(projectRoot, candidate);
+      if (await this.exists(resolved)) {
+        files.add(resolved);
+      }
+    }
+
+    if (files.size === 0 && scripts.size === 0) {
+      return null;
+    }
+
+    return {
+      files: Array.from(files).sort(),
+      scripts: Array.from(scripts).sort(),
     };
   }
 

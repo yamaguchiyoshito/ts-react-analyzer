@@ -108,6 +108,8 @@ const TEST_PRESENCE_BUCKETS: TestPresenceBucketDescriptor[] = [
 ];
 
 export class QualityReportGenerator {
+  private projectRoot?: string;
+
   async generateReports(input: QualityGenerationInput, options: QualityGenerationOptions): Promise<QualityReport> {
     const startedAt = Date.now();
     await fs.mkdir(options.outputDir, { recursive: true });
@@ -135,6 +137,7 @@ export class QualityReportGenerator {
   }
 
   private async buildReport(input: QualityGenerationInput): Promise<QualityReport> {
+    this.projectRoot = path.resolve(input.projectRoot);
     const strictQualityAnalysisResults = input.analysisResults.filter((result) => this.isStrictQualityCheckTargetFile(result.filePath));
     const strictQualityParsedFiles = input.parsedFiles.filter((parsedFile) => this.isStrictQualityCheckTargetFile(parsedFile.filePath));
     const typeCheckSummary = this.filterTypeCheckSummary(new TypeCheckAnalyzer().analyzeProject(input.projectRoot, input.tsConfigPath));
@@ -216,7 +219,9 @@ export class QualityReportGenerator {
         metrics,
       } satisfies QualityCategoryReport;
     });
-    const mergedCategoryReports = this.applyManualInputs(categoryReports, input.manualInputs ?? []);
+    const mergedCategoryReports = this.normalizeEvidenceDisplayPaths(
+      this.applyManualInputs(categoryReports, input.manualInputs ?? []),
+    );
 
     return {
       timestamp: new Date().toISOString(),
@@ -399,6 +404,7 @@ export class QualityReportGenerator {
     const verdict = this.testPresenceVerdict(testPresence.targetFiles, testPresence.rate);
     const junit = testArtifactSummary.junit;
     const coverage = testArtifactSummary.coverage;
+    const vitest = testArtifactSummary.vitest;
     const playwright = uiTestArtifactSummary.playwright;
     const storybook = uiTestArtifactSummary.storybook;
     const junitRate = junit && junit.totalTests > 0 ? (junit.passedTests / junit.totalTests) * 100 : null;
@@ -425,7 +431,21 @@ export class QualityReportGenerator {
           ...junit.files.map((filePath) => this.fileEvidence("junit", filePath)),
         ],
       )
-      : this.manualMetric("test", "unit_pass_rate", "Unitテスト通過率", "100%", "JUnit XML が見つからないため手動入力扱いです。");
+      : vitest
+        ? this.metric(
+          "test",
+          "unit_pass_rate",
+          "Unitテスト通過率",
+          "Vitest検出 / 結果未収集",
+          "100%",
+          "manual",
+          "Vitest は検出されましたが、JUnit XML などの実行結果が見つからないため通過率は算出できません。",
+          [
+            ...vitest.files.map((filePath) => this.fileEvidence("vitest", filePath)),
+            ...vitest.scripts.map((script) => this.noteEvidence("vitest-script", script)),
+          ],
+        )
+        : this.manualMetric("test", "unit_pass_rate", "Unitテスト通過率", "100%", "JUnit XML が見つからず、Vitest も検出されないため手動入力扱いです。");
     const coverageMetric = coverage
       ? this.metric(
         "test",
@@ -804,6 +824,45 @@ export class QualityReportGenerator {
         summary: this.summarizeCategory(metrics),
       };
     });
+  }
+
+  private normalizeEvidenceDisplayPaths(categories: QualityCategoryReport[]): QualityCategoryReport[] {
+    return categories.map((category) => ({
+      ...category,
+      metrics: category.metrics.map((metric) => ({
+        ...metric,
+        evidence: metric.evidence.map((evidence) => this.normalizeEvidenceDisplayValue(evidence)),
+      })),
+    }));
+  }
+
+  private normalizeEvidenceDisplayValue(evidence: QualityEvidence): QualityEvidence {
+    if (evidence.type !== "file" || !evidence.filePath) {
+      return evidence;
+    }
+
+    const displayPath = this.toDisplayPath(evidence.filePath);
+    if (evidence.value === evidence.filePath) {
+      return {
+        ...evidence,
+        filePath: displayPath,
+        value: displayPath,
+      };
+    }
+
+    const prefixedValue = `${evidence.filePath}: `;
+    if (evidence.value.startsWith(prefixedValue)) {
+      return {
+        ...evidence,
+        filePath: displayPath,
+        value: `${displayPath}: ${evidence.value.slice(prefixedValue.length)}`,
+      };
+    }
+
+    return {
+      ...evidence,
+      filePath: displayPath,
+    };
   }
 
   private renderMarkdown(report: QualityReport): string {
@@ -1633,6 +1692,20 @@ export class QualityReportGenerator {
       filePath,
       value: value ? `${filePath}: ${value}` : filePath,
     };
+  }
+
+  private toDisplayPath(filePath: string): string {
+    const normalized = filePath.split(path.sep).join("/");
+    if (!this.projectRoot || !path.isAbsolute(filePath)) {
+      return normalized;
+    }
+
+    const relativePath = path.relative(this.projectRoot, filePath);
+    if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+      return normalized;
+    }
+
+    return relativePath.split(path.sep).join("/");
   }
 
   private noteEvidence(label: string, value: string): QualityEvidence {
