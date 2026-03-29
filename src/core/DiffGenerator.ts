@@ -45,6 +45,8 @@ export class DiffGenerator {
       hotSpotDelta: this.buildHotSpotDelta(current, baseline),
       impact: this.buildImpactSection(
         files.filter((file) => file.status !== "unchanged").map((file) => file.path),
+        current.files,
+        baseline.files,
         current.graphJson,
         baseline.graphJson,
       ),
@@ -136,6 +138,9 @@ export class DiffGenerator {
     if (diff.hotSpotDelta.changed.length > 0) {
       for (const item of diff.hotSpotDelta.changed.slice(0, 10)) {
         markdown += `- ${item.currentDisplayPath} scoreDelta=${item.scoreDelta} complexityDelta=${item.complexityDelta} dependencyDelta=${item.dependencyDelta} anyDelta=${item.anyDelta} cluster=${item.clusterBefore}->${item.clusterAfter}\n`;
+        if ((item.complexityDriverDelta?.length ?? 0) > 0) {
+          markdown += `  drivers=${item.complexityDriverDelta!.join(", ")}\n`;
+        }
       }
       markdown += "\n";
     }
@@ -143,6 +148,19 @@ export class DiffGenerator {
       markdown += "### Added Hot Spots\n\n";
       for (const item of diff.hotSpotDelta.added.slice(0, 10)) {
         markdown += `- ${item.displayPath} score=${item.score} cluster=${item.cluster}\n`;
+        if ((item.complexityDrivers?.length ?? 0) > 0) {
+          markdown += `  drivers=${item.complexityDrivers!.join(", ")}\n`;
+        }
+      }
+      markdown += "\n";
+    }
+    if (diff.hotSpotDelta.removed.length > 0) {
+      markdown += "### Removed Hot Spots\n\n";
+      for (const item of diff.hotSpotDelta.removed.slice(0, 10)) {
+        markdown += `- ${item.displayPath} score=${item.score} cluster=${item.cluster}\n`;
+        if ((item.complexityDrivers?.length ?? 0) > 0) {
+          markdown += `  drivers=${item.complexityDrivers!.join(", ")}\n`;
+        }
       }
       markdown += "\n";
     }
@@ -153,7 +171,11 @@ export class DiffGenerator {
     if (diff.impact.prioritizedFiles.length > 0) {
       markdown += "### Prioritized Impacted Files\n\n";
       for (const item of diff.impact.prioritizedFiles.slice(0, 10)) {
-        markdown += `- ${item.path} score=${item.score} distance=${item.distance} inbound=${item.inboundDegree} outbound=${item.outboundDegree}\n`;
+        markdown += `- ${item.path} score=${item.score} distance=${item.distance} inbound=${item.inboundDegree} outbound=${item.outboundDegree} complexityPressure=${item.complexityPressure}`;
+        if (item.reasons.length > 0) {
+          markdown += ` reasons=${item.reasons.join(",")}`;
+        }
+        markdown += "\n";
       }
       markdown += "\n";
     }
@@ -194,9 +216,19 @@ export class DiffGenerator {
       : "<li>none</li>";
     const hotSpotChanged = diff.hotSpotDelta.changed.length > 0
       ? `<ul>${diff.hotSpotDelta.changed.slice(0, 10).map((item) =>
-        `<li><a href="${this.toFileHref(item.path)}">${this.escapeHtml(item.currentDisplayPath)}</a> scoreDelta=${item.scoreDelta} complexityDelta=${item.complexityDelta} dependencyDelta=${item.dependencyDelta} anyDelta=${item.anyDelta} cluster=${this.escapeHtml(item.clusterBefore)}-&gt;${this.escapeHtml(item.clusterAfter)}</li>`
+        `<li><a href="${this.toFileHref(item.path)}">${this.escapeHtml(item.currentDisplayPath)}</a> scoreDelta=${item.scoreDelta} complexityDelta=${item.complexityDelta} dependencyDelta=${item.dependencyDelta} anyDelta=${item.anyDelta} cluster=${this.escapeHtml(item.clusterBefore)}-&gt;${this.escapeHtml(item.clusterAfter)}${this.renderHtmlDriverMeta(item.complexityDriverDelta)}</li>`
       ).join("")}</ul>`
       : "<p>No changed hot spots.</p>";
+    const hotSpotAdded = diff.hotSpotDelta.added.length > 0
+      ? `<ul>${diff.hotSpotDelta.added.slice(0, 10).map((item) =>
+        `<li><a href="${this.toFileHref(item.path)}">${this.escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${this.escapeHtml(item.cluster)}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
+      ).join("")}</ul>`
+      : "<p>No added hot spots.</p>";
+    const hotSpotRemoved = diff.hotSpotDelta.removed.length > 0
+      ? `<ul>${diff.hotSpotDelta.removed.slice(0, 10).map((item) =>
+        `<li><a href="${this.toFileHref(item.path)}">${this.escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${this.escapeHtml(item.cluster)}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
+      ).join("")}</ul>`
+      : "<p>No removed hot spots.</p>";
     const impactGraph = JSON.stringify(diff.impact.graph).replace(/</gu, "\\u003c");
     const subtreeData = JSON.stringify(diff.impact.subtrees).replace(/</gu, "\\u003c");
     const subtreeMetricsData = JSON.stringify(diff.impact.subtrees).replace(/</gu, "\\u003c");
@@ -266,7 +298,12 @@ export class DiffGenerator {
     <li>Removed Hot Spots: ${diff.hotSpotDelta.removed.length}</li>
     <li>Changed Hot Spots: ${diff.hotSpotDelta.changed.length}</li>
   </ul>
+  <h3>Changed Hot Spots</h3>
   ${hotSpotChanged}
+  <h3>Added Hot Spots</h3>
+  ${hotSpotAdded}
+  <h3>Removed Hot Spots</h3>
+  ${hotSpotRemoved}
   <h2>Changed Subtree</h2>
   <div id="impact-toolbar">
     <label for="impact-focus">Focus</label>
@@ -327,9 +364,10 @@ export class DiffGenerator {
         ? "<p>No impacted files.</p>"
         : visible.map((item) => {
             const reasons = item.reasons.join(", ");
+            const complexityPressure = item.complexityPressure > 0 ? ", complexityPressure=" + item.complexityPressure : "";
             return "<div class=\\"impact-entry\\">" +
               "<div><span class=\\"impact-score\\">" + item.score + "</span><a href=\\"" + toHref(item.path) + "\\">" + item.path + "</a></div>" +
-              "<div class=\\"impact-meta\\">distance=" + item.distance + ", inbound=" + item.inboundDegree + ", outbound=" + item.outboundDegree + ", reasons=" + reasons + "</div>" +
+              "<div class=\\"impact-meta\\">distance=" + item.distance + ", inbound=" + item.inboundDegree + ", outbound=" + item.outboundDegree + complexityPressure + ", reasons=" + reasons + "</div>" +
             "</div>";
           }).join("");
     }
@@ -486,9 +524,13 @@ export class DiffGenerator {
 
   private buildImpactSection(
     changedFiles: string[],
+    currentFiles: PersistedAnalysisReport["files"],
+    baselineFiles: PersistedAnalysisReport["files"],
     currentGraph?: PersistedAnalysisReport["graphJson"],
     baselineGraph?: PersistedAnalysisReport["graphJson"],
   ) {
+    const currentFilesByPath = new Map(currentFiles.map((file) => [file.path, file]));
+    const baselineFilesByPath = new Map(baselineFiles.map((file) => [file.path, file]));
     const currentEdges = currentGraph?.edges ?? [];
     const baselineEdges = baselineGraph?.edges ?? [];
     const combinedNodes = this.mergeNodes(currentGraph?.nodes ?? [], baselineGraph?.nodes ?? []);
@@ -504,13 +546,25 @@ export class DiffGenerator {
         const inboundDegree = incoming.get(filePath)?.size ?? 0;
         const outboundDegree = outgoing.get(filePath)?.size ?? 0;
         const directlyChanged = filePath === root;
+        const complexityChange = this.getComplexityChangePressure(
+          filePath,
+          currentFilesByPath.get(filePath),
+          baselineFilesByPath.get(filePath),
+        );
         const score = this.computeImpactScore({
           directlyChanged,
           distance,
           inboundDegree,
           outboundDegree,
+          complexityPressure: complexityChange.score,
         });
-        return { score, distance, inboundDegree, outboundDegree };
+        return {
+          score,
+          distance,
+          inboundDegree,
+          outboundDegree,
+          complexityPressure: complexityChange.score,
+        };
       });
       return {
         root,
@@ -543,17 +597,24 @@ export class DiffGenerator {
       const inboundDegree = incoming.get(filePath)?.size ?? 0;
       const outboundDegree = outgoing.get(filePath)?.size ?? 0;
       const directlyChanged = changedFiles.includes(filePath);
+      const complexityChange = this.getComplexityChangePressure(
+        filePath,
+        currentFilesByPath.get(filePath),
+        baselineFilesByPath.get(filePath),
+      );
       const score = this.computeImpactScore({
         directlyChanged,
         distance,
         inboundDegree,
         outboundDegree,
+        complexityPressure: complexityChange.score,
       });
       const reasons = this.buildImpactReasons({
         directlyChanged,
         distance,
         inboundDegree,
         outboundDegree,
+        complexitySignals: complexityChange.signals,
       });
       return {
         path: filePath,
@@ -562,6 +623,8 @@ export class DiffGenerator {
         inboundDegree,
         outboundDegree,
         directlyChanged,
+        complexityPressure: complexityChange.score,
+        complexitySignals: complexityChange.signals,
         reasons,
       };
     }).sort((left, right) => right.score - left.score || left.path.localeCompare(right.path));
@@ -604,6 +667,10 @@ export class DiffGenerator {
       const complexityDelta = currentItem.complexity - baselineItem.complexity;
       const dependencyDelta = currentItem.dependencies - baselineItem.dependencies;
       const anyDelta = currentItem.anyCount - baselineItem.anyCount;
+      const complexityDriverDelta = this.buildComplexityDriverDelta(
+        baselineItem.complexityDrivers,
+        currentItem.complexityDrivers,
+      );
 
       if (
         scoreDelta !== 0
@@ -611,6 +678,7 @@ export class DiffGenerator {
         || dependencyDelta !== 0
         || anyDelta !== 0
         || currentItem.cluster !== baselineItem.cluster
+        || complexityDriverDelta.length > 0
       ) {
         changed.push({
           path,
@@ -622,6 +690,9 @@ export class DiffGenerator {
           anyDelta,
           clusterBefore: baselineItem.cluster,
           clusterAfter: currentItem.cluster,
+          baselineComplexityDrivers: baselineItem.complexityDrivers,
+          currentComplexityDrivers: currentItem.complexityDrivers,
+          complexityDriverDelta,
         });
       }
     }
@@ -631,6 +702,58 @@ export class DiffGenerator {
     changed.sort((left, right) => Math.abs(right.scoreDelta) - Math.abs(left.scoreDelta) || left.currentDisplayPath.localeCompare(right.currentDisplayPath));
 
     return { added, removed, changed };
+  }
+
+  private buildComplexityDriverDelta(baselineDrivers?: string[], currentDrivers?: string[]): string[] {
+    const baseline = this.toDriverEntryMap(baselineDrivers);
+    const current = this.toDriverEntryMap(currentDrivers);
+    const orderedKeys = [
+      ...Array.from(current.keys()),
+      ...Array.from(baseline.keys()).filter((key) => !current.has(key)),
+    ];
+    const deltas: string[] = [];
+
+    for (const key of orderedKeys) {
+      const before = baseline.get(key);
+      const after = current.get(key);
+      if (before === after) {
+        continue;
+      }
+      if (before && after) {
+        deltas.push(`${key}=${before}->${after}`);
+        continue;
+      }
+      if (!before && after) {
+        deltas.push(`${key}=+${after}`);
+        continue;
+      }
+      if (before && !after) {
+        deltas.push(`${key}=-${before}`);
+      }
+    }
+
+    return deltas;
+  }
+
+  private toDriverEntryMap(drivers?: string[]): Map<string, string> {
+    const entries = new Map<string, string>();
+    for (const driver of drivers ?? []) {
+      const separator = driver.indexOf("=");
+      if (separator <= 0) {
+        continue;
+      }
+      const key = driver.slice(0, separator);
+      const value = driver.slice(separator + 1);
+      entries.set(key, value);
+    }
+    return entries;
+  }
+
+  private renderHtmlDriverMeta(drivers?: string[]): string {
+    if (!drivers || drivers.length === 0) {
+      return "";
+    }
+    return `<div class="impact-meta">drivers=${this.escapeHtml(drivers.join(", "))}</div>`;
   }
 
   private mergeNodes(currentNodes: GraphNode[], baselineNodes: GraphNode[]): GraphNode[] {
@@ -759,6 +882,7 @@ export class DiffGenerator {
     distance: number;
     inboundDegree: number;
     outboundDegree: number;
+    complexityPressure: number;
   }): number {
     let score = 0;
     if (input.directlyChanged) {
@@ -767,6 +891,7 @@ export class DiffGenerator {
     score += Math.max(0, 50 - input.distance * 12);
     score += input.inboundDegree * 5;
     score += input.outboundDegree * 4;
+    score += input.complexityPressure;
     return score;
   }
 
@@ -775,6 +900,7 @@ export class DiffGenerator {
     distance: number;
     inboundDegree: number;
     outboundDegree: number;
+    complexitySignals: string[];
   }): string[] {
     const reasons: string[] = [];
     if (input.directlyChanged) {
@@ -791,7 +917,80 @@ export class DiffGenerator {
     if (input.outboundDegree >= 2) {
       reasons.push("high-fan-out");
     }
-    return reasons;
+    return [...reasons, ...input.complexitySignals];
+  }
+
+  private getComplexityChangePressure(
+    filePath: string,
+    current?: PersistedFileReport,
+    baseline?: PersistedFileReport,
+  ): { score: number; signals: string[] } {
+    if (!current || !baseline) {
+      return { score: 0, signals: [] };
+    }
+
+    const currentBreakdown = current.complexity.scoreBreakdown;
+    const baselineBreakdown = baseline.complexity.scoreBreakdown;
+    const signals: string[] = [];
+    let score = 0;
+    const currentOverall = current.complexity.overallComplexity;
+    const baselineOverall = baseline.complexity.overallComplexity;
+    const overallDelta = currentOverall - baselineOverall;
+
+    if (overallDelta > 0) {
+      const points = Math.min(24, overallDelta * 4);
+      score += points;
+      signals.push(`weighted=+${overallDelta}`);
+    }
+
+    const driverDeltas = [
+      this.createComplexityPressureEntry("peakFn", baselineBreakdown?.peakFunctionComplexity ?? 0, currentBreakdown?.peakFunctionComplexity ?? 0, 5),
+      this.createComplexityPressureEntry("top3avg", baselineBreakdown?.topFunctionAverage ?? 0, currentBreakdown?.topFunctionAverage ?? 0, 3),
+      this.createComplexityPressureEntry("renderPeak", baselineBreakdown?.peakRenderComplexity ?? 0, currentBreakdown?.peakRenderComplexity ?? 0, 6),
+      this.createComplexityPressureEntry("hookPressure", baselineBreakdown?.hookPressure ?? 0, currentBreakdown?.hookPressure ?? 0, 4),
+      this.createComplexityPressureEntry("nesting", baselineBreakdown?.peakNestingDepth ?? 0, currentBreakdown?.peakNestingDepth ?? 0, 4),
+      this.createComplexityPressureEntry("elevatedFns", baselineBreakdown?.elevatedFunctionCount ?? 0, currentBreakdown?.elevatedFunctionCount ?? 0, 5),
+    ];
+
+    for (const entry of driverDeltas) {
+      if (!entry) {
+        continue;
+      }
+      score += entry.score;
+      signals.push(`${entry.label}=+${this.formatImpactMetric(entry.delta)}`);
+    }
+
+    if (filePath && score > 0 && signals.length === 0) {
+      signals.push("complexity-regressed");
+    }
+
+    return {
+      score: Math.min(40, score),
+      signals,
+    };
+  }
+
+  private createComplexityPressureEntry(
+    label: string,
+    baseline: number,
+    current: number,
+    weight: number,
+  ): { label: string; delta: number; score: number } | null {
+    const delta = current - baseline;
+    if (delta <= 0) {
+      return null;
+    }
+
+    return {
+      label,
+      delta,
+      score: Math.min(12, Math.ceil(delta * weight)),
+    };
+  }
+
+  private formatImpactMetric(value: number): string {
+    const rounded = Number(value.toFixed(2));
+    return Number.isInteger(rounded) ? String(rounded) : String(rounded);
   }
 
   private escapeHtml(value: string): string {

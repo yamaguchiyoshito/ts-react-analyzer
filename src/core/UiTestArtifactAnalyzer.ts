@@ -7,6 +7,7 @@ export interface UiTestRunSummary {
   failedTests: number;
   skippedTests: number;
   files: string[];
+  executedTestFiles: string[];
 }
 
 export interface UiTestArtifactSummary {
@@ -22,6 +23,11 @@ interface PlaywrightLikeTest {
   status?: string;
   expectedStatus?: string;
   results?: PlaywrightLikeResult[];
+  file?: string;
+  path?: string;
+  location?: {
+    file?: string;
+  };
 }
 
 interface StorybookLikeEntry {
@@ -34,7 +40,7 @@ export class UiTestArtifactAnalyzer {
     const storybookFiles = await this.findStorybookFiles(projectRoot);
 
     return {
-      playwright: playwrightFiles.length > 0 ? await this.parsePlaywrightFiles(playwrightFiles) : null,
+      playwright: playwrightFiles.length > 0 ? await this.parsePlaywrightFiles(projectRoot, playwrightFiles) : null,
       storybook: storybookFiles.length > 0 ? await this.parseStorybookFiles(storybookFiles) : null,
     };
   }
@@ -89,11 +95,12 @@ export class UiTestArtifactAnalyzer {
     return Array.from(files).sort();
   }
 
-  private async parsePlaywrightFiles(files: string[]): Promise<UiTestRunSummary> {
+  private async parsePlaywrightFiles(projectRoot: string, files: string[]): Promise<UiTestRunSummary> {
     let totalTests = 0;
     let passedTests = 0;
     let failedTests = 0;
     let skippedTests = 0;
+    const executedTestFiles = new Set<string>();
 
     for (const filePath of files) {
       const payload = JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
@@ -101,6 +108,10 @@ export class UiTestArtifactAnalyzer {
 
       for (const test of tests) {
         totalTests += 1;
+        const testFile = this.extractPlaywrightTestFile(test);
+        if (testFile) {
+          executedTestFiles.add(this.resolveArtifactSourcePath(projectRoot, filePath, testFile));
+        }
         const status = this.normalizePlaywrightStatus(test);
         if (status === "passed") {
           passedTests += 1;
@@ -118,6 +129,7 @@ export class UiTestArtifactAnalyzer {
       failedTests,
       skippedTests,
       files,
+      executedTestFiles: Array.from(executedTestFiles).sort(),
     };
   }
 
@@ -159,6 +171,7 @@ export class UiTestArtifactAnalyzer {
       failedTests,
       skippedTests,
       files,
+      executedTestFiles: [],
     };
   }
 
@@ -209,6 +222,13 @@ export class UiTestArtifactAnalyzer {
     return "failed";
   }
 
+  private extractPlaywrightTestFile(test: PlaywrightLikeTest): string | null {
+    return test.location?.file?.trim()
+      || test.file?.trim()
+      || test.path?.trim()
+      || null;
+  }
+
   private extractStorybookSummary(payload: unknown): UiTestRunSummary | null {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
       return null;
@@ -230,6 +250,7 @@ export class UiTestArtifactAnalyzer {
       failedTests: failedTests > 0 ? failedTests : Math.max(0, totalTests - passedTests - skippedTests),
       skippedTests,
       files: [],
+      executedTestFiles: [],
     };
   }
 
@@ -268,6 +289,20 @@ export class UiTestArtifactAnalyzer {
 
   private readNumber(value: unknown): number | null {
     return typeof value === "number" && Number.isFinite(value) ? value : null;
+  }
+
+  private resolveArtifactSourcePath(projectRoot: string, artifactFilePath: string, sourcePath: string): string {
+    const trimmed = sourcePath.trim();
+    if (!trimmed) {
+      return artifactFilePath;
+    }
+    if (path.isAbsolute(trimmed)) {
+      return path.normalize(trimmed);
+    }
+
+    const projectRelative = path.resolve(projectRoot, trimmed);
+    const artifactRelative = path.resolve(path.dirname(artifactFilePath), trimmed);
+    return trimmed.startsWith(".") ? artifactRelative : projectRelative;
   }
 
   private async findFilesByPattern(

@@ -3,11 +3,14 @@ import fs from "node:fs/promises";
 import { parseArgs } from "node:util";
 
 import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, ManualQualityInputLoader, QualityDiffGenerator, QualityReportGenerator, ReportGenerator } from "./core/index.js";
+import { shouldIncludeInAnalysisScope } from "./core/FileConventions.js";
 import type { AnalysisConfig, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, PersistedAnalysisReport, QualityDiffReport, QualityMetricDiffEntry, QualityReport } from "./types/index.js";
 
 interface RunArtifacts {
   results: AnalysisResult[];
+  allResults: AnalysisResult[];
   scanResult: Awaited<ReturnType<FileScanner["scanProject"]>>;
+  fullScanResult: Awaited<ReturnType<FileScanner["scanProject"]>>;
   graphBuilder: GraphBuilder;
   graphJson: GraphJSON;
   graphMetrics: GraphMetrics;
@@ -31,9 +34,12 @@ Options:
   --prefix <name>                report file prefix
   --verbose                      enable debug logging
   --max-file-size <bytes>        skip files larger than the threshold
+  --analysis-scope <scope>       all,source-only
+  --quality-profile <profile>    application,library-repo
   --complexity-threshold <n>     warning threshold
   --impact-threshold <n>         diff impact score threshold
   --fail-on-impact               exit non-zero when impact threshold is exceeded
+  --exclude-groups <groups>      comma-separated exclusion groups
   --exclude-patterns <patterns>  comma-separated regex patterns
   --cache-dir <dir>              cache directory
   --log-file <path>              log file path
@@ -42,20 +48,38 @@ Options:
                                 comma-separated metric ids that must fail gate on regression
   --quality-gate-monitoring-metrics <ids>
                                 comma-separated metric ids excluded from regression gate
+  --max-typecheck-root-names <n> skip TS program creation above this root count
   --baseline <path>              baseline report json path for diff/gate
   --help                         show help
 `);
 }
 
-async function buildArtifacts(projectDir: string, config: AnalysisConfig, logger: Logger): Promise<RunArtifacts> {
-  const scanner = new FileScanner(config);
-  const scanResult = await scanner.scanProject(projectDir);
+async function buildArtifacts(
+  projectDir: string,
+  config: AnalysisConfig,
+  logger: Logger,
+  options: { includeUnscopedScan?: boolean } = {},
+): Promise<RunArtifacts> {
+  const preferUnscopedScan = options.includeUnscopedScan && config.analysisScope !== "all";
+  const fullScanResult = await new FileScanner({
+    ...config,
+    analysisScope: preferUnscopedScan ? "all" : config.analysisScope,
+  }).scanProject(projectDir);
+  const scopedParsedFiles = fullScanResult.parsed.filter((parsedFile) =>
+    shouldIncludeInAnalysisScope(parsedFile.filePath, config.analysisScope)
+  );
+  const scopedFilePaths = new Set(scopedParsedFiles.map((parsedFile) => parsedFile.filePath));
+  const scanResult = {
+    ...fullScanResult,
+    parsed: scopedParsedFiles,
+  };
   logger.info("Scan completed", {
-    parsed: scanResult.parsed.length,
-    skipped: scanResult.skipped.length,
-    errors: scanResult.errors.length,
-    fileCacheHits: scanResult.cacheStats.hits,
-    fileCacheMisses: scanResult.cacheStats.misses,
+    parsed: fullScanResult.parsed.length,
+    scopedParsed: scopedParsedFiles.length,
+    skipped: fullScanResult.skipped.length,
+    errors: fullScanResult.errors.length,
+    fileCacheHits: fullScanResult.cacheStats.hits,
+    fileCacheMisses: fullScanResult.cacheStats.misses,
   });
 
   const analysisCache = new AnalysisCache(config.cacheDir, projectDir, config.tsCompilerOptions);
@@ -65,9 +89,11 @@ async function buildArtifacts(projectDir: string, config: AnalysisConfig, logger
   const complexityAnalyzer = new ComplexityAnalyzer();
   const graphBuilder = new GraphBuilder();
   const results: AnalysisResult[] = [];
+  const allResults: AnalysisResult[] = [];
 
-  for (const parsedFile of scanResult.parsed) {
-    const cached = analysisCache.get(parsedFile.filePath, parsedFile.metadata.sha256);
+  for (const parsedFile of fullScanResult.parsed) {
+    const analysisContextHash = dependencyAnalyzer.getAnalysisContextHash(parsedFile.filePath);
+    const cached = analysisCache.get(parsedFile.filePath, parsedFile.metadata.sha256, analysisContextHash);
     const result = cached
       ? {
           filePath: parsedFile.filePath,
@@ -84,7 +110,7 @@ async function buildArtifacts(projectDir: string, config: AnalysisConfig, logger
             dependencies: dependencyResult.dependencies,
             dependencyErrors: dependencyResult.errors,
           };
-          analysisCache.set(parsedFile.filePath, parsedFile.metadata.sha256, {
+          analysisCache.set(parsedFile.filePath, parsedFile.metadata.sha256, analysisContextHash, {
             complexity,
             dependencies: dependencyResult.dependencies,
             dependencyErrors: dependencyResult.errors,
@@ -92,22 +118,26 @@ async function buildArtifacts(projectDir: string, config: AnalysisConfig, logger
           return freshResult;
         })();
 
-    for (const dependency of result.dependencies) {
-      if (!dependency.isExternal) {
-        graphBuilder.addDependency(dependency.source, dependency.target, {
-          type: dependency.type,
-          isExternal: dependency.isExternal,
-        });
+    if (scopedFilePaths.has(parsedFile.filePath)) {
+      for (const dependency of result.dependencies) {
+        if (!dependency.isExternal) {
+          graphBuilder.addDependency(dependency.source, dependency.target, {
+            type: dependency.type,
+            isExternal: dependency.isExternal,
+          });
+        }
       }
+
+      logger.debug(cached ? "File analyzed from cache" : "File analyzed", {
+        filePath: parsedFile.filePath,
+        dependencies: result.dependencies.length,
+        functions: result.complexity.functions.length,
+        components: result.complexity.components.length,
+      });
+      results.push(result);
     }
 
-    logger.debug(cached ? "File analyzed from cache" : "File analyzed", {
-      filePath: parsedFile.filePath,
-      dependencies: result.dependencies.length,
-      functions: result.complexity.functions.length,
-      components: result.complexity.components.length,
-    });
-    results.push(result);
+    allResults.push(result);
   }
 
   await analysisCache.persist();
@@ -150,7 +180,12 @@ async function buildArtifacts(projectDir: string, config: AnalysisConfig, logger
 
   return {
     results,
-    scanResult,
+    allResults,
+    scanResult: {
+      ...scanResult,
+      parsed: scopedParsedFiles,
+    },
+    fullScanResult,
     graphBuilder,
     graphJson,
     graphMetrics,
@@ -334,7 +369,7 @@ async function qualityProject(
     const baselineReport = (mode === "diff" || mode === "gate") && baselinePath
       ? JSON.parse(await fs.readFile(baselinePath, "utf8")) as QualityReport
       : undefined;
-    const artifacts = await buildArtifacts(projectDir, config, logger);
+    const artifacts = await buildArtifacts(projectDir, config, logger, { includeUnscopedScan: true });
     const manualInputPath = config.manualInputPath
       ? path.resolve(config.manualInputPath)
       : path.join(projectDir, "quality.manual.json");
@@ -356,9 +391,14 @@ async function qualityProject(
       projectRoot: projectDir,
       analysisResults: artifacts.results,
       parsedFiles: artifacts.scanResult.parsed,
+      testEvidenceResults: artifacts.allResults,
+      testEvidenceParsedFiles: artifacts.fullScanResult.parsed,
       graphMetrics: artifacts.graphMetrics,
       executionTimeMs: Date.now() - startTime,
       tsConfigPath: config.tsConfigPath,
+      qualityProfile: config.qualityProfile,
+      testPresenceSettings: config.testPresenceSettings,
+      maxTypeCheckRootNames: config.maxTypeCheckRootNames,
       manualInputs,
     }, {
       outputDir: config.outputDir,
@@ -366,6 +406,7 @@ async function qualityProject(
       formats: mode === "diff" && !config.outputFormats.includes("json")
         ? [...config.outputFormats, "json"]
         : config.outputFormats,
+      onProgress: (message, metadata) => logger.info(message, metadata),
     });
 
     const failingAutomaticMetrics = report.categories
@@ -535,15 +576,19 @@ async function main(): Promise<number> {
       prefix: { type: "string" },
       verbose: { type: "boolean" },
       "max-file-size": { type: "string" },
+      "analysis-scope": { type: "string" },
+      "quality-profile": { type: "string" },
       "complexity-threshold": { type: "string" },
       "impact-threshold": { type: "string" },
       "fail-on-impact": { type: "boolean" },
+      "exclude-groups": { type: "string" },
       "exclude-patterns": { type: "string" },
       "cache-dir": { type: "string" },
       "log-file": { type: "string" },
       "manual-input": { type: "string" },
       "quality-gate-blocking-metrics": { type: "string" },
       "quality-gate-monitoring-metrics": { type: "string" },
+      "max-typecheck-root-names": { type: "string" },
       baseline: { type: "string" },
       help: { type: "boolean" },
     },
@@ -590,6 +635,8 @@ async function main(): Promise<number> {
     prefix: typeof parsed.values.prefix === "string" ? parsed.values.prefix : undefined,
     verbose: parsed.values.verbose,
     maxFileSize: typeof parsed.values["max-file-size"] === "string" ? parsed.values["max-file-size"] : undefined,
+    analysisScope: typeof parsed.values["analysis-scope"] === "string" ? parsed.values["analysis-scope"] : undefined,
+    qualityProfile: typeof parsed.values["quality-profile"] === "string" ? parsed.values["quality-profile"] : undefined,
     complexityThreshold: typeof parsed.values["complexity-threshold"] === "string"
       ? parsed.values["complexity-threshold"]
       : undefined,
@@ -597,6 +644,7 @@ async function main(): Promise<number> {
       ? parsed.values["impact-threshold"]
       : undefined,
     failOnImpactThreshold: parsed.values["fail-on-impact"],
+    excludeGroups: typeof parsed.values["exclude-groups"] === "string" ? parsed.values["exclude-groups"] : undefined,
     excludePatterns: typeof parsed.values["exclude-patterns"] === "string" ? parsed.values["exclude-patterns"] : undefined,
     cacheDir: typeof parsed.values["cache-dir"] === "string" ? parsed.values["cache-dir"] : undefined,
     logFile: typeof parsed.values["log-file"] === "string" ? parsed.values["log-file"] : undefined,
@@ -606,6 +654,9 @@ async function main(): Promise<number> {
       : undefined,
     qualityGateMonitoringMetrics: typeof parsed.values["quality-gate-monitoring-metrics"] === "string"
       ? parsed.values["quality-gate-monitoring-metrics"]
+      : undefined,
+    maxTypeCheckRootNames: typeof parsed.values["max-typecheck-root-names"] === "string"
+      ? parsed.values["max-typecheck-root-names"]
       : undefined,
   });
 

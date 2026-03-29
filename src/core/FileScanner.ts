@@ -3,12 +3,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import ts from "typescript";
 
+import { shouldIncludeInAnalysisScope } from "./FileConventions.js";
 import type {
-  AnalysisConfig,
+  AnalysisScope,
   CacheRecord,
   ParsedFile,
   ScanResult,
-  SkippedFile,
 } from "../types/index.js";
 
 interface FileScannerOptions {
@@ -16,6 +16,7 @@ interface FileScannerOptions {
   maxFileSizeBytes: number;
   cacheDir: string;
   enableCache: boolean;
+  analysisScope?: AnalysisScope;
 }
 
 export class FileScanner {
@@ -24,14 +25,16 @@ export class FileScanner {
   private readonly maxFileSizeBytes: number;
   private readonly cacheDir: string;
   private readonly enableCache: boolean;
+  private readonly analysisScope: AnalysisScope;
   private readonly cacheIndex = new Map<string, CacheRecord>();
   private readonly nextCacheIndex = new Map<string, CacheRecord>();
 
-  constructor(config: Pick<AnalysisConfig, "excludePatterns" | "maxFileSizeBytes" | "cacheDir" | "enableCache">) {
+  constructor(config: FileScannerOptions) {
     this.excludePatterns = config.excludePatterns.map((pattern) => this.toRegExp(pattern));
     this.maxFileSizeBytes = config.maxFileSizeBytes;
     this.cacheDir = config.cacheDir;
     this.enableCache = config.enableCache;
+    this.analysisScope = config.analysisScope ?? "all";
   }
 
   async scanProject(rootPath: string): Promise<ScanResult> {
@@ -132,6 +135,15 @@ export class FileScanner {
           result.skipped.push({
             filePath: fullPath,
             reason: `File size exceeds ${this.maxFileSizeBytes} bytes`,
+            isDirectory: false,
+          });
+          continue;
+        }
+
+        if (!shouldIncludeInAnalysisScope(fullPath, this.analysisScope)) {
+          result.skipped.push({
+            filePath: fullPath,
+            reason: `Excluded by analysis scope (${this.analysisScope})`,
             isDirectory: false,
           });
           continue;

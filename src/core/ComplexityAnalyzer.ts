@@ -2,6 +2,7 @@ import ts from "typescript";
 
 import type {
   ComponentMetrics,
+  ComplexityScoreBreakdown,
   FileComplexityAnalysis,
   FunctionMetrics,
   HookInfo,
@@ -49,6 +50,11 @@ export class ComplexityAnalyzer {
       assertionCount: 0,
       nonNullAssertionCount: 0,
       tsIgnoreCount: 0,
+      tsExpectErrorCount: 0,
+      tsNoCheckCount: 0,
+      unsafeAssertionCount: 0,
+      doubleAssertionCount: 0,
+      constAssertionCount: 0,
       uncheckedPatterns: [],
     };
 
@@ -65,11 +71,9 @@ export class ComplexityAnalyzer {
       } else {
         codeLines += 1;
       }
-      if (trimmed.includes("@ts-ignore")) {
-        typeMetrics.tsIgnoreCount += 1;
-        typeMetrics.uncheckedPatterns.push("@ts-ignore");
-      }
     }
+
+    this.collectTypeScriptDirectives(sourceFile.text, typeMetrics);
 
     const visit = (node: ts.Node): void => {
       if (this.isAnalyzableFunction(node)) {
@@ -95,6 +99,18 @@ export class ComplexityAnalyzer {
       }
       if (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) {
         typeMetrics.assertionCount += 1;
+        if (this.isConstAssertion(node)) {
+          typeMetrics.constAssertionCount = (typeMetrics.constAssertionCount ?? 0) + 1;
+          typeMetrics.uncheckedPatterns.push("type-assertion:const");
+        }
+        if (this.isDoubleAssertion(node)) {
+          typeMetrics.doubleAssertionCount = (typeMetrics.doubleAssertionCount ?? 0) + 1;
+          typeMetrics.uncheckedPatterns.push("double-assertion");
+        }
+        if (this.isUnsafeAssertion(node)) {
+          typeMetrics.unsafeAssertionCount = (typeMetrics.unsafeAssertionCount ?? 0) + 1;
+          typeMetrics.uncheckedPatterns.push("unsafe-assertion");
+        }
         if (node.getText().includes(" as any") || node.getText().startsWith("<any>")) {
           typeMetrics.uncheckedPatterns.push("type-assertion:any");
         }
@@ -109,6 +125,8 @@ export class ComplexityAnalyzer {
 
     ts.forEachChild(sourceFile, visit);
 
+    const scoreBreakdown = this.buildComplexityScoreBreakdown(functions, components, hooks);
+
     return {
       filePath,
       totalLines: lines.length,
@@ -118,8 +136,33 @@ export class ComplexityAnalyzer {
       components,
       hooks,
       typeMetrics,
-      overallComplexity: this.calculateOverallComplexity(functions, components),
+      scoreBreakdown,
+      overallComplexity: this.calculateOverallComplexity(scoreBreakdown, functions, components, hooks),
     };
+  }
+
+  private collectTypeScriptDirectives(sourceText: string, metrics: TypeSafetyMetrics): void {
+    const commentPattern = /\/\/[^\n]*|\/\*[\s\S]*?\*\//gu;
+    for (const comment of sourceText.match(commentPattern) ?? []) {
+      this.collectDirective(comment, /@ts-ignore\b/gu, () => {
+        metrics.tsIgnoreCount += 1;
+        metrics.uncheckedPatterns.push("@ts-ignore");
+      });
+      this.collectDirective(comment, /@ts-expect-error\b/gu, () => {
+        metrics.tsExpectErrorCount = (metrics.tsExpectErrorCount ?? 0) + 1;
+        metrics.uncheckedPatterns.push("@ts-expect-error");
+      });
+      this.collectDirective(comment, /@ts-nocheck\b/gu, () => {
+        metrics.tsNoCheckCount = (metrics.tsNoCheckCount ?? 0) + 1;
+        metrics.uncheckedPatterns.push("@ts-nocheck");
+      });
+    }
+  }
+
+  private collectDirective(source: string, pattern: RegExp, onMatch: () => void): void {
+    for (const _match of source.matchAll(pattern)) {
+      onMatch();
+    }
   }
 
   private analyzeFunctionComplexity(node: AnalyzableFunctionNode): FunctionMetrics {
@@ -132,6 +175,7 @@ export class ComplexityAnalyzer {
 
     const visit = (child: ts.Node, depth: number): void => {
       maxNestingDepth = Math.max(maxNestingDepth, depth);
+      const nestedDepth = this.isControlFlowNestingNode(child) ? depth + 1 : depth;
 
       if (ts.isIfStatement(child) || ts.isCaseClause(child) || ts.isConditionalExpression(child) || ts.isSwitchStatement(child)) {
         branchCount += 1;
@@ -166,11 +210,11 @@ export class ComplexityAnalyzer {
         }
       }
 
-      ts.forEachChild(child, (grandChild) => visit(grandChild, depth + 1));
+      ts.forEachChild(child, (grandChild) => visit(grandChild, nestedDepth));
     };
 
     if (node.body) {
-      ts.forEachChild(node.body, (child) => visit(child, 1));
+      ts.forEachChild(node.body, (child) => visit(child, 0));
     }
 
     const startLine = ts.getLineAndCharacterOfPosition(node.getSourceFile(), node.getStart()).line + 1;
@@ -467,15 +511,115 @@ export class ComplexityAnalyzer {
     return "high";
   }
 
-  private calculateOverallComplexity(functions: FunctionMetrics[], components: ComponentMetrics[]): number {
-    const averageFunctionComplexity = functions.length > 0
-      ? functions.reduce((sum, metric) => sum + metric.cyclomaticComplexity, 0) / functions.length
-      : 0;
-    const averageComponentComplexity = components.length > 0
-      ? components.reduce((sum, metric) => sum + metric.renderComplexity.complexity, 0) / components.length
-      : 0;
+  private isControlFlowNestingNode(node: ts.Node): boolean {
+    return ts.isIfStatement(node)
+      || ts.isSwitchStatement(node)
+      || ts.isCaseClause(node)
+      || ts.isConditionalExpression(node)
+      || ts.isForStatement(node)
+      || ts.isForInStatement(node)
+      || ts.isForOfStatement(node)
+      || ts.isWhileStatement(node)
+      || ts.isDoStatement(node)
+      || ts.isTryStatement(node)
+      || ts.isCatchClause(node);
+  }
 
-    return Math.round((averageFunctionComplexity + averageComponentComplexity) / 2);
+  private isConstAssertion(node: ts.AsExpression | ts.TypeAssertion): boolean {
+    const typeText = node.type.getText().trim();
+    return typeText === "const";
+  }
+
+  private isDoubleAssertion(node: ts.AsExpression | ts.TypeAssertion): boolean {
+    return ts.isAsExpression(node.expression) || ts.isTypeAssertionExpression(node.expression);
+  }
+
+  private isUnsafeAssertion(node: ts.AsExpression | ts.TypeAssertion): boolean {
+    const targetType = node.type.getText().trim();
+    if (targetType === "any") {
+      return true;
+    }
+
+    if (!this.isDoubleAssertion(node)) {
+      return false;
+    }
+
+    const nested = node.expression;
+    if (!ts.isAsExpression(nested) && !ts.isTypeAssertionExpression(nested)) {
+      return false;
+    }
+    const nestedTarget = nested.type.getText().trim();
+    return nestedTarget === "any" || nestedTarget === "unknown";
+  }
+
+  private buildComplexityScoreBreakdown(
+    functions: FunctionMetrics[],
+    components: ComponentMetrics[],
+    hooks: HookInfo[],
+  ): ComplexityScoreBreakdown {
+    const functionComplexities = functions
+      .map((metric) => metric.cyclomaticComplexity)
+      .sort((left, right) => right - left);
+    const renderComplexities = components
+      .map((component) => component.renderComplexity.complexity)
+      .sort((left, right) => right - left);
+    const averageFunctionComplexity = this.average(functionComplexities);
+    const peakFunctionComplexity = functionComplexities[0] ?? 0;
+    const topFunctionAverage = this.average(functionComplexities.slice(0, 3));
+    const averageRenderComplexity = this.average(renderComplexities);
+    const peakRenderComplexity = renderComplexities[0] ?? 0;
+    const peakNestingDepth = functions.reduce((max, metric) => Math.max(max, metric.maxNestingDepth), 0);
+    const elevatedFunctionCount = functions.filter((metric) =>
+      metric.cyclomaticComplexity >= 5 || metric.maxNestingDepth >= 4
+    ).length;
+    const hookPressure = components.length > 0 ? hooks.length / components.length : hooks.length;
+    const nestingPressure = Math.min(6, Math.max(0, peakNestingDepth - 2));
+    const weightedScore = (
+      (averageFunctionComplexity * 0.3)
+      + (peakFunctionComplexity * 0.4)
+      + (topFunctionAverage * 0.2)
+      + (averageRenderComplexity * 1.2)
+      + (peakRenderComplexity * 0.8)
+      + (nestingPressure * 0.7)
+      + (Math.min(4, hookPressure) * 0.4)
+      + (Math.min(3, elevatedFunctionCount) * 1.1)
+    );
+
+    return {
+      averageFunctionComplexity: this.roundMetric(averageFunctionComplexity),
+      peakFunctionComplexity,
+      topFunctionAverage: this.roundMetric(topFunctionAverage),
+      averageRenderComplexity: this.roundMetric(averageRenderComplexity),
+      peakRenderComplexity,
+      hookPressure: this.roundMetric(hookPressure),
+      peakNestingDepth,
+      elevatedFunctionCount,
+      weightedScore: this.roundMetric(weightedScore),
+    };
+  }
+
+  private calculateOverallComplexity(
+    scoreBreakdown: ComplexityScoreBreakdown,
+    functions: FunctionMetrics[],
+    components: ComponentMetrics[],
+    hooks: HookInfo[],
+  ): number {
+    if (functions.length === 0 && components.length === 0 && hooks.length === 0) {
+      return 0;
+    }
+
+    return Math.max(1, Math.round(scoreBreakdown.weightedScore));
+  }
+
+  private average(values: number[]): number {
+    if (values.length === 0) {
+      return 0;
+    }
+    return values.reduce((sum, value) => sum + value, 0) / values.length;
+  }
+
+  private roundMetric(value: number): number {
+    return Number(value.toFixed(2));
   }
 
   private isAnalyzableFunction(node: ts.Node): node is AnalyzableFunctionNode {

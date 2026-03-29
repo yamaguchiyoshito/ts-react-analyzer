@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { classifyFileType } from "./FileConventions.js";
 import type {
   AnalysisResult,
   CacheStats,
@@ -45,6 +46,30 @@ interface CycleInsight {
   barrelInvolved: boolean;
   sharedCandidate: string | null;
 }
+
+const LOW_COMPLEXITY_MAX = 6;
+const MEDIUM_COMPLEXITY_MAX = 12;
+const KNOWN_FILE_TYPES = [
+  "Route",
+  "Feature",
+  "Layout",
+  "Form",
+  "UI component",
+  "Shared",
+  "Hook",
+  "Context/State",
+  "API/Infrastructure",
+  "Utils",
+  "Schema",
+  "Validation",
+  "Barrel",
+  "Type Support",
+  "Test",
+  "Story",
+  "Fixture",
+  "Config",
+  "Storybook Support",
+];
 
 export class ReportGenerator {
   private analysisResults: AnalysisResult[] = [];
@@ -228,17 +253,17 @@ export class ReportGenerator {
   private async generateMarkdownReport(outputDir: string, prefix: string, options: GenerationOptions): Promise<void> {
     const sections = [
       "# TypeScript/React 静的解析レポート",
+      this.generateTableOfContentsSection(),
       this.generateDecisionSummarySection(options.complexityThreshold),
-      this.generateSummarySection(options.cacheStats, options.analysisCacheStats, options.incrementalStats),
-      this.generateMatrixClusterSection(),
-      this.generateFileTypeDistributionSection(),
       this.generateStatisticsSection(),
-      this.generateRiskAnalysisSection(options.complexityThreshold),
       this.generateTypeSafetySection(),
       this.generateDependencyAnalysisSection(),
+      this.generateFileTypeDistributionSection(),
+      this.generateMatrixClusterSection(),
       this.generateComponentsSection(),
       this.generateScanSection(options.skippedFiles ?? [], options.scanErrors ?? [], options.parseIssues ?? []),
-      this.generateRecommendationsSection(options.complexityThreshold),
+      this.generateRiskAnalysisSection(options.complexityThreshold),
+      this.generateSummarySection(options.cacheStats, options.analysisCacheStats, options.incrementalStats),
       this.generateMetadataSection(),
     ];
     const markdown = sections.map((section) => this.withSectionBreak(section)).join("");
@@ -269,9 +294,9 @@ export class ReportGenerator {
       : "";
 
     return [
-      "## 概要",
+      "## 実行サマリー",
       "",
-      "レポート全体の規模感と実行条件を短く把握するための要約です。",
+      "レポートの規模と実行条件だけを最後に確認するための要約です。",
       "",
       `- **対象ファイル数**: ${fileCount}`,
       `- **総行数**: ${totalLines}`,
@@ -286,37 +311,68 @@ export class ReportGenerator {
     ].filter(Boolean).join("\n");
   }
 
+  private generateTableOfContentsSection(): string {
+    return [
+      "## 目次",
+      "",
+      "1. 要点",
+      "2. 優先対応 Top 5",
+      "3. リスク概況",
+      "4. 型安全性",
+      "5. 依存関係分析",
+      "6. ファイル種別分布",
+      "7. 3x3 マトリクス要約",
+      "8. コンポーネント分析",
+      "9. スキャン結果",
+      "10. 閾値超過ファイル（補足）",
+      "11. 実行サマリー",
+      "",
+    ].join("\n");
+  }
+
   private generateDecisionSummarySection(threshold: number): string {
     const decisionSummary = this.buildDecisionSummary(threshold);
     const hotSpots = decisionSummary.topHotSpots;
+    const primary = hotSpots[0];
 
-    let markdown = "## 意思決定サマリー\n\n";
-    markdown += "優先順位の高い論点を先頭で整理し、着手判断を早くするためのセクションです。\n\n";
-    markdown += `- **重点改修候補**: ${hotSpots.length > 0 ? hotSpots.map((item) => item.displayPath).join(", ") : "なし"}\n`;
+    let markdown = "## 要点\n\n";
+    markdown += "最初の 30 秒で読むべき情報だけを先頭に集約しています。\n\n";
+    markdown += `- **最優先ファイル**: ${primary ? primary.displayPath : "なし"}\n`;
+    markdown += `- **優先改修候補数**: ${hotSpots.length}\n`;
     markdown += `- **循環依存の状態**: ${decisionSummary.cycleStatus}\n`;
     markdown += `- **複雑度リスク**: 高=${decisionSummary.riskSummary.complexity.high}, 中=${decisionSummary.riskSummary.complexity.medium}\n`;
     markdown += `- **構造リスク**: 高=${decisionSummary.riskSummary.structure.high}, 中=${decisionSummary.riskSummary.structure.medium}\n`;
-    markdown += `- **型安全性リスク**: 高=${decisionSummary.riskSummary.typeSafety.high}, 中=${decisionSummary.riskSummary.typeSafety.medium}, any=${decisionSummary.typeSafetyAlerts.anyCount}, ts-ignore=${decisionSummary.typeSafetyAlerts.tsIgnoreCount}\n\n`;
+    markdown += `- **型安全性の警戒信号**: 高=${decisionSummary.riskSummary.typeSafety.high}, 中=${decisionSummary.riskSummary.typeSafety.medium}, any=${decisionSummary.typeSafetyAlerts.anyCount}, ts-ignore=${decisionSummary.typeSafetyAlerts.tsIgnoreCount}\n\n`;
 
-    markdown += "## 重点改修候補 Top 5\n\n";
-    markdown += "複雑度だけでなく、構造負債と型安全性を含めた総合危険度で上位ファイルを示します。\n\n";
+    markdown += "## 優先対応 Top 5\n\n";
+    markdown += "重複説明を避けるため、着手順・主因・推奨対応をこの表に一本化しています。score は複雑度・依存・型安全性・Hooks を合算した優先順位で、severity は Critical>=120 / High>=80 / Medium>=40 / Low<40 です。\n\n";
     if (hotSpots.length === 0) {
       markdown += "優先度の高い改修候補はありません。\n\n";
       return markdown;
     }
 
-    for (const item of hotSpots) {
-      markdown += `- **${item.displayPath}** 主因=${this.getPrimaryRiskAxisLabel(item.path)} score=${item.score} cluster=${item.cluster} complexity=${item.complexity} codeLines=${item.codeLines} dependencies=${item.dependencies} any=${item.anyCount} hooks=${item.hooks}\n`;
-      markdown += `  理由=${item.reasons.join(", ")}\n`;
-      markdown += `  対応=${item.action}\n`;
-    }
+    markdown += "| 順位 | ファイル | severity | 主因 | score | 複雑度 | 依存 | any | Hooks | クラスタ | 推奨対応 |\n";
+    markdown += "|------|----------|----------|------|-------|----------|------|-----|-------|----------|----------|\n";
+    hotSpots.forEach((item, index) => {
+      markdown += `| ${index + 1} | ${item.displayPath} | ${this.getHotSpotSeverity(item.score)} | ${this.getPrimaryRiskAxisLabel(item.path)} | ${item.score} | ${item.complexity} | ${item.dependencies} | ${item.anyCount} | ${item.hooks} | ${item.cluster} | ${item.action} |\n`;
+    });
     markdown += "\n";
+
+    if (primary && (primary.complexityDrivers?.length ?? 0) > 0) {
+      markdown += "### 最優先ファイルの補足\n\n";
+      markdown += `- **対象**: ${primary.displayPath}\n`;
+      markdown += `- **score帯**: ${this.getHotSpotSeverity(primary.score)}\n`;
+      markdown += `- **クラスタ**: ${primary.cluster}\n`;
+      markdown += `- **複雑度内訳**: ${primary.complexityDrivers!.join(", ")}\n`;
+      markdown += `- **推奨対応**: ${primary.action}\n`;
+      markdown += "\n";
+    }
     return markdown;
   }
 
   private generateStatisticsSection(): string {
     if (this.analysisResults.length === 0) {
-      return "## リスク分布\n\n複雑度・構造・型安全性を別軸で集計し、どこに負債が偏っているかを示します。\n\n解析対象ファイルはありません。";
+      return "## リスク概況\n\n複雑度・構造・型安全性の偏りだけを短く確認するセクションです。\n\n解析対象ファイルはありません。";
     }
 
     const complexity = this.buildRiskBreakdown((result) => this.getRiskLevel(result.complexity.overallComplexity));
@@ -324,9 +380,9 @@ export class ReportGenerator {
     const typeSafety = this.buildTypeSafetyRiskBreakdown();
 
     return [
-      "## リスク分布",
+      "## リスク概況",
       "",
-      "複雑度・構造・型安全性を別軸で集計し、どこに負債が偏っているかを示します。",
+      "複雑度・構造・型安全性の偏りを、意思決定に必要な粒度まで圧縮して示します。",
       "",
       "| 軸 | 低 | 中 | 高 |",
       "|----|----|----|----|",
@@ -336,29 +392,34 @@ export class ReportGenerator {
       "",
       "### 判定基準",
       "",
-      "- **複雑度**: サイクロマティック複雑度ベース",
+      `- **複雑度**: 平均 / 最大 / 上位3関数平均 / ネスト深度 / render分岐 / hook圧の重み付きスコア（低<=${LOW_COMPLEXITY_MAX}, 中<=${MEDIUM_COMPLEXITY_MAX}）`,
       "- **構造**: 依存数・Hooks 数・コード行数ベース",
       "- **型安全性**: any / assertion / non-null / ts-ignore の重み付きスコアベース",
     ].join("\n");
   }
 
   private generateRiskAnalysisSection(threshold: number): string {
+    const topHotSpotPaths = new Set(this.getHotSpots(threshold, 5).map((item) => item.path));
     const highRiskFiles = this.analysisResults
+      .filter((result) => this.isHotSpotTargetFile(result.filePath))
       .filter((result) => result.complexity.overallComplexity >= threshold)
+      .filter((result) => !topHotSpotPaths.has(result.filePath))
       .sort((left, right) => right.complexity.overallComplexity - left.complexity.overallComplexity)
       .slice(0, 10);
 
     if (highRiskFiles.length === 0) {
-      return "## 高複雑度ファイル\n\n複雑度しきい値を超えたファイルについて、危険な理由と対応方針を示します。\n\n閾値超過ファイルはありません。\n\n";
+      return "## 閾値超過ファイル（補足）\n\n優先対応 Top 5 に入らなかった閾値超過ファイルだけを補足表示します。\n\n追加の閾値超過ファイルはありません。\n\n";
     }
 
-    let markdown = "## 高複雑度ファイル\n\n";
-    markdown += "複雑度しきい値を超えたファイルについて、危険な理由と対応方針を示します。\n\n";
+    let markdown = "## 閾値超過ファイル（補足）\n\n";
+    markdown += "優先対応 Top 5 に入らなかった閾値超過ファイルだけを補足表示します。\n\n";
     for (const file of highRiskFiles) {
       const displayPath = this.toDisplayPath(file.filePath);
       const cluster = this.classifySizeComplexityCluster(file.complexity.codeLines, file.complexity.overallComplexity);
+      const complexityDrivers = this.buildComplexityDrivers(file);
       markdown += `- **${displayPath}**\n`;
       markdown += `  理由: matrix=${cluster}, complexity=${file.complexity.overallComplexity}, codeLines=${file.complexity.codeLines}, functions=${file.complexity.functions.length}, hooks=${file.complexity.hooks.length}, any=${file.complexity.typeMetrics.anyTypeCount}, dependencyCount=${file.dependencies.length}\n`;
+      markdown += `  複雑度内訳: ${complexityDrivers.join(", ")}\n`;
       markdown += `  対応: ${this.buildHotSpotAction(file, file.dependencies.length, file.complexity.typeMetrics.anyTypeCount, file.complexity.hooks.length)}\n`;
     }
     markdown += "\n";
@@ -381,7 +442,7 @@ export class ReportGenerator {
 
     let markdown = "## 3x3 マトリクス要約\n\n";
     markdown += "コード行数と複雑度の 3x3 マトリクスで、設計負債の位置を俯瞰します。\n\n";
-    markdown += "| 行数帯 \\\\ 複雑度 | 低 (<=5) | 中 (<=10) | 高 (>10) |\n";
+    markdown += `| 行数帯 \\\\ 複雑度 | 低 (<=${LOW_COMPLEXITY_MAX}) | 中 (<=${MEDIUM_COMPLEXITY_MAX}) | 高 (>${MEDIUM_COMPLEXITY_MAX}) |\n`;
     markdown += "|-------------------|----------|-----------|----------|\n";
     markdown += `| 小 (<=100) | ${counts.get("S-L") ?? 0} | ${counts.get("S-M") ?? 0} | ${counts.get("S-H") ?? 0} |\n`;
     markdown += `| 中 (<=300) | ${counts.get("M-L") ?? 0} | ${counts.get("M-M") ?? 0} | ${counts.get("M-H") ?? 0} |\n`;
@@ -404,27 +465,6 @@ export class ReportGenerator {
       return "## ファイル種別分布\n\nRoute や Feature などの種別ごとの偏りを見て、責務の寄り方を判断します。\n\n解析対象ファイルはありません。\n\n";
     }
 
-    const order = [
-      "Route",
-      "Schema",
-      "Feature",
-      "Validation",
-      "Layout",
-      "Form",
-      "UI component",
-      "Storybook Support",
-      "Context/State",
-      "Hook",
-      "API/Infrastructure",
-      "Utils",
-      "Type Support",
-      "Barrel",
-      "Shared",
-      "Test",
-      "Story",
-      "Fixture",
-      "Config",
-    ];
     const stats = new Map<string, { count: number; totalComplexity: number; totalCodeLines: number }>();
 
     for (const result of this.analysisResults) {
@@ -440,23 +480,76 @@ export class ReportGenerator {
     }
 
     let markdown = "## ファイル種別分布\n\n";
-    markdown += "Route や Feature などの種別ごとの偏りを見て、責務の寄り方を判断します。\n\n";
+    markdown += "件数が多い責務から順に並べ、偏りを先に読めるようにしています。0 件の種別は既定で省略します。\n\n";
     markdown += "| ファイル種別 | 件数 | 比率 | 平均複雑度 | 平均コード行数 |\n";
     markdown += "|--------------|------|------|------------|----------------|\n";
 
-    for (const fileType of order) {
-      const entry = stats.get(fileType) ?? { count: 0, totalComplexity: 0, totalCodeLines: 0 };
+    const visibleEntries = Array.from(stats.entries())
+      .filter(([, entry]) => entry.count > 0)
+      .sort((left, right) => {
+        const countDiff = right[1].count - left[1].count;
+        if (countDiff !== 0) {
+          return countDiff;
+        }
+        const complexityDiff = right[1].totalComplexity / right[1].count - (left[1].totalComplexity / left[1].count);
+        if (complexityDiff !== 0) {
+          return complexityDiff;
+        }
+        return left[0].localeCompare(right[0]);
+      });
+
+    for (const [fileType, entry] of visibleEntries) {
       const averageComplexity = entry.count > 0 ? (entry.totalComplexity / entry.count).toFixed(1) : "0.0";
       const averageCodeLines = entry.count > 0 ? (entry.totalCodeLines / entry.count).toFixed(1) : "0.0";
       markdown += `| ${fileType} | ${entry.count} | ${((entry.count / this.analysisResults.length) * 100).toFixed(1)}% | ${averageComplexity} | ${averageCodeLines} |\n`;
     }
 
     markdown += "\n";
+    const riskFocusedEntries = visibleEntries
+      .slice()
+      .sort((left, right) => {
+        const leftAverage = left[1].totalComplexity / left[1].count;
+        const rightAverage = right[1].totalComplexity / right[1].count;
+        const complexityDiff = rightAverage - leftAverage;
+        if (complexityDiff !== 0) {
+          return complexityDiff;
+        }
+        const countDiff = right[1].count - left[1].count;
+        if (countDiff !== 0) {
+          return countDiff;
+        }
+        return left[0].localeCompare(right[0]);
+      })
+      .slice(0, 3);
+
+    if (riskFocusedEntries.length > 0) {
+      markdown += "### 要注意種別\n\n";
+      markdown += "| ファイル種別 | 件数 | 平均複雑度 | 所見 |\n";
+      markdown += "|--------------|------|------------|------|\n";
+      for (const [fileType, entry] of riskFocusedEntries) {
+        const averageComplexity = entry.totalComplexity / entry.count;
+        markdown += `| ${fileType} | ${entry.count} | ${averageComplexity.toFixed(1)} | ${this.describeFileTypeRisk(fileType, averageComplexity, entry.count)} |\n`;
+      }
+      markdown += "\n";
+    }
+
+    const hiddenTypes = KNOWN_FILE_TYPES.length - visibleEntries.length;
+    if (hiddenTypes > 0) {
+      markdown += `- 0 件の種別 ${hiddenTypes} 件は省略しています。\n\n`;
+    }
     return markdown;
   }
 
   private generateTypeSafetySection(): string {
     const totals = this.getTypeSafetyTotals();
+    const allScoredFiles = this.analysisResults
+      .filter((result) => this.isTypeSafetyTargetFile(result.filePath))
+      .map((result) => ({
+        path: this.toDisplayPath(result.filePath),
+        score: this.getTypeSafetyScore(result),
+      }))
+      .filter((item) => item.score > 0)
+      .sort((left, right) => right.score - left.score || left.path.localeCompare(right.path));
     const worstFiles = this.analysisResults
       .filter((result) => this.isTypeSafetyTargetFile(result.filePath))
       .map((result) => {
@@ -466,6 +559,8 @@ export class ReportGenerator {
           path: this.toDisplayPath(result.filePath),
           anyCount: metrics.anyTypeCount,
           assertionCount: metrics.assertionCount,
+          unsafeAssertionCount: metrics.unsafeAssertionCount ?? 0,
+          doubleAssertionCount: metrics.doubleAssertionCount ?? 0,
           nonNullAssertionCount: metrics.nonNullAssertionCount,
           tsIgnoreCount: metrics.tsIgnoreCount,
           score,
@@ -476,23 +571,36 @@ export class ReportGenerator {
       .slice(0, 10);
 
     let markdown = "## 型安全性\n\n";
-    markdown += "型の逃げ道になっている記述を集計し、どこで安全性が落ちているかを示します。\n\n";
-    markdown += `- **explicit any**: ${totals.anyCount}\n`;
-    markdown += `- **型アサーション**: ${totals.assertionCount}\n`;
-    markdown += `- **non-null アサーション**: ${totals.nonNullAssertionCount}\n`;
-    markdown += `- **ts-ignore**: ${totals.tsIgnoreCount}\n\n`;
+    markdown += "型の逃げ道を件数表にまとめ、問題ファイルだけを下段に残します。\n\n";
+    markdown += "| 指標 | 件数 |\n";
+    markdown += "|------|------|\n";
+    markdown += `| explicit any | ${totals.anyCount} |\n`;
+    markdown += `| 型アサーション | ${totals.assertionCount} |\n`;
+    markdown += `| unsafe assertion | ${totals.unsafeAssertionCount} |\n`;
+    markdown += `| double assertion | ${totals.doubleAssertionCount} |\n`;
+    markdown += `| non-null アサーション | ${totals.nonNullAssertionCount} |\n`;
+    markdown += `| ts-ignore | ${totals.tsIgnoreCount} |\n`;
+    markdown += `| ts-expect-error | ${totals.tsExpectErrorCount} |\n`;
+    markdown += `| ts-nocheck | ${totals.tsNoCheckCount} |\n\n`;
 
     if (worstFiles.length === 0) {
       markdown += "型安全性の警告はありません。\n\n";
       return markdown;
     }
 
-    markdown += "| ファイル | any | assertions | non-null | ts-ignore | score |\n";
-    markdown += "|----------|-----|------------|----------|-----------|-------|\n";
+    markdown += "### スコア上位ファイル\n\n";
+    markdown += "| ファイル | any | assertions | unsafe | double | non-null | ts-ignore | score |\n";
+    markdown += "|----------|-----|------------|--------|--------|----------|-----------|-------|\n";
     for (const item of worstFiles) {
-      markdown += `| ${item.path} | ${item.anyCount} | ${item.assertionCount} | ${item.nonNullAssertionCount} | ${item.tsIgnoreCount} | ${item.score} |\n`;
+      markdown += `| ${item.path} | ${item.anyCount} | ${item.assertionCount} | ${item.unsafeAssertionCount} | ${item.doubleAssertionCount} | ${item.nonNullAssertionCount} | ${item.tsIgnoreCount} | ${item.score} |\n`;
     }
     markdown += "\n";
+
+    const totalScore = allScoredFiles.reduce((sum, item) => sum + item.score, 0);
+    const dominant = allScoredFiles[0];
+    if (dominant && totalScore > 0) {
+      markdown += `- **支配要因**: ${dominant.path} が型逃げスコア全体の ${((dominant.score / totalScore) * 100).toFixed(1)}% を占めます。\n\n`;
+    }
     return markdown;
   }
 
@@ -548,29 +656,51 @@ export class ReportGenerator {
       }
     }
 
-    if (this.graphMetrics.topPageRank.length > 0) {
-      markdown += "### 中心性が高いモジュール\n\n";
-      markdown += "依存グラフ全体で影響範囲が大きいモジュールを示します。\n\n";
-      for (const entry of this.graphMetrics.topPageRank.slice(0, 10)) {
-        markdown += `- ${this.toDisplayPath(entry.id)} (${entry.score.toFixed(4)})\n`;
+    const structureRows = [
+      ...this.graphMetrics.topInDegree.slice(0, 3).map((entry) => ({
+        aspect: "ハブ",
+        file: this.toDisplayPath(entry.id),
+        metric: `inDegree=${entry.degree}`,
+        implication: "被依存が多く、変更波及が大きい",
+      })),
+      ...this.graphMetrics.topOutDegree.slice(0, 3).map((entry) => ({
+        aspect: "fan-out",
+        file: this.toDisplayPath(entry.id),
+        metric: `outDegree=${entry.degree}`,
+        implication: "依存先が多く、責務分割候補",
+      })),
+      ...this.graphMetrics.topPageRank.slice(0, 3).map((entry) => ({
+        aspect: "影響中心",
+        file: this.toDisplayPath(entry.id),
+        metric: `pageRank=${entry.score.toFixed(4)}`,
+        implication: "グラフ全体の中心に近い",
+      })),
+    ];
+
+    if (structureRows.length > 0) {
+      markdown += "### 構造上位\n\n";
+      markdown += "ハブ・fan-out・中心性の上位だけを一表に圧縮しています。\n\n";
+      markdown += "| 観点 | ファイル | 指標 | 含意 |\n";
+      markdown += "|------|----------|------|------|\n";
+      for (const row of structureRows) {
+        markdown += `| ${row.aspect} | ${row.file} | ${row.metric} | ${row.implication} |\n`;
       }
       markdown += "\n";
     }
 
-    if (this.graphMetrics.topInDegree.length > 0) {
-      markdown += "### 被依存が多いモジュール\n\n";
-      markdown += "多くのファイルから参照されるハブモジュールを示します。\n\n";
-      for (const entry of this.graphMetrics.topInDegree.slice(0, 10)) {
-        markdown += `- ${this.toDisplayPath(entry.id)} (inDegree=${entry.degree})\n`;
+    const topInDegree = this.graphMetrics.topInDegree[0];
+    const topOutDegree = this.graphMetrics.topOutDegree[0];
+    const topPageRank = this.graphMetrics.topPageRank[0];
+    if (topInDegree || topOutDegree || topPageRank) {
+      markdown += "### 構造解釈\n\n";
+      if (topInDegree) {
+        markdown += `- ハブ化: ${this.toDisplayPath(topInDegree.id)} が最も参照される共通依存です。\n`;
       }
-      markdown += "\n";
-    }
-
-    if (this.graphMetrics.topOutDegree.length > 0) {
-      markdown += "### 依存先が多いモジュール\n\n";
-      markdown += "依存の広がりが大きいモジュールを示します。\n\n";
-      for (const entry of this.graphMetrics.topOutDegree.slice(0, 10)) {
-        markdown += `- ${this.toDisplayPath(entry.id)} (outDegree=${entry.degree})\n`;
+      if (topOutDegree) {
+        markdown += `- fan-out過多: ${this.toDisplayPath(topOutDegree.id)} が最も多くの依存先を持つ起点です。\n`;
+      }
+      if (topPageRank) {
+        markdown += `- 影響中心: ${this.toDisplayPath(topPageRank.id)} を変更すると波及しやすい構造です。\n`;
       }
       markdown += "\n";
     }
@@ -597,12 +727,15 @@ export class ReportGenerator {
     markdown += "React コンポーネントの構造と Hooks 利用の偏りを確認します。\n\n";
     markdown += `- **総コンポーネント数**: ${components.length}\n`;
     markdown += `- **平均 JSX ノード数**: ${averageJsx.toFixed(1)}\n\n`;
+    markdown += "JSX を返す宣言単位で数えているため、1 ファイル内の複数コンポーネントも含みます。\n\n";
 
     if (hookHeavy.length > 0) {
       markdown += "### Hooks 多用コンポーネント\n\n";
-      markdown += "Hooks が集中しているコンポーネントを確認し、分割候補を洗い出します。\n\n";
+      markdown += "Hooks 名の生列挙ではなく、件数と主要 Hook だけを残します。\n\n";
+      markdown += "| コンポーネント | ファイル | Hooks数 | 主な Hooks |\n";
+      markdown += "|----------------|----------|---------|------------|\n";
       for (const component of hookHeavy) {
-        markdown += `- **${component.name}** (${component.file}) hooks=${component.hooksUsed.map((hook) => hook.name).join(", ")}\n`;
+        markdown += `| ${component.name} | ${component.file} | ${component.hookCount} | ${component.hooksUsed.map((hook) => hook.name).join(", ")} |\n`;
       }
       markdown += "\n";
     }
@@ -616,17 +749,21 @@ export class ReportGenerator {
     parseIssues: ParseIssue[],
   ): string {
     const expectedSkips = skippedFiles.filter((skipped) => this.isExpectedSkip(skipped));
-    const unexpectedSkips = skippedFiles.filter((skipped) => !this.isExpectedSkip(skipped));
+    const generatedSkips = skippedFiles.filter((skipped) => !this.isExpectedSkip(skipped) && this.isGeneratedArtifactSkip(skipped));
+    const configuredSkips = skippedFiles.filter((skipped) => !this.isExpectedSkip(skipped) && !this.isGeneratedArtifactSkip(skipped) && this.isConfiguredSkip(skipped));
+    const unexpectedSkips = skippedFiles.filter((skipped) => !this.isExpectedSkip(skipped) && !this.isGeneratedArtifactSkip(skipped) && !this.isConfiguredSkip(skipped));
 
     let markdown = "## スキャン結果\n\n";
-    markdown += "スキャン段階で想定どおり除外されたものと、異常として扱うべき事象を分離して示します。\n\n";
-    markdown += `- **想定どおりの除外**: ${expectedSkips.length}\n`;
-    markdown += `- **想定外の除外**: ${unexpectedSkips.length}\n`;
-    markdown += `- **想定外のエラー**: ${scanErrors.length}\n`;
+    markdown += "外部依存、生成物、設定除外、要調査項目を分離して、調べるべきものだけが残るようにしています。\n\n";
+    markdown += `- **設定どおりの除外**: ${expectedSkips.length}\n`;
+    markdown += `- **生成物の除外**: ${generatedSkips.length}\n`;
+    markdown += `- **設定起因の除外**: ${configuredSkips.length}\n`;
+    markdown += `- **要調査の除外**: ${unexpectedSkips.length}\n`;
+    markdown += `- **スキャンエラー**: ${scanErrors.length}\n`;
     markdown += `- **パースエラー**: ${parseIssues.length}\n\n`;
 
     if (expectedSkips.length > 0) {
-      markdown += "### 想定どおりの除外\n\n";
+      markdown += "### 設定どおりの除外\n\n";
       markdown += "設定済みの除外対象に一致したため、解析対象から外した項目です。\n\n";
       for (const skipped of expectedSkips.slice(0, 10)) {
         markdown += `- ${this.toDisplayPath(skipped.filePath)} (${skipped.reason})\n`;
@@ -634,9 +771,29 @@ export class ReportGenerator {
       markdown += "\n";
     }
 
+    if (generatedSkips.length > 0) {
+      markdown += "### 生成物の除外\n\n";
+      markdown += "ビルド成果物や出力ディレクトリであり、解析対象に含めるべきではない項目です。\n\n";
+      for (const skipped of generatedSkips.slice(0, 10)) {
+        markdown += `- ${this.toDisplayPath(skipped.filePath)} (${skipped.reason})\n`;
+      }
+      markdown += "\n";
+    }
+
+    if (configuredSkips.length > 0) {
+      markdown += "### 設定起因の除外\n\n";
+      markdown += "analysis scope や明示設定により、意図的に解析対象外にした項目です。生列挙ではなくカテゴリ別に集約しています。\n\n";
+      for (const group of this.groupConfiguredSkips(configuredSkips)) {
+        const examples = group.examples.join(", ");
+        const remainder = group.count > group.examples.length ? `、他${group.count - group.examples.length}件` : "";
+        markdown += `- ${group.label}: ${group.count}件（例: ${examples}${remainder}）\n`;
+      }
+      markdown += "\n";
+    }
+
     if (unexpectedSkips.length > 0) {
-      markdown += "### 想定外の除外\n\n";
-      markdown += "サイズ超過や循環検出など、後で確認すべき除外項目です。\n\n";
+      markdown += "### 要調査の除外\n\n";
+      markdown += "サイズ超過や権限問題など、後で確認すべき除外項目です。\n\n";
       for (const skipped of unexpectedSkips.slice(0, 10)) {
         markdown += `- ${this.toDisplayPath(skipped.filePath)} (${skipped.reason})\n`;
       }
@@ -644,7 +801,7 @@ export class ReportGenerator {
     }
 
     if (scanErrors.length > 0) {
-      markdown += "### 想定外のエラー\n\n";
+      markdown += "### スキャンエラー\n\n";
       markdown += "読み取り失敗など、スキャン処理が継続できなかった事象です。\n\n";
       for (const error of scanErrors.slice(0, 10)) {
         markdown += `- ${this.toDisplayPath(error.filePath)} (${error.reason})\n`;
@@ -662,6 +819,67 @@ export class ReportGenerator {
     }
 
     return markdown;
+  }
+
+  private groupConfiguredSkips(skippedFiles: SkippedFile[]): Array<{ label: string; count: number; examples: string[] }> {
+    const groups = new Map<string, { count: number; examples: string[] }>();
+
+    for (const skipped of skippedFiles) {
+      const label = this.classifyConfiguredSkipGroup(skipped.filePath);
+      if (!groups.has(label)) {
+        groups.set(label, { count: 0, examples: [] });
+      }
+
+      const group = groups.get(label)!;
+      group.count += 1;
+      if (group.examples.length < 3) {
+        group.examples.push(this.toDisplayPath(skipped.filePath));
+      }
+    }
+
+    return Array.from(groups.entries())
+      .map(([label, entry]) => ({ label, count: entry.count, examples: entry.examples }))
+      .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label));
+  }
+
+  private classifyConfiguredSkipGroup(filePath: string): string {
+    const displayPath = this.toDisplayPath(filePath).replace(/\\/gu, "/");
+    if (/(^|\/)\.storybook(\/|$)/u.test(displayPath)) {
+      return "Storybook設定";
+    }
+    if (/(^|\/)__tests__(\/|$)|(?:^|\/)tests?(\/|$)|\.(test|spec)\.[cm]?[jt]sx?$/u.test(displayPath)) {
+      return "テストコード";
+    }
+    if (/\.stories\.[cm]?[jt]sx?$/u.test(displayPath) || /(^|\/)(stories|storybook)(\/|$)/u.test(displayPath)) {
+      return "Story";
+    }
+    if (/(^|\/)(next|vite|vitest|jest)\.config\./u.test(displayPath) || /(^|\/)tsconfig\.json$/u.test(displayPath)) {
+      return "設定ファイル";
+    }
+    return "その他の設定除外";
+  }
+
+  private getHotSpotSeverity(score: number): string {
+    if (score >= 120) {
+      return "Critical";
+    }
+    if (score >= 80) {
+      return "High";
+    }
+    if (score >= 40) {
+      return "Medium";
+    }
+    return "Low";
+  }
+
+  private describeFileTypeRisk(fileType: string, averageComplexity: number, count: number): string {
+    if (averageComplexity >= 10) {
+      return `${fileType} が高複雑度です。件数 ${count} 件のため横断対応が必要です。`;
+    }
+    if (count >= 10) {
+      return `${fileType} が多数派です。小さな設計崩れでも波及しやすい状態です。`;
+    }
+    return `${fileType} は局所対応で収まりやすい規模です。`;
   }
 
   private generateRecommendationsSection(threshold: number): string {
@@ -926,10 +1144,10 @@ export class ReportGenerator {
   }
 
   private getRiskLevel(complexity: number): "low" | "medium" | "high" {
-    if (complexity <= 5) {
+    if (complexity <= LOW_COMPLEXITY_MAX) {
       return "low";
     }
-    if (complexity <= 10) {
+    if (complexity <= MEDIUM_COMPLEXITY_MAX) {
       return "medium";
     }
     return "high";
@@ -980,122 +1198,7 @@ export class ReportGenerator {
   }
 
   private classifyFileType(filePath: string, componentName?: string, hasChildren = false): string {
-    const displayPath = this.toDisplayPath(filePath).split(path.sep).join("/");
-    const normalized = displayPath.toLowerCase();
-    const baseName = path.basename(displayPath);
-    const normalizedBaseName = baseName.toLowerCase();
-    const baseStem = baseName.replace(/\.[cm]?[jt]sx?$/u, "");
-    const normalizedBaseStem = baseStem.toLowerCase();
-    const normalizedComponentName = componentName?.toLowerCase() ?? "";
-    const isTestFile = /(?:^|\.)(test|spec)\.[cm]?[jt]sx?$/.test(normalizedBaseName)
-      || /(^|\/)(__tests__|tests)\//.test(normalized);
-    const isStoryFile = /\.stories\.[cm]?[jt]sx?$/.test(normalizedBaseName)
-      || /(^|\/)(stories|storybook)\//.test(normalized);
-    const isFixtureFile = /(^|\/)(__fixtures__|fixtures)\//.test(normalized)
-      || /\.fixture\.[cm]?[jt]sx?$/.test(normalizedBaseName);
-    const isStorybookSupportFile = (normalized.startsWith(".storybook/") || normalized.includes("/.storybook/"))
-      && /\.(?:[cm]?[jt]sx?)$/u.test(normalizedBaseName)
-      && !/^(main|preview|manager|vitest\.setup)\.[cm]?[jt]sx?$/u.test(normalizedBaseName);
-    const isConfigFile = normalizedBaseName === "tsconfig.json"
-      || normalizedBaseName === "jsconfig.json"
-      || normalizedBaseName.startsWith("eslint.config.")
-      || normalizedBaseName.startsWith(".eslintrc")
-      || normalizedBaseName.startsWith(".prettierrc")
-      || normalizedBaseName.startsWith("vite.config.")
-      || normalizedBaseName.startsWith("vitest.config.")
-      || normalizedBaseName.startsWith("jest.config.")
-      || normalizedBaseName.startsWith("storybook.")
-      || normalized.includes("/.storybook/")
-      || normalized.startsWith(".storybook/")
-      || normalizedBaseName.includes(".config.");
-    const isBarrel = this.isBarrelFile(displayPath);
-    const isRouteFile = /(^|\/)(app|pages)\//.test(normalized)
-      || /^(app|root|page|loading|error|template|route)\.[cm]?[jt]sx?$/.test(normalizedBaseName);
-    const isSchemaFile = /(^|\/)schemas?(\/|$)/.test(normalized)
-      || /\.schema\.[cm]?[jt]sx?$/u.test(normalizedBaseName);
-    const isValidationFile = /(^|\/)(validations?|validators?)(\/|$)/.test(normalized)
-      || /\.(validation|validator)\.[cm]?[jt]sx?$/u.test(normalizedBaseName);
-    const isUiLibraryFile = /(^|\/)components\/ui(\/|$)/.test(normalized)
-      || /(^|\/)components\/commons(\/|$)/.test(normalized);
-    const isLayoutFile = /(^|\/)(layouts?|layout)(\/|$)/.test(normalized)
-      || /(^|\/)(header|sidebar|footer|navbar)\.[cm]?[jt]sx?$/.test(normalized)
-      || /(^|\/).*(layout|container|shell)\.[cm]?[jt]sx?$/.test(normalized)
-      || (hasChildren && /(layout|container|shell)$/u.test(normalizedComponentName));
-    const isFeatureFile = /(^|\/)(features?|modules?|domains?|scenes?|containers?)(\/|$)/.test(normalized);
-    const isHookFile = /^use[A-Z0-9]/u.test(baseStem)
-      || /(^|\/)hooks?(\/|$)/.test(normalized);
-    const isContextStateFile = /(^|\/)contexts?(\/|$)/.test(normalized)
-      || /(provider|context|store)\.[cm]?[jt]sx?$/.test(normalizedBaseName)
-      || /(provider|context|store)$/u.test(normalizedBaseStem);
-    const isApiInfrastructureFile = /(^|\/)(bases\/api|api|services?|repositories?|clients?)(\/|$)/.test(normalized);
-    const isUtilsFile = /(^|\/)(lib|utils?|helpers?)(\/|$)/.test(normalized);
-    const isTypeSupportFile = /\.d\.[cm]?ts$/u.test(normalizedBaseName)
-      || normalizedBaseName.includes("shims")
-      || normalizedBaseName.includes("global.d.ts");
-    const isUiComponentFile = /(^|\/)components(\/|$)/.test(normalized);
-    const isFormFile = /(^|\/)(components\/forms?|forms?|form-components)(\/|$)/.test(normalized)
-      || normalizedBaseStem === "form"
-      || normalizedBaseStem.endsWith("form")
-      || normalizedComponentName.endsWith("form");
-
-    if (isTestFile) {
-      return "Test";
-    }
-    if (isStoryFile) {
-      return "Story";
-    }
-    if (isFixtureFile) {
-      return "Fixture";
-    }
-    if (isStorybookSupportFile) {
-      return "Storybook Support";
-    }
-    if (isConfigFile) {
-      return "Config";
-    }
-    if (isBarrel) {
-      return "Barrel";
-    }
-    if (isRouteFile) {
-      return "Route";
-    }
-    if (isSchemaFile) {
-      return "Schema";
-    }
-    if (isValidationFile) {
-      return "Validation";
-    }
-    if (isLayoutFile) {
-      if (isUiLibraryFile) {
-        return "UI component";
-      }
-      return "Layout";
-    }
-    if (isFeatureFile) {
-      return "Feature";
-    }
-    if (isHookFile) {
-      return "Hook";
-    }
-    if (isContextStateFile) {
-      return "Context/State";
-    }
-    if (isApiInfrastructureFile) {
-      return "API/Infrastructure";
-    }
-    if (isUtilsFile) {
-      return "Utils";
-    }
-    if (isTypeSupportFile) {
-      return "Type Support";
-    }
-    if (isUiComponentFile && !isFormFile) {
-      return "UI component";
-    }
-    if (isFormFile) {
-      return "Form";
-    }
-    return "Shared";
+    return classifyFileType(this.toDisplayPath(filePath).split(path.sep).join("/"), { componentName, hasChildren });
   }
 
   private hasCorrespondingTestFile(filePath: string, testTargets: Set<string>): boolean {
@@ -1143,7 +1246,7 @@ export class ReportGenerator {
       .replace(/\.[cm]?[jt]sx?$/iu, "");
     const normalizedPath = withoutExt
       .split("/")
-      .filter((segment) => segment !== "__tests__" && segment !== "tests")
+      .filter((segment) => segment !== "__tests__" && segment !== "tests" && segment !== "test")
       .join("/")
       .replace(/\.(test|spec)$/iu, "")
       .toLowerCase();
@@ -1183,10 +1286,10 @@ export class ReportGenerator {
   }
 
   private classifyComplexityBand(complexity: number): "L" | "M" | "H" {
-    if (complexity <= 5) {
+    if (complexity <= LOW_COMPLEXITY_MAX) {
       return "L";
     }
-    if (complexity <= 10) {
+    if (complexity <= MEDIUM_COMPLEXITY_MAX) {
       return "M";
     }
     return "H";
@@ -1194,12 +1297,14 @@ export class ReportGenerator {
 
   private getHotSpots(threshold: number, limit: number): HotSpotItem[] {
     return this.analysisResults
+      .filter((result) => this.isHotSpotTargetFile(result.filePath))
       .map((result) => {
         const pathLabel = this.toDisplayPath(result.filePath);
         const cluster = this.classifySizeComplexityCluster(result.complexity.codeLines, result.complexity.overallComplexity);
         const dependencies = result.dependencies.length;
         const hooks = result.complexity.hooks.length;
         const anyCount = this.isTypeSafetyTargetFile(result.filePath) ? result.complexity.typeMetrics.anyTypeCount : 0;
+        const complexityDrivers = this.buildComplexityDrivers(result);
         const score = (result.complexity.overallComplexity * 5)
           + (dependencies * 2)
           + (anyCount * 4)
@@ -1237,6 +1342,7 @@ export class ReportGenerator {
           hooks,
           anyCount,
           reasons,
+          complexityDrivers,
           action: this.buildHotSpotAction(result, dependencies, anyCount, hooks),
         };
       })
@@ -1258,6 +1364,62 @@ export class ReportGenerator {
       return "大関数の分割 + 補助関数の抽出";
     }
     return "サブコンポーネント化 + shared helper抽出";
+  }
+
+  private buildComplexityDrivers(result: AnalysisResult): string[] {
+    const breakdown = result.complexity.scoreBreakdown;
+    const functionComplexities = result.complexity.functions
+      .map((metric) => metric.cyclomaticComplexity)
+      .sort((left, right) => right - left);
+    const peakFunctionComplexity = functionComplexities[0] ?? breakdown?.peakFunctionComplexity ?? 0;
+    const topFunctionAverage = functionComplexities.length > 0
+      ? functionComplexities.slice(0, 3).reduce((sum, value) => sum + value, 0) / Math.min(functionComplexities.length, 3)
+      : (breakdown?.topFunctionAverage ?? 0);
+    const peakNestingDepth = Math.max(
+      result.complexity.functions.reduce((max, metric) => Math.max(max, metric.maxNestingDepth), 0),
+      breakdown?.peakNestingDepth ?? 0,
+    );
+    const peakRenderComplexity = Math.max(
+      ...result.complexity.components.map((component) => component.renderComplexity.complexity),
+      breakdown?.peakRenderComplexity ?? 0,
+      0,
+    );
+    const derivedHookPressure = result.complexity.components.length > 0
+      ? result.complexity.hooks.length / result.complexity.components.length
+      : result.complexity.hooks.length;
+    const hookPressure = Math.max(derivedHookPressure, breakdown?.hookPressure ?? 0);
+    const elevatedFunctionCount = Math.max(
+      result.complexity.functions.filter((metric) => metric.cyclomaticComplexity >= 5 || metric.maxNestingDepth >= 4).length,
+      breakdown?.elevatedFunctionCount ?? 0,
+    );
+    const weightedScore = breakdown && Math.abs(breakdown.weightedScore - result.complexity.overallComplexity) <= 1
+      ? breakdown.weightedScore
+      : result.complexity.overallComplexity;
+
+    const drivers = [`weighted=${this.formatMetric(weightedScore)}`];
+    if (peakFunctionComplexity > 0) {
+      drivers.push(`peakFn=${peakFunctionComplexity}`);
+    }
+    if (functionComplexities.length >= 2) {
+      drivers.push(`top3avg=${this.formatMetric(topFunctionAverage)}`);
+    }
+    if (peakNestingDepth > 0) {
+      drivers.push(`nesting=${peakNestingDepth}`);
+    }
+    if (peakRenderComplexity > 0) {
+      drivers.push(`renderPeak=${peakRenderComplexity}`);
+    }
+    if (hookPressure > 0) {
+      drivers.push(`hookPressure=${this.formatMetric(hookPressure)}`);
+    }
+    if (elevatedFunctionCount > 0) {
+      drivers.push(`elevatedFns=${elevatedFunctionCount}`);
+    }
+    return drivers;
+  }
+
+  private formatMetric(value: number): string {
+    return Number(value.toFixed(2)).toString();
   }
 
   private getClusterWeight(cluster: string): number {
@@ -1309,21 +1471,33 @@ export class ReportGenerator {
   private getTypeSafetyTotals(): {
     anyCount: number;
     assertionCount: number;
+    unsafeAssertionCount: number;
+    doubleAssertionCount: number;
     nonNullAssertionCount: number;
     tsIgnoreCount: number;
+    tsExpectErrorCount: number;
+    tsNoCheckCount: number;
   } {
     return this.analysisResults
       .filter((result) => this.isTypeSafetyTargetFile(result.filePath))
       .reduce((totals, result) => ({
         anyCount: totals.anyCount + result.complexity.typeMetrics.anyTypeCount,
         assertionCount: totals.assertionCount + result.complexity.typeMetrics.assertionCount,
+        unsafeAssertionCount: totals.unsafeAssertionCount + (result.complexity.typeMetrics.unsafeAssertionCount ?? 0),
+        doubleAssertionCount: totals.doubleAssertionCount + (result.complexity.typeMetrics.doubleAssertionCount ?? 0),
         nonNullAssertionCount: totals.nonNullAssertionCount + result.complexity.typeMetrics.nonNullAssertionCount,
         tsIgnoreCount: totals.tsIgnoreCount + result.complexity.typeMetrics.tsIgnoreCount,
+        tsExpectErrorCount: totals.tsExpectErrorCount + (result.complexity.typeMetrics.tsExpectErrorCount ?? 0),
+        tsNoCheckCount: totals.tsNoCheckCount + (result.complexity.typeMetrics.tsNoCheckCount ?? 0),
       }), {
         anyCount: 0,
         assertionCount: 0,
+        unsafeAssertionCount: 0,
+        doubleAssertionCount: 0,
         nonNullAssertionCount: 0,
         tsIgnoreCount: 0,
+        tsExpectErrorCount: 0,
+        tsNoCheckCount: 0,
       });
   }
 
@@ -1334,9 +1508,13 @@ export class ReportGenerator {
 
     const metrics = result.complexity.typeMetrics;
     return (metrics.anyTypeCount * 4)
-      + (metrics.assertionCount * 2)
+      + ((metrics.unsafeAssertionCount ?? 0) * 4)
+      + ((metrics.doubleAssertionCount ?? 0) * 5)
+      + (Math.max(0, metrics.assertionCount - (metrics.unsafeAssertionCount ?? 0) - (metrics.doubleAssertionCount ?? 0) - (metrics.constAssertionCount ?? 0)) * 1)
       + (metrics.nonNullAssertionCount * 2)
-      + (metrics.tsIgnoreCount * 5);
+      + (metrics.tsIgnoreCount * 5)
+      + ((metrics.tsExpectErrorCount ?? 0) * 4)
+      + ((metrics.tsNoCheckCount ?? 0) * 20);
   }
 
   private getStructureRiskScore(result: AnalysisResult): number {
@@ -1560,13 +1738,30 @@ export class ReportGenerator {
     return fileType !== "Test" && fileType !== "Story";
   }
 
+  private isHotSpotTargetFile(filePath: string): boolean {
+    const fileType = this.classifyFileType(filePath);
+    return fileType !== "Test" && fileType !== "Story";
+  }
+
   private isExpectedSkip(skipped: SkippedFile): boolean {
     return skipped.reason === "Excluded pattern match" && this.isExpectedExcludedPath(skipped.filePath);
   }
 
+  private isConfiguredSkip(skipped: SkippedFile): boolean {
+    return /^Excluded by analysis scope\b/u.test(skipped.reason);
+  }
+
+  private isGeneratedArtifactSkip(skipped: SkippedFile): boolean {
+    const normalized = skipped.filePath.replace(/\\/gu, "/");
+    if (skipped.reason !== "Excluded pattern match") {
+      return false;
+    }
+    return /(^|\/)(out|storybook-static|coverage|dist|build)(\/|$)/u.test(normalized);
+  }
+
   private isExpectedExcludedPath(filePath: string): boolean {
     const normalized = filePath.replace(/\\/gu, "/");
-    return /(^|\/)(node_modules|dist|build|\.next|coverage|\.git|\.venv)(\/|$)/u.test(normalized)
+    return /(^|\/)(node_modules|\.next|\.git|\.venv)(\/|$)/u.test(normalized)
       || /(^|\/)storybook-static\/assets(\/|$)/u.test(normalized);
   }
 
@@ -1584,11 +1779,15 @@ export class ReportGenerator {
         typeSafety: this.buildTypeSafetyRiskBreakdown(),
       },
       typeSafetyAlerts: {
-        criticalSignals: typeTotals.anyCount + typeTotals.tsIgnoreCount,
+        criticalSignals: typeTotals.anyCount + typeTotals.tsIgnoreCount + typeTotals.tsNoCheckCount,
         anyCount: typeTotals.anyCount,
         assertionCount: typeTotals.assertionCount,
         nonNullAssertionCount: typeTotals.nonNullAssertionCount,
         tsIgnoreCount: typeTotals.tsIgnoreCount,
+        tsExpectErrorCount: typeTotals.tsExpectErrorCount,
+        tsNoCheckCount: typeTotals.tsNoCheckCount,
+        unsafeAssertionCount: typeTotals.unsafeAssertionCount,
+        doubleAssertionCount: typeTotals.doubleAssertionCount,
       },
     };
   }

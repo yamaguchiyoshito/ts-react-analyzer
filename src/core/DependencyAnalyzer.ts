@@ -1,3 +1,5 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import ts from "typescript";
 
@@ -15,16 +17,27 @@ interface ResolveResult {
   isExternal: boolean;
 }
 
+interface ResolutionContext {
+  compilerOptions: ts.CompilerOptions;
+  configDir: string;
+  hash: string;
+}
+
 export class DependencyAnalyzer {
   private readonly compilerOptions: ts.CompilerOptions;
+  private readonly compilerOptionsHash: string;
   private readonly projectRoot: string;
   private readonly host: ts.ModuleResolutionHost;
   private readonly externalLibraries = new Set<string>();
   private readonly reExportChains = new Map<string, Set<string>>();
+  private readonly resolutionCache = new Map<string, ResolveResult>();
+  private readonly nearestTsConfigCache = new Map<string, string | null>();
+  private readonly resolutionContextCache = new Map<string, ResolutionContext>();
 
   constructor(projectRoot: string, compilerOptions: ts.CompilerOptions) {
-    this.projectRoot = projectRoot;
+    this.projectRoot = path.resolve(projectRoot);
     this.compilerOptions = compilerOptions;
+    this.compilerOptionsHash = this.hash(this.stableStringify(compilerOptions));
     this.host = ts.sys;
   }
 
@@ -84,6 +97,11 @@ export class DependencyAnalyzer {
     );
   }
 
+  getAnalysisContextHash(filePath: string): string {
+    const context = this.getResolutionContextForFile(filePath);
+    return context.hash;
+  }
+
   private handleImportDeclaration(
     node: ts.ImportDeclaration,
     fromFile: string,
@@ -94,7 +112,18 @@ export class DependencyAnalyzer {
     }
 
     if (!node.importClause) {
-      return { dependencies: [], sideEffectImports: 1 };
+      const resolved = this.resolveModuleTarget(modulePath, fromFile);
+      return {
+        dependencies: [{
+          source: fromFile,
+          target: resolved.target,
+          type: "side-effect-import",
+          isExternal: resolved.isExternal,
+          modulePath,
+          range: this.createRange(node, node.getSourceFile()),
+        }],
+        sideEffectImports: 1,
+      };
     }
 
     const imported: ImportedItem[] = [];
@@ -224,34 +253,55 @@ export class DependencyAnalyzer {
   }
 
   private resolveModuleTarget(modulePath: string, fromFile: string): ResolveResult {
+    const cacheKey = `${fromFile}::${modulePath}`;
+    const cached = this.resolutionCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const context = this.getResolutionContextForFile(fromFile);
     const resolution = ts.resolveModuleName(
       modulePath,
       fromFile,
-      this.compilerOptions,
+      context.compilerOptions,
       this.host,
     );
-    const resolvedFileName = resolution.resolvedModule?.resolvedFileName;
-    const isExternal = resolution.resolvedModule?.isExternalLibraryImport ?? this.isExternalSpecifier(modulePath);
-
-    if (isExternal) {
-      const packageName = modulePath.startsWith("@")
-        ? modulePath.split("/").slice(0, 2).join("/")
-        : modulePath.split("/")[0];
-      if (packageName) {
-        this.externalLibraries.add(packageName);
-      }
-      return { target: packageName || modulePath, isExternal: true };
-    }
+    const resolvedFileName = resolution.resolvedModule?.resolvedFileName
+      ? path.resolve(resolution.resolvedModule.resolvedFileName)
+      : undefined;
 
     if (resolvedFileName) {
-      return { target: path.resolve(resolvedFileName), isExternal: false };
+      const resolvedResult = this.isExternalResolvedModule(resolution.resolvedModule, resolvedFileName)
+        ? this.createExternalResolution(modulePath)
+        : {
+            target: resolvedFileName,
+            isExternal: false,
+          };
+      this.resolutionCache.set(cacheKey, resolvedResult);
+      return resolvedResult;
     }
 
     if (modulePath.startsWith(".")) {
-      return { target: path.resolve(path.dirname(fromFile), modulePath), isExternal: false };
+      const relativeResult = {
+        target: this.resolveExistingInternalTarget(path.resolve(path.dirname(fromFile), modulePath)),
+        isExternal: false,
+      } satisfies ResolveResult;
+      this.resolutionCache.set(cacheKey, relativeResult);
+      return relativeResult;
     }
 
-    return { target: path.resolve(this.projectRoot, modulePath), isExternal: false };
+    if (this.matchesConfiguredPathAlias(modulePath, context.compilerOptions.paths ?? {})) {
+      const aliasResult = {
+        target: this.resolveAliasFallback(modulePath, context),
+        isExternal: false,
+      } satisfies ResolveResult;
+      this.resolutionCache.set(cacheKey, aliasResult);
+      return aliasResult;
+    }
+
+    const externalResult = this.createExternalResolution(modulePath);
+    this.resolutionCache.set(cacheKey, externalResult);
+    return externalResult;
   }
 
   private createRange(node: ts.Node, sourceFile: ts.SourceFile) {
@@ -291,5 +341,283 @@ export class DependencyAnalyzer {
       this.reExportChains.set(source, new Set<string>());
     }
     this.reExportChains.get(source)?.add(target);
+  }
+
+  private getResolutionContextForFile(filePath: string): ResolutionContext {
+    const tsConfigPath = this.findNearestTsConfig(filePath);
+    if (!tsConfigPath) {
+      return {
+        compilerOptions: this.compilerOptions,
+        configDir: this.projectRoot,
+        hash: `fallback:${this.compilerOptionsHash}`,
+      };
+    }
+
+    const cached = this.resolutionContextCache.get(tsConfigPath);
+    if (cached) {
+      return cached;
+    }
+
+    const loaded = this.loadResolutionContext(tsConfigPath);
+    this.resolutionContextCache.set(tsConfigPath, loaded);
+    return loaded;
+  }
+
+  private findNearestTsConfig(filePath: string): string | undefined {
+    const startDir = path.dirname(path.resolve(filePath));
+    const visited: string[] = [];
+    let currentDir = startDir;
+
+    while (this.isWithinProjectRoot(currentDir)) {
+      const cached = this.nearestTsConfigCache.get(currentDir);
+      if (cached !== undefined) {
+        for (const visitedDir of visited) {
+          this.nearestTsConfigCache.set(visitedDir, cached);
+        }
+        return cached ?? undefined;
+      }
+
+      visited.push(currentDir);
+      const candidate = this.findNearestConfigInDirectory(currentDir);
+      if (candidate) {
+        for (const visitedDir of visited) {
+          this.nearestTsConfigCache.set(visitedDir, candidate);
+        }
+        return candidate;
+      }
+
+      if (currentDir === this.projectRoot) {
+        break;
+      }
+
+      const parentDir = path.dirname(currentDir);
+      if (parentDir === currentDir) {
+        break;
+      }
+      currentDir = parentDir;
+    }
+
+    for (const visitedDir of visited) {
+      this.nearestTsConfigCache.set(visitedDir, null);
+    }
+    return undefined;
+  }
+
+  private loadResolutionContext(tsConfigPath: string): ResolutionContext {
+    const configDir = path.dirname(tsConfigPath);
+    try {
+      const readResult = ts.readConfigFile(tsConfigPath, ts.sys.readFile);
+      if (readResult.error) {
+        return {
+          compilerOptions: this.compilerOptions,
+          configDir,
+          hash: `invalid:${tsConfigPath}:${this.compilerOptionsHash}`,
+        };
+      }
+
+      const parsed = ts.parseJsonConfigFileContent(
+        readResult.config,
+        ts.sys,
+        configDir,
+        undefined,
+        tsConfigPath,
+      );
+
+      return {
+        compilerOptions: {
+          ...this.compilerOptions,
+          ...parsed.options,
+        },
+        configDir,
+        hash: this.hash(`${tsConfigPath}:${this.stableStringify(parsed.options)}`),
+      };
+    } catch {
+      return {
+        compilerOptions: this.compilerOptions,
+        configDir,
+        hash: `fallback:${this.compilerOptionsHash}`,
+      };
+    }
+  }
+
+  private findNearestConfigInDirectory(dirPath: string): string | undefined {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(dirPath);
+    } catch {
+      return undefined;
+    }
+
+    const candidates = entries
+      .filter((entry) => this.isTypeCheckConfigFile(entry))
+      .sort((left, right) => this.compareConfigPriority(left, right))
+      .map((entry) => path.join(dirPath, entry));
+
+    return candidates[0];
+  }
+
+  private isTypeCheckConfigFile(fileName: string): boolean {
+    return fileName === "jsconfig.json" || /^tsconfig(?:\.[^.]+)*\.json$/u.test(fileName);
+  }
+
+  private compareConfigPriority(left: string, right: string): number {
+    const leftRank = this.configPriority(left);
+    const rightRank = this.configPriority(right);
+    if (leftRank !== rightRank) {
+      return leftRank - rightRank;
+    }
+    return left.localeCompare(right);
+  }
+
+  private configPriority(fileName: string): number {
+    if (fileName === "tsconfig.json") {
+      return 0;
+    }
+    if (fileName === "jsconfig.json") {
+      return 1;
+    }
+    if (/^tsconfig\.(app|lib|src)\.json$/u.test(fileName)) {
+      return 2;
+    }
+    if (/^tsconfig\.(base|shared|options)\.json$/u.test(fileName)) {
+      return 4;
+    }
+    return 3;
+  }
+
+  private isExternalResolvedModule(
+    resolvedModule: ts.ResolvedModule | undefined,
+    resolvedFileName: string,
+  ): boolean {
+    return resolvedModule?.isExternalLibraryImport === true
+      || /(^|[/\\])node_modules(?:$|[/\\])/u.test(resolvedFileName);
+  }
+
+  private createExternalResolution(modulePath: string): ResolveResult {
+    const packageName = modulePath.startsWith("@")
+      ? modulePath.split("/").slice(0, 2).join("/")
+      : modulePath.split("/")[0];
+    if (packageName) {
+      this.externalLibraries.add(packageName);
+    }
+    return { target: packageName || modulePath, isExternal: true };
+  }
+
+  private matchesConfiguredPathAlias(modulePath: string, paths: Record<string, string[]>): boolean {
+    if (!this.isExternalSpecifier(modulePath)) {
+      return false;
+    }
+
+    return Object.keys(paths).some((pattern) => this.matchPathAliasPattern(modulePath, pattern) !== null);
+  }
+
+  private resolveAliasFallback(modulePath: string, context: ResolutionContext): string {
+    const baseDir = this.resolveBaseDir(context);
+    let fallbackTarget: string | null = null;
+    for (const [pattern, replacements] of Object.entries(context.compilerOptions.paths ?? {})) {
+      const wildcardValue = this.matchPathAliasPattern(modulePath, pattern);
+      if (wildcardValue === null) {
+        continue;
+      }
+
+      for (const replacement of replacements) {
+        const substituted = replacement.includes("*")
+          ? replacement.replace(/\*/gu, wildcardValue)
+          : replacement;
+        const candidate = path.isAbsolute(substituted)
+          ? substituted
+          : path.resolve(baseDir, substituted);
+        const resolvedCandidate = this.findExistingInternalTarget(candidate);
+        if (resolvedCandidate) {
+          return resolvedCandidate;
+        }
+        fallbackTarget ??= path.resolve(candidate);
+      }
+    }
+
+    return fallbackTarget ?? this.resolveExistingInternalTarget(path.resolve(baseDir, modulePath));
+  }
+
+  private resolveBaseDir(context: ResolutionContext): string {
+    const { baseUrl } = context.compilerOptions;
+    if (typeof baseUrl !== "string" || baseUrl.length === 0) {
+      return context.configDir;
+    }
+
+    return path.isAbsolute(baseUrl)
+      ? baseUrl
+      : path.resolve(context.configDir, baseUrl);
+  }
+
+  private resolveExistingInternalTarget(basePath: string): string {
+    return this.findExistingInternalTarget(basePath) ?? path.resolve(basePath);
+  }
+
+  private findExistingInternalTarget(basePath: string): string | undefined {
+    const resolvedBase = path.resolve(basePath);
+    const candidates = new Set<string>([
+      resolvedBase,
+      `${resolvedBase}.ts`,
+      `${resolvedBase}.tsx`,
+      `${resolvedBase}.js`,
+      `${resolvedBase}.jsx`,
+      `${resolvedBase}.d.ts`,
+      path.join(resolvedBase, "index.ts"),
+      path.join(resolvedBase, "index.tsx"),
+      path.join(resolvedBase, "index.js"),
+      path.join(resolvedBase, "index.jsx"),
+      path.join(resolvedBase, "index.d.ts"),
+    ]);
+
+    for (const candidate of candidates) {
+      try {
+        if (fs.statSync(candidate).isFile()) {
+          return path.resolve(candidate);
+        }
+      } catch {
+        // Ignore missing candidates.
+      }
+    }
+
+    return undefined;
+  }
+
+  private matchPathAliasPattern(modulePath: string, pattern: string): string | null {
+    if (!pattern.includes("*")) {
+      return pattern === modulePath ? "" : null;
+    }
+
+    const [rawPrefix, rawSuffix] = pattern.split("*");
+    const prefix = rawPrefix ?? "";
+    const suffix = rawSuffix ?? "";
+    if (!modulePath.startsWith(prefix) || !modulePath.endsWith(suffix)) {
+      return null;
+    }
+
+    return modulePath.slice(prefix.length, modulePath.length - suffix.length);
+  }
+
+  private isWithinProjectRoot(candidatePath: string): boolean {
+    const relative = path.relative(this.projectRoot, candidatePath);
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  }
+
+  private stableStringify(value: unknown): string {
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => this.stableStringify(item)).join(",")}]`;
+    }
+
+    if (value && typeof value === "object") {
+      return `{${Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => `${JSON.stringify(key)}:${this.stableStringify(item)}`)
+        .join(",")}}`;
+    }
+
+    return JSON.stringify(value);
+  }
+
+  private hash(value: string): string {
+    return crypto.createHash("sha256").update(value).digest("hex");
   }
 }

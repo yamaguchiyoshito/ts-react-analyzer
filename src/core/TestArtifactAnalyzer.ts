@@ -7,6 +7,7 @@ export interface JUnitSummary {
   failedTests: number;
   skippedTests: number;
   files: string[];
+  executedTestFiles: string[];
 }
 
 export interface CoverageSummary {
@@ -14,6 +15,12 @@ export interface CoverageSummary {
   lineHit: number;
   lineCoverage: number | null;
   files: string[];
+  sourceFiles: Array<{
+    filePath: string;
+    lineFound: number;
+    lineHit: number;
+    lineCoverage: number | null;
+  }>;
 }
 
 export interface VitestSummary {
@@ -34,8 +41,8 @@ export class TestArtifactAnalyzer {
     const vitest = await this.detectVitest(projectRoot);
 
     return {
-      junit: junitFiles.length > 0 ? await this.parseJUnitFiles(junitFiles) : null,
-      coverage: coverageFiles.length > 0 ? await this.parseCoverageFiles(coverageFiles) : null,
+      junit: junitFiles.length > 0 ? await this.parseJUnitFiles(projectRoot, junitFiles) : null,
+      coverage: coverageFiles.length > 0 ? await this.parseCoverageFiles(projectRoot, coverageFiles) : null,
       vitest,
     };
   }
@@ -93,29 +100,48 @@ export class TestArtifactAnalyzer {
     return Array.from(files).sort();
   }
 
-  private async parseJUnitFiles(files: string[]): Promise<JUnitSummary> {
+  private async parseJUnitFiles(projectRoot: string, files: string[]): Promise<JUnitSummary> {
     let totalTests = 0;
     let failedTests = 0;
     let skippedTests = 0;
+    const executedTestFiles = new Set<string>();
 
     for (const filePath of files) {
       const xml = await fs.readFile(filePath, "utf8");
       const suiteTags = Array.from(xml.matchAll(/<testsuite\b[^>]*>/gu));
+      const testcases = this.extractJUnitTestCases(xml);
 
-      if (suiteTags.length > 0) {
+      if (testcases.length > 0) {
+        totalTests += testcases.length;
+        for (const testcase of testcases) {
+          if (/<(?:failure|error)\b/iu.test(testcase.body)) {
+            failedTests += 1;
+          } else if (/<skipped\b/iu.test(testcase.body)) {
+            skippedTests += 1;
+          }
+          const testFile = this.extractStringAttribute(testcase.raw, "file");
+          if (testFile) {
+            executedTestFiles.add(this.resolveArtifactSourcePath(projectRoot, filePath, testFile));
+          }
+        }
+      } else if (suiteTags.length > 0) {
         for (const match of suiteTags) {
           const tag = match[0];
           totalTests += this.extractIntegerAttribute(tag, "tests");
           failedTests += this.extractIntegerAttribute(tag, "failures");
           failedTests += this.extractIntegerAttribute(tag, "errors");
           skippedTests += this.extractIntegerAttribute(tag, "skipped");
+          const suiteFile = this.extractStringAttribute(tag, "file");
+          if (suiteFile) {
+            executedTestFiles.add(this.resolveArtifactSourcePath(projectRoot, filePath, suiteFile));
+          }
         }
-        continue;
       }
 
-      totalTests += Array.from(xml.matchAll(/<testcase\b/gu)).length;
-      failedTests += Array.from(xml.matchAll(/<(failure|error)\b/gu)).length;
-      skippedTests += Array.from(xml.matchAll(/<skipped\b/gu)).length;
+      if (suiteTags.length === 0 && testcases.length === 0) {
+        failedTests += Array.from(xml.matchAll(/<(failure|error)\b/gu)).length;
+        skippedTests += Array.from(xml.matchAll(/<skipped\b/gu)).length;
+      }
     }
 
     const passedTests = Math.max(0, totalTests - failedTests - skippedTests);
@@ -126,30 +152,86 @@ export class TestArtifactAnalyzer {
       failedTests,
       skippedTests,
       files,
+      executedTestFiles: Array.from(executedTestFiles).sort(),
     };
   }
 
-  private async parseCoverageFiles(files: string[]): Promise<CoverageSummary> {
-    let lineFound = 0;
-    let lineHit = 0;
+  private extractJUnitTestCases(xml: string): Array<{ raw: string; body: string }> {
+    return Array.from(xml.matchAll(/<testcase\b[^>]*(?:\/>|>([\s\S]*?)<\/testcase>)/gu)).map((match) => ({
+      raw: match[0],
+      body: match[1] ?? "",
+    }));
+  }
+
+  private async parseCoverageFiles(projectRoot: string, files: string[]): Promise<CoverageSummary> {
+    const sourceFiles = new Map<string, { lineFound: number; lineHit: number }>();
 
     for (const filePath of files) {
       const content = await fs.readFile(filePath, "utf8");
+      let currentSourcePath: string | null = null;
+      let currentLineFound = 0;
+      let currentLineHit = 0;
+
+      const flushRecord = (): void => {
+        if (!currentSourcePath) {
+          return;
+        }
+
+        const existing = sourceFiles.get(currentSourcePath) ?? { lineFound: 0, lineHit: 0 };
+        existing.lineFound += currentLineFound;
+        existing.lineHit += currentLineHit;
+        sourceFiles.set(currentSourcePath, existing);
+      };
+
       for (const line of content.split(/\r?\n/u)) {
+        if (line.startsWith("SF:")) {
+          flushRecord();
+          currentSourcePath = this.resolveCoverageSourcePath(projectRoot, filePath, line.slice(3));
+          currentLineFound = 0;
+          currentLineHit = 0;
+          continue;
+        }
         if (line.startsWith("LF:")) {
-          lineFound += Number.parseInt(line.slice(3), 10) || 0;
-        } else if (line.startsWith("LH:")) {
-          lineHit += Number.parseInt(line.slice(3), 10) || 0;
+          currentLineFound = Number.parseInt(line.slice(3), 10) || 0;
+          continue;
+        }
+        if (line.startsWith("LH:")) {
+          currentLineHit = Number.parseInt(line.slice(3), 10) || 0;
+          continue;
+        }
+        if (line === "end_of_record") {
+          flushRecord();
+          currentSourcePath = null;
+          currentLineFound = 0;
+          currentLineHit = 0;
         }
       }
+
+      flushRecord();
     }
+
+    const summarizedSourceFiles = Array.from(sourceFiles.entries())
+      .map(([filePath, summary]) => ({
+        filePath,
+        lineFound: summary.lineFound,
+        lineHit: summary.lineHit,
+        lineCoverage: summary.lineFound > 0 ? (summary.lineHit / summary.lineFound) * 100 : null,
+      }))
+      .sort((left, right) => left.filePath.localeCompare(right.filePath));
+    const lineFound = summarizedSourceFiles.reduce((sum, item) => sum + item.lineFound, 0);
+    const lineHit = summarizedSourceFiles.reduce((sum, item) => sum + item.lineHit, 0);
 
     return {
       lineFound,
       lineHit,
       lineCoverage: lineFound > 0 ? (lineHit / lineFound) * 100 : null,
       files,
+      sourceFiles: summarizedSourceFiles,
     };
+  }
+
+  private resolveCoverageSourcePath(projectRoot: string, coverageFilePath: string, sourcePath: string): string {
+    return this.resolveArtifactSourcePath(projectRoot, coverageFilePath, sourcePath);
   }
 
   private async detectVitest(projectRoot: string): Promise<VitestSummary | null> {
@@ -218,6 +300,25 @@ export class TestArtifactAnalyzer {
   private extractIntegerAttribute(tag: string, attribute: string): number {
     const match = new RegExp(`${attribute}="(\\d+)"`, "u").exec(tag);
     return match ? Number.parseInt(match[1] ?? "0", 10) : 0;
+  }
+
+  private extractStringAttribute(tag: string, attribute: string): string | null {
+    const match = new RegExp(`${attribute}="([^"]+)"`, "u").exec(tag);
+    return match?.[1]?.trim() ? match[1].trim() : null;
+  }
+
+  private resolveArtifactSourcePath(projectRoot: string, artifactFilePath: string, sourcePath: string): string {
+    const trimmed = sourcePath.trim();
+    if (!trimmed) {
+      return artifactFilePath;
+    }
+    if (path.isAbsolute(trimmed)) {
+      return path.normalize(trimmed);
+    }
+
+    const projectRelative = path.resolve(projectRoot, trimmed);
+    const artifactRelative = path.resolve(path.dirname(artifactFilePath), trimmed);
+    return trimmed.startsWith(".") ? artifactRelative : projectRelative;
   }
 
   private async findFilesByPattern(

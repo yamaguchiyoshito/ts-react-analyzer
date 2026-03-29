@@ -1,11 +1,46 @@
 import ts from "typescript";
 
 export type OutputFormat = "json" | "markdown" | "csv" | "html" | "all";
-export type DependencyType = "import" | "export" | "dynamic-import";
+export type DependencyType = "import" | "export" | "dynamic-import" | "side-effect-import";
 export type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 export type RiskLevel = "low" | "medium" | "high";
+export type AnalysisScope = "all" | "source-only";
+export type QualityProfile = "application" | "library-repo";
+export type TestPresenceBucketId = "route" | "feature" | "form" | "ui";
+
+export interface TestPresenceThresholdConfig {
+  pass: number;
+  warn: number;
+}
+
+export interface TestPresenceBucketWeightConfig {
+  route: number;
+  feature: number;
+  form: number;
+  layout: number;
+  api: number;
+  schema: number;
+  validation: number;
+  hook: number;
+  context: number;
+  ui: number;
+  shared: number;
+}
+
+export interface TestPresenceSettings {
+  thresholds: Record<QualityProfile, TestPresenceThresholdConfig>;
+  bucketWeights: TestPresenceBucketWeightConfig;
+  staticImportTraversalMaxDepth: number;
+  runtimeLineCoverageMinPercent: number;
+  knownCallNames: string[];
+  knownFrameworkModules: string[];
+}
 
 export interface AnalysisConfig {
+  analysisScope: AnalysisScope;
+  qualityProfile: QualityProfile;
+  testPresenceSettings: TestPresenceSettings;
+  excludeGroups: string[];
   excludePatterns: string[];
   outputFormats: OutputFormat[];
   outputDir: string;
@@ -21,6 +56,7 @@ export interface AnalysisConfig {
   manualInputPath?: string;
   qualityGateBlockingMetricIds: string[];
   qualityGateMonitoringMetricIds: string[];
+  maxTypeCheckRootNames: number;
   tsConfigPath?: string;
   projectRoot?: string;
   tsCompilerOptions: ts.CompilerOptions;
@@ -91,6 +127,7 @@ export interface CachedAnalysisRecord {
   filePath: string;
   sourceSha256: string;
   configHash: string;
+  analysisContextHash: string;
   payload: CachedAnalysisPayload;
   timestamp: number;
 }
@@ -229,7 +266,24 @@ export interface TypeSafetyMetrics {
   assertionCount: number;
   nonNullAssertionCount: number;
   tsIgnoreCount: number;
+  tsExpectErrorCount?: number;
+  tsNoCheckCount?: number;
+  unsafeAssertionCount?: number;
+  doubleAssertionCount?: number;
+  constAssertionCount?: number;
   uncheckedPatterns: string[];
+}
+
+export interface ComplexityScoreBreakdown {
+  averageFunctionComplexity: number;
+  peakFunctionComplexity: number;
+  topFunctionAverage: number;
+  averageRenderComplexity: number;
+  peakRenderComplexity: number;
+  hookPressure: number;
+  peakNestingDepth: number;
+  elevatedFunctionCount: number;
+  weightedScore: number;
 }
 
 export interface FileComplexityAnalysis {
@@ -241,6 +295,7 @@ export interface FileComplexityAnalysis {
   components: ComponentMetrics[];
   hooks: HookInfo[];
   typeMetrics: TypeSafetyMetrics;
+  scoreBreakdown: ComplexityScoreBreakdown;
   overallComplexity: number;
 }
 
@@ -316,6 +371,7 @@ export interface HotSpotReportItem {
   hooks: number;
   anyCount: number;
   reasons: string[];
+  complexityDrivers?: string[];
   action: string;
 }
 
@@ -340,6 +396,10 @@ export interface DecisionSummaryReport {
     assertionCount: number;
     nonNullAssertionCount: number;
     tsIgnoreCount: number;
+    tsExpectErrorCount?: number;
+    tsNoCheckCount?: number;
+    unsafeAssertionCount?: number;
+    doubleAssertionCount?: number;
   };
 }
 
@@ -402,6 +462,9 @@ export interface AnalysisDiffReport {
       anyDelta: number;
       clusterBefore: string;
       clusterAfter: string;
+      baselineComplexityDrivers?: string[];
+      currentComplexityDrivers?: string[];
+      complexityDriverDelta?: string[];
     }>;
   };
   impact: {
@@ -414,6 +477,8 @@ export interface AnalysisDiffReport {
       inboundDegree: number;
       outboundDegree: number;
       directlyChanged: boolean;
+      complexityPressure: number;
+      complexitySignals: string[];
       reasons: string[];
     }>;
     subtrees: Array<{
@@ -502,11 +567,46 @@ export interface QualitySummary {
   overallVerdict: QualityVerdict;
 }
 
+export interface WorkspaceSegmentSummary {
+  id: "apps" | "packages" | "src" | "other";
+  label: string;
+  fileCount: number;
+  componentCount: number;
+  typeEscapeCount: number;
+  highResponsibilityComponentCount: number;
+  visualConsumerCount: number;
+  designSystemBackedCount: number;
+  testTargetFiles: number;
+  matchedTestFiles: number;
+  weightedTestRate: number;
+  productTextCount: number;
+}
+
+export interface FeatureSummary {
+  id: string;
+  label: string;
+  fileCount: number;
+  componentCount: number;
+  averageComplexity: number;
+  maxComplexity: number;
+  typeEscapeCount: number;
+  highResponsibilityComponentCount: number;
+  visualConsumerCount: number;
+  designSystemBackedCount: number;
+  testTargetFiles: number;
+  matchedTestFiles: number;
+  weightedTestRate: number;
+  productTextCount: number;
+}
+
 export interface QualityReport {
   timestamp: string;
   executionTimeMs: number;
   projectRoot: string;
+  qualityProfile?: QualityProfile;
   summary: QualitySummary;
+  workspaceSegments?: WorkspaceSegmentSummary[];
+  featureSummaries?: FeatureSummary[];
   categories: QualityCategoryReport[];
 }
 

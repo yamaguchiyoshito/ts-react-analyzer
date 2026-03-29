@@ -11,7 +11,7 @@ import type {
 
 export class AnalysisCache {
   private readonly cacheFile: string;
-  private readonly configHash: string;
+  private readonly baseConfigHash: string;
   private readonly records = new Map<string, CachedAnalysisRecord>();
   private readonly nextRecords = new Map<string, CachedAnalysisRecord>();
   private readonly stats: CacheStats = { hits: 0, misses: 0 };
@@ -19,7 +19,7 @@ export class AnalysisCache {
   constructor(cacheDir: string, projectRoot: string, compilerOptions: ts.CompilerOptions) {
     const projectKey = this.hash(projectRoot).slice(0, 16);
     this.cacheFile = path.join(cacheDir, "analysis", `${projectKey}.json`);
-    this.configHash = this.hash(this.stableStringify(compilerOptions));
+    this.baseConfigHash = this.hash(this.stableStringify(compilerOptions));
   }
 
   async initialize(): Promise<void> {
@@ -35,9 +35,14 @@ export class AnalysisCache {
     }
   }
 
-  get(filePath: string, sourceSha256: string): CachedAnalysisPayload | null {
+  get(filePath: string, sourceSha256: string, analysisContextHash: string): CachedAnalysisPayload | null {
     const record = this.records.get(filePath);
-    if (!record || record.sourceSha256 !== sourceSha256 || record.configHash !== this.configHash) {
+    if (
+      !record
+      || record.sourceSha256 !== sourceSha256
+      || record.configHash !== this.baseConfigHash
+      || record.analysisContextHash !== analysisContextHash
+    ) {
       this.stats.misses += 1;
       return null;
     }
@@ -47,11 +52,12 @@ export class AnalysisCache {
     return record.payload;
   }
 
-  set(filePath: string, sourceSha256: string, payload: CachedAnalysisPayload): void {
+  set(filePath: string, sourceSha256: string, analysisContextHash: string, payload: CachedAnalysisPayload): void {
     this.nextRecords.set(filePath, {
       filePath,
       sourceSha256,
-      configHash: this.configHash,
+      configHash: this.baseConfigHash,
+      analysisContextHash,
       payload,
       timestamp: Date.now(),
     });

@@ -6,9 +6,10 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import ts from "typescript";
 
-import { ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, FileScanner, GraphBuilder, QualityDiffGenerator, QualityReportGenerator, ReportGenerator } from "../src/core/index.js";
-import type { AnalysisResult, Dependency, GraphMetrics, QualityDiffReport, QualityReport } from "../src/types/index.js";
+import { ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, FileScanner, GraphBuilder, QualityDiffGenerator, QualityReportGenerator, ReportGenerator, TypeCheckAnalyzer } from "../src/core/index.js";
+import type { AnalysisResult, Dependency, GraphMetrics, PersistedAnalysisReport, QualityDiffReport, QualityReport } from "../src/types/index.js";
 
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const sampleProject = path.join(workspaceRoot, "tests", "fixtures", "sample-app");
@@ -84,6 +85,17 @@ function createAnalysisResult(
         tsIgnoreCount: 0,
         uncheckedPatterns: [],
       },
+      scoreBreakdown: {
+        averageFunctionComplexity: 0,
+        peakFunctionComplexity: 0,
+        topFunctionAverage: 0,
+        averageRenderComplexity: 0,
+        peakRenderComplexity: 0,
+        hookPressure: 0,
+        peakNestingDepth: 0,
+        elevatedFunctionCount: 0,
+        weightedScore: 1,
+      },
       overallComplexity: 1,
       ...overrides,
     },
@@ -148,6 +160,115 @@ test("DependencyAnalyzer resolves tsconfig path aliases and dynamic imports", as
   await fs.rm(config.cacheDir, { recursive: true, force: true });
 });
 
+test("DependencyAnalyzer resolves aliases from the nearest nested tsconfig in monorepos", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-monorepo-alias-"));
+  const appRoot = path.join(projectRoot, "apps", "demo");
+  const srcDir = path.join(appRoot, "src");
+  const componentsDir = path.join(srcDir, "components");
+  await fs.mkdir(componentsDir, { recursive: true });
+
+  const appFilePath = path.join(srcDir, "App.tsx");
+  const buttonFilePath = path.join(componentsDir, "Button.tsx");
+  const tsConfigPath = path.join(appRoot, "tsconfig.json");
+
+  await fs.writeFile(buttonFilePath, "export const Button = () => <button />;\n", "utf8");
+  await fs.writeFile(appFilePath, "import { Button } from '@/components/Button';\nexport const App = () => <Button />;\n", "utf8");
+  await fs.writeFile(tsConfigPath, JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "ESNext",
+      moduleResolution: "Bundler",
+      jsx: "react-jsx",
+      baseUrl: ".",
+      paths: {
+        "@/*": ["src/*"],
+      },
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+
+  const scanner = new FileScanner({
+    excludePatterns: [],
+    maxFileSizeBytes: 1024 * 1024,
+    cacheDir: path.join(projectRoot, ".cache"),
+    enableCache: false,
+  });
+  const scanResult = await scanner.scanProject(projectRoot);
+  const appFile = scanResult.parsed.find((file) => file.filePath === appFilePath);
+
+  assert.ok(appFile);
+
+  const analyzer = new DependencyAnalyzer(projectRoot, {});
+  const extracted = analyzer.extractDependencies(appFile!.sourceFile, appFile!.filePath);
+
+  assert.equal(extracted.internalCount, 1);
+  assert.equal(extracted.externalCount, 0);
+  assert.equal(extracted.dependencies[0]?.target, buttonFilePath);
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("DependencyAnalyzer resolves aliases from nearest tsconfig variant files", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-tsconfig-variant-"));
+  const appRoot = path.join(projectRoot, "apps", "demo");
+  const srcDir = path.join(appRoot, "src");
+  const sharedDir = path.join(srcDir, "shared");
+  await fs.mkdir(sharedDir, { recursive: true });
+
+  const appFilePath = path.join(srcDir, "App.tsx");
+  const labelFilePath = path.join(sharedDir, "label.ts");
+  await fs.writeFile(labelFilePath, "export const label = 'demo';\n", "utf8");
+  await fs.writeFile(appFilePath, "import { label } from '@app/shared/label';\nexport const App = () => <main>{label}</main>;\n", "utf8");
+  await fs.writeFile(path.join(appRoot, "tsconfig.app.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "ESNext",
+      moduleResolution: "Bundler",
+      jsx: "react-jsx",
+      baseUrl: ".",
+      paths: {
+        "@app/*": ["src/*"],
+      },
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+
+  const scanner = new FileScanner({
+    excludePatterns: [],
+    maxFileSizeBytes: 1024 * 1024,
+    cacheDir: path.join(projectRoot, ".cache"),
+    enableCache: false,
+  });
+  const scanResult = await scanner.scanProject(projectRoot);
+  const appFile = scanResult.parsed.find((file) => file.filePath === appFilePath);
+
+  assert.ok(appFile);
+
+  const analyzer = new DependencyAnalyzer(projectRoot, {});
+  const extracted = analyzer.extractDependencies(appFile!.sourceFile, appFile!.filePath);
+
+  assert.equal(extracted.internalCount, 1);
+  assert.equal(extracted.dependencies[0]?.target, labelFilePath);
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("DependencyAnalyzer keeps side-effect imports in the dependency graph", () => {
+  const source = [
+    "import './polyfills';",
+    "import { start } from './start';",
+    "start();",
+  ].join("\n");
+  const sourceFile = ts.createSourceFile("/virtual/src/App.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const analyzer = new DependencyAnalyzer("/virtual", {});
+  const extracted = analyzer.extractDependencies(sourceFile, "/virtual/src/App.ts");
+
+  assert.equal(extracted.sideEffectImports, 1);
+  assert.ok(extracted.dependencies.some((dependency) =>
+    dependency.type === "side-effect-import" && dependency.target === "/virtual/src/polyfills"
+  ));
+});
+
 test("ComplexityAnalyzer detects hooks, JSX, and explicit any usage", async () => {
   const configManager = new ConfigManager();
   const config = configManager.mergeConfigs(
@@ -168,6 +289,79 @@ test("ComplexityAnalyzer detects hooks, JSX, and explicit any usage", async () =
   assert.ok(metrics.hooks.some((hook) => hook.name === "useEffect"));
   assert.ok(metrics.typeMetrics.anyTypeCount >= 1);
   assert.ok(metrics.components[0]?.jsxElements && metrics.components[0].jsxElements >= 3);
+});
+
+test("ComplexityAnalyzer classifies ts directives and unsafe assertion patterns", () => {
+  const source = `
+    // @ts-ignore legacy shim
+    // @ts-expect-error temporary mismatch
+    // @ts-nocheck file-level suppression
+
+    const value = foo as any;
+    const stable = { a: 1 } as const;
+    const converted = foo as unknown as string;
+    const current = ref.current!;
+  `;
+  const sourceFile = ts.createSourceFile("unsafe.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const analyzer = new ComplexityAnalyzer();
+  const metrics = analyzer.analyzeFile(sourceFile, "/virtual/unsafe.ts");
+
+  assert.equal(metrics.typeMetrics.tsIgnoreCount, 1);
+  assert.equal(metrics.typeMetrics.tsExpectErrorCount, 1);
+  assert.equal(metrics.typeMetrics.tsNoCheckCount, 1);
+  assert.ok((metrics.typeMetrics.unsafeAssertionCount ?? 0) >= 2);
+  assert.equal(metrics.typeMetrics.doubleAssertionCount, 1);
+  assert.equal(metrics.typeMetrics.constAssertionCount, 1);
+  assert.equal(metrics.typeMetrics.nonNullAssertionCount, 1);
+  assert.ok(metrics.typeMetrics.uncheckedPatterns.includes("@ts-expect-error"));
+  assert.ok(metrics.typeMetrics.uncheckedPatterns.includes("@ts-nocheck"));
+  assert.ok(metrics.typeMetrics.uncheckedPatterns.includes("double-assertion"));
+});
+
+test("ComplexityAnalyzer weights peak complexity, nesting, and hook pressure into file score", () => {
+  const source = `
+    import { useEffect, useMemo, useState } from "react";
+
+    export function Dashboard({ items }: { items: number[] }) {
+      const [count] = useState(0);
+
+      useEffect(() => {
+        void count;
+      }, [count]);
+
+      const total = useMemo(() => items.reduce((sum, item) => sum + item, 0), [items]);
+
+      const decide = () => {
+        if (count > 0) {
+          for (const item of items) {
+            if (item > 1 && item < 5) {
+              if (total > 10 || item === count) {
+                return item;
+              }
+            }
+          }
+        }
+
+        return 0;
+      };
+
+      return (
+        <section>
+          {items.length > 0 && items.map((item) => <div key={item}>{item}</div>)}
+          <span>{decide()}</span>
+        </section>
+      );
+    }
+  `;
+  const sourceFile = ts.createSourceFile("Dashboard.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const analyzer = new ComplexityAnalyzer();
+  const metrics = analyzer.analyzeFile(sourceFile, "/virtual/Dashboard.tsx");
+
+  assert.ok(metrics.overallComplexity >= 12);
+  assert.ok(metrics.scoreBreakdown.peakFunctionComplexity >= 7);
+  assert.ok(metrics.scoreBreakdown.peakNestingDepth >= 4);
+  assert.ok(metrics.scoreBreakdown.hookPressure >= 2);
+  assert.ok(metrics.scoreBreakdown.elevatedFunctionCount >= 1);
 });
 
 test("GraphBuilder detects circular dependencies", async () => {
@@ -260,7 +454,7 @@ test("ReportGenerator writes json, markdown, csv, and html outputs", async () =>
     statistics: { fileCount: number };
     incrementalStats?: { reusedFiles: number; recomputedFiles: number };
     decisionSummary?: {
-      topHotSpots?: Array<{ path: string; displayPath: string; score: number }>;
+      topHotSpots?: Array<{ path: string; displayPath: string; score: number; complexityDrivers?: string[] }>;
       riskSummary?: { complexity: { low: number; medium: number; high: number } };
       typeSafetyAlerts?: { anyCount: number; criticalSignals: number };
     };
@@ -271,6 +465,7 @@ test("ReportGenerator writes json, markdown, csv, and html outputs", async () =>
   assert.equal(jsonReport.incrementalStats?.recomputedFiles, 4);
   assert.ok((jsonReport.decisionSummary?.topHotSpots?.length ?? 0) >= 1);
   assert.ok(jsonReport.decisionSummary?.topHotSpots?.some((item) => item.displayPath === "src/App.tsx"));
+  assert.ok(jsonReport.decisionSummary?.topHotSpots?.every((item) => (item.complexityDrivers?.length ?? 0) >= 1));
   assert.equal(jsonReport.decisionSummary?.riskSummary?.complexity.low, 4);
   assert.ok((jsonReport.decisionSummary?.typeSafetyAlerts?.anyCount ?? 0) >= 1);
   const htmlReport = await fs.readFile(path.join(outputDir, "fixture_report.html"), "utf8");
@@ -282,31 +477,35 @@ test("ReportGenerator writes json, markdown, csv, and html outputs", async () =>
   assert.match(htmlReport, /Incremental/u);
   assert.match(htmlReport, /file:\/\//u);
   assert.match(htmlReport, /Dependency Graph/u);
-  assert.match(markdownReport, /## 意思決定サマリー/u);
-  assert.match(markdownReport, /優先順位の高い論点を先頭で整理し、着手判断を早くするためのセクションです。/u);
-  assert.match(markdownReport, /## 重点改修候補 Top 5/u);
+  assert.match(markdownReport, /## 目次/u);
+  assert.match(markdownReport, /## 要点/u);
+  assert.match(markdownReport, /最初の 30 秒で読むべき情報だけを先頭に集約しています。/u);
+  assert.match(markdownReport, /## 優先対応 Top 5/u);
   assert.match(markdownReport, /## 3x3 マトリクス要約/u);
   assert.match(markdownReport, /コード行数と複雑度の 3x3 マトリクスで、設計負債の位置を俯瞰します。/u);
   assert.match(markdownReport, /## ファイル種別分布/u);
-  assert.match(markdownReport, /## リスク分布/u);
+  assert.match(markdownReport, /## リスク概況/u);
   assert.match(markdownReport, /\| 複雑度 \| \d+ \| \d+ \| \d+ \|/u);
   assert.match(markdownReport, /\| 構造 \| \d+ \| \d+ \| \d+ \|/u);
   assert.match(markdownReport, /\| 型安全性 \| \d+ \| \d+ \| \d+ \|/u);
   assert.match(markdownReport, /## 型安全性/u);
+  assert.match(markdownReport, /### スコア上位ファイル/u);
   assert.match(markdownReport, /### 外部ライブラリ内訳/u);
   assert.match(markdownReport, /#### Runtime 外部ライブラリ Top 10/u);
   assert.match(markdownReport, /- react: \d+/u);
-  assert.match(markdownReport, /## 優先対応タスク/u);
-  assert.match(markdownReport, /1\. src\/App\.tsx/u);
-  assert.match(markdownReport, /理由: .*fan-out=/u);
-  assert.match(markdownReport, /対応: /u);
+  assert.match(markdownReport, /\| 順位 \| ファイル \| severity \| 主因 \| score \| 複雑度 \| 依存 \| any \| Hooks \| クラスタ \| 推奨対応 \|/u);
+  assert.match(markdownReport, /\| 1 \| src\/App\.tsx \|/u);
+  assert.match(markdownReport, /### 最優先ファイルの補足/u);
+  assert.match(markdownReport, /- \*\*score帯\*\*: /u);
+  assert.match(markdownReport, /- \*\*複雑度内訳\*\*: weighted=/u);
+  assert.match(markdownReport, /- \*\*推奨対応\*\*: /u);
   assert.match(markdownReport, /- \*\*複雑度リスク\*\*: 高=0, 中=0/u);
   assert.match(markdownReport, /- \*\*構造リスク\*\*: /u);
-  assert.match(markdownReport, /- \*\*型安全性リスク\*\*: /u);
+  assert.match(markdownReport, /- \*\*型安全性の警戒信号\*\*: /u);
+  assert.match(markdownReport, /## 実行サマリー/u);
   assert.match(markdownReport, /- \*\*実行時間\*\*: 1234ms/u);
   assert.doesNotMatch(markdownReport, /recomputed##/u);
-  assert.match(markdownReport, /\| Feature \| 0 \|/u);
-  assert.match(markdownReport, /\*\*src\/App\.tsx\*\* 主因=/u);
+  assert.match(markdownReport, /0 件の種別 \d+ 件は省略しています。/u);
   assert.match(markdownReport, /\| src\/App\.tsx \| 1 \|/u);
   assert.match(filesCsv, /^File,File Type,Has Test File,Matrix Cluster,Lines,/mu);
   assert.match(filesCsv, /src\/components\/Button\.tsx,UI component,No,S-L,/u);
@@ -379,7 +578,7 @@ test("ReportGenerator excludes test and story files from type safety summaries",
     medium: 1,
     high: 0,
   });
-  assert.match(markdownReport, /\| src\/App\.tsx \| 1 \| 0 \| 0 \| 0 \| 4 \|/u);
+  assert.match(markdownReport, /\| src\/App\.tsx \| 1 \| 0 \| 0 \| 0 \| 0 \| 0 \| 4 \|/u);
   assert.doesNotMatch(markdownReport, /\| src\/App\.test\.tsx \|/u);
   assert.doesNotMatch(markdownReport, /\| src\/App\.stories\.tsx \|/u);
 
@@ -457,10 +656,19 @@ test("QualityReportGenerator writes quality outputs with automatic and manual me
   const csvReport = await fs.readFile(path.join(outputDir, "quality_quality_summary.csv"), "utf8");
   const htmlReport = await fs.readFile(path.join(outputDir, "quality_quality_report.html"), "utf8");
   assert.match(markdownReport, /# React 出荷審査 品質レポート/u);
-  assert.match(markdownReport, /\| 観点 \| 自動指標数 \| 診断指標数 \| PASS \| PARTIAL \| WARN \| FAIL \| MANUAL \| 判定 \|/u);
+  assert.match(markdownReport, /## 判定凡例/u);
+  assert.match(markdownReport, /## 要点/u);
+  assert.match(markdownReport, /## 優先対応/u);
+  assert.match(markdownReport, /## 不足証跡/u);
+  assert.match(markdownReport, /前回比: N\/A（ベースライン未設定）/u);
+  assert.match(markdownReport, /\| 観点 \| 自動 \| FAIL \| WARN \| PARTIAL \| 手動 \| 判定 \|/u);
+  assert.match(markdownReport, /\| 優先度 \| 観点 \| 指標 \| 判定 \| 実績 \| 基準 \| 証跡種別 \| 信頼度 \| 主対象 \| 推奨アクション \| 要点 \|/u);
+  assert.match(markdownReport, /\| 指標 \| 集計 \| 実績 \| 基準 \| 判定 \| 証跡種別 \| 信頼度 \| 主対象 \|/u);
   assert.match(markdownReport, /## セキュリティ品質/u);
   assert.match(csvReport, /^"Category","Metric","Aggregation","Automation","Actual","Threshold","Verdict","Summary"/mu);
   assert.match(htmlReport, /React 出荷審査 品質レポート/u);
+  assert.match(htmlReport, /判定凡例/u);
+  assert.match(htmlReport, /自動判定カバレッジ/u);
 
   await fs.rm(outputDir, { recursive: true, force: true });
   await fs.rm(config.cacheDir, { recursive: true, force: true });
@@ -670,6 +878,574 @@ test("QualityReportGenerator imports JUnit and LCOV artifacts into test metrics"
   assert.equal(coverageMetric?.automation, "automatic");
   assert.equal(coverageMetric?.actual, "90.0%");
   assert.equal(coverageMetric?.verdict, "pass");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator avoids double-counting nested JUnit suites", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-junit-nested-"));
+  const outputDir = path.join(projectRoot, "out");
+  const testResultsDir = path.join(projectRoot, "test-results");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.mkdir(testResultsDir, { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "value.ts"), "export const value = 1;\n", "utf8");
+  await fs.writeFile(path.join(testResultsDir, "junit.xml"), [
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+    "<testsuites>",
+    "  <testsuite name=\"root\" tests=\"2\" failures=\"1\" errors=\"0\" skipped=\"0\">",
+    "    <testsuite name=\"child\" tests=\"2\" failures=\"1\" errors=\"0\" skipped=\"0\">",
+    "      <testcase classname=\"value\" name=\"ok\" file=\"src/value.test.ts\"><system-out /></testcase>",
+    "      <testcase classname=\"value\" name=\"ng\" file=\"src/value.test.ts\"><failure message=\"ng\" /></testcase>",
+    "    </testsuite>",
+    "  </testsuite>",
+    "</testsuites>",
+  ].join("\n"), "utf8");
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: [],
+    parsedFiles: [],
+    graphMetrics: createEmptyGraphMetrics(),
+    executionTimeMs: 10,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "nested-junit",
+    formats: ["json"],
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const unitPassMetric = testCategory?.metrics.find((metric) => metric.id === "unit_pass_rate");
+
+  assert.equal(unitPassMetric?.actual, "50.0%");
+  assert.ok(unitPassMetric?.evidence.some((item) => item.label === "総テスト数" && item.value === "2"));
+  assert.ok(unitPassMetric?.evidence.some((item) => item.label === "失敗数" && item.value === "1"));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator ignores non-executable helper files inside test directories", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-test-helpers-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src", "features"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "features", "__tests__"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "features", "UserCard.tsx"), [
+    "export function UserCard() {",
+    "  return <section>User</section>;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "features", "__tests__", "UserCard.tsx"), [
+    "import { render } from \"@testing-library/react\";",
+    "import { UserCard } from \"../UserCard\";",
+    "",
+    "export function renderUserCard() {",
+    "  return render(<UserCard />);",
+    "}",
+  ].join("\n"), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "helper-quality",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 100,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "helper-quality",
+    formats: ["json"],
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const overallMetric = testCategory?.metrics.find((metric) => metric.id === "matching_test_file_presence");
+
+  assert.equal(overallMetric?.actual, "0.0%");
+  assert.equal(overallMetric?.verdict, "fail");
+  assert.equal(overallMetric?.evidence.find((item) => item.label === "static一致数")?.value, "0");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator uses JUnit executed test files as runtime evidence", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-junit-runtime-"));
+  const outputDir = path.join(projectRoot, "out");
+  const reportsDir = path.join(projectRoot, "reports");
+
+  await fs.mkdir(path.join(projectRoot, "src", "app"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "__tests__"), { recursive: true });
+  await fs.mkdir(reportsDir, { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "app", "page.tsx"), [
+    "export default function Page() {",
+    "  return <main>hello</main>;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "__tests__", "page.test.tsx"), [
+    "import { expect, test } from \"vitest\";",
+    "import Page from \"../app/page\";",
+    "",
+    "test(\"Page\", () => {",
+    "  expect(Page).toBeDefined();",
+    "});",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(reportsDir, "junit.xml"), [
+    "<testsuites>",
+    "  <testsuite name=\"unit\" tests=\"1\" failures=\"0\" errors=\"0\" skipped=\"0\">",
+    "    <testcase name=\"Page\" file=\"src/__tests__/page.test.tsx\" />",
+    "  </testsuite>",
+    "</testsuites>",
+  ].join("\n"), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "junit-runtime",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    testEvidenceResults: results,
+    testEvidenceParsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 100,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "junit-runtime",
+    formats: ["json"],
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const overallMetric = testCategory?.metrics.find((metric) => metric.id === "matching_test_file_presence");
+
+  assert.equal(overallMetric?.actual, "100.0%");
+  assert.equal(overallMetric?.evidence.find((item) => item.label === "runtime一致数")?.value, "1");
+  assert.equal(overallMetric?.evidence.find((item) => item.label === "static一致数")?.value, "0");
+  assert.ok(overallMetric?.evidence.some((item) =>
+    item.label === "runtime-test-link" && /junit:src\/__tests__\/page\.test\.tsx depth=0/u.test(item.value)
+  ));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator uses Playwright executed test files as runtime evidence", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-playwright-runtime-"));
+  const outputDir = path.join(projectRoot, "out");
+  const reportDir = path.join(projectRoot, "playwright-report");
+
+  await fs.mkdir(path.join(projectRoot, "src", "app"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "tests", "e2e"), { recursive: true });
+  await fs.mkdir(reportDir, { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src", "tests"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "app", "page.tsx"), [
+    "export default function Page() {",
+    "  return <main>hello</main>;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "tests", "e2e", "page.spec.ts"), [
+    "import { expect, test } from \"@playwright/test\";",
+    "import Page from \"../../src/app/page\";",
+    "",
+    "test(\"Page\", async () => {",
+    "  expect(Page).toBeDefined();",
+    "});",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(reportDir, "results.json"), JSON.stringify({
+    tests: [
+      {
+        location: {
+          file: "tests/e2e/page.spec.ts",
+        },
+        results: [{ status: "passed" }],
+      },
+    ],
+  }, null, 2), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "playwright-runtime",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    testEvidenceResults: results,
+    testEvidenceParsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 100,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "playwright-runtime",
+    formats: ["json"],
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const overallMetric = testCategory?.metrics.find((metric) => metric.id === "matching_test_file_presence");
+
+  assert.equal(overallMetric?.actual, "100.0%");
+  assert.equal(overallMetric?.evidence.find((item) => item.label === "runtime一致数")?.value, "1");
+  assert.ok(overallMetric?.evidence.some((item) =>
+    item.label === "runtime-test-link" && /playwright:tests\/e2e\/page\.spec\.ts depth=0/u.test(item.value)
+  ));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator applies custom test presence settings for callable test DSLs", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-custom-test-settings-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src", "app"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "__tests__"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "app", "page.tsx"), [
+    "export default function Page() {",
+    "  return <main>hello</main>;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "__tests__", "page.case.tsx"), [
+    "import { expect } from \"vitest\";",
+    "import Page from \"../app/page\";",
+    "",
+    "scenario(\"Page\", () => {",
+    "  expect(Page).toBeDefined();",
+    "});",
+  ].join("\n"), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "custom-test-settings",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const defaultReport = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 100,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "custom-test-settings-default",
+    formats: ["json"],
+  });
+
+  const customReport = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 100,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+    testPresenceSettings: {
+      thresholds: {
+        application: { pass: 55, warn: 20 },
+        "library-repo": { pass: 60, warn: 25 },
+      },
+      bucketWeights: {
+        route: 5,
+        feature: 4,
+        form: 3,
+        layout: 2,
+        api: 2,
+        schema: 2,
+        validation: 2,
+        hook: 2,
+        context: 2,
+        ui: 1,
+        shared: 1,
+      },
+      staticImportTraversalMaxDepth: 3,
+      runtimeLineCoverageMinPercent: 0,
+      knownCallNames: ["scenario"],
+      knownFrameworkModules: ["vitest", "jest", "@jest/globals", "@playwright/test", "cypress"],
+    },
+  }, {
+    outputDir,
+    prefix: "custom-test-settings-enabled",
+    formats: ["json"],
+  });
+
+  const defaultMetric = defaultReport.categories
+    .find((category) => category.id === "test")
+    ?.metrics.find((metric) => metric.id === "matching_test_file_presence");
+  const customMetric = customReport.categories
+    .find((category) => category.id === "test")
+    ?.metrics.find((metric) => metric.id === "matching_test_file_presence");
+
+  assert.equal(defaultMetric?.actual, "0.0%");
+  assert.equal(defaultMetric?.verdict, "fail");
+  assert.equal(customMetric?.actual, "100.0%");
+  assert.equal(customMetric?.verdict, "pass");
+  assert.equal(customMetric?.threshold, "PASS>=55% / WARN>=20%");
+  assert.ok(customMetric?.evidence.some((item) =>
+    item.label === "test-link" && /import:src\/__tests__\/page\.case\.tsx depth=0/u.test(item.value)
+  ));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator prioritizes LCOV per-file evidence over static test links", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-lcov-priority-"));
+  const outputDir = path.join(projectRoot, "out");
+  const coverageDir = path.join(projectRoot, "coverage");
+
+  await fs.mkdir(path.join(projectRoot, "src", "app"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "__tests__"), { recursive: true });
+  await fs.mkdir(coverageDir, { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "app", "page.tsx"), [
+    "export default function Page() {",
+    "  return <main>hello</main>;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "__tests__", "page.test.tsx"), [
+    "import { expect, test } from \"vitest\";",
+    "import Page from \"../app/page\";",
+    "",
+    "test(\"Page\", () => {",
+    "  expect(Page).toBeDefined();",
+    "});",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(coverageDir, "lcov.info"), [
+    "TN:",
+    "SF:src/app/page.tsx",
+    "LF:10",
+    "LH:0",
+    "end_of_record",
+    "",
+  ].join("\n"), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "lcov-priority",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 100,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "lcov-priority",
+    formats: ["json"],
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const overallMetric = testCategory?.metrics.find((metric) => metric.id === "matching_test_file_presence");
+  const routeMetric = testCategory?.metrics.find((metric) => metric.id === "route_test_file_presence");
+
+  assert.equal(overallMetric?.actual, "0.0%");
+  assert.equal(overallMetric?.verdict, "fail");
+  assert.equal(routeMetric?.actual, "0.0%");
+  assert.equal(routeMetric?.verdict, "fail");
+  assert.equal(overallMetric?.evidence.find((item) => item.label === "runtime明示未一致数")?.value, "1");
+  assert.ok(overallMetric?.evidence.some((item) =>
+    item.label === "runtime-test-gap" && /lcov:0\/10/u.test(item.value)
+  ));
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
@@ -1053,6 +1829,7 @@ test("QualityReportGenerator excludes test and story files from strict code and 
   const securityCategory = report.categories.find((category) => category.id === "security");
   const i18nCategory = report.categories.find((category) => category.id === "i18n");
   const typeScriptErrorsMetric = codeCategory!.metrics.find((metric) => metric.id === "typescript_errors");
+  const tsconfigTypeSafetyMetric = codeCategory!.metrics.find((metric) => metric.id === "tsconfig_type_safety");
   const typeEscapeMetric = codeCategory!.metrics.find((metric) => metric.id === "type_escape_count");
   const dangerousHtmlMetric = securityCategory!.metrics.find((metric) => metric.id === "dangerous_html");
   const secretIndicatorsMetric = securityCategory!.metrics.find((metric) => metric.id === "secret_indicators");
@@ -1060,6 +1837,8 @@ test("QualityReportGenerator excludes test and story files from strict code and 
 
   assert.equal(typeScriptErrorsMetric?.actual, "0");
   assert.equal(typeScriptErrorsMetric?.verdict, "pass");
+  assert.equal(tsconfigTypeSafetyMetric?.verdict, "pass");
+  assert.match(tsconfigTypeSafetyMetric?.actual ?? "", /full=0\/1, strict=1\/1/u);
   assert.equal(typeEscapeMetric?.actual, "0");
   assert.equal(typeEscapeMetric?.verdict, "pass");
   assert.equal(dangerousHtmlMetric?.actual, "0");
@@ -1072,13 +1851,104 @@ test("QualityReportGenerator excludes test and story files from strict code and 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
 
-test("QualityReportGenerator treats story files as coverage evidence and ignores storybook support noise", async () => {
+test("QualityReportGenerator weights unsafe type escapes and tsconfig gaps", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-type-safety-quality-"));
+  const outputDir = path.join(projectRoot, "out");
+  await fs.mkdir(path.join(projectRoot, "src", "api"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "features"), { recursive: true });
+
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "api", "client.ts"), `
+    // @ts-expect-error temporary coercion
+    export const client = JSON.parse("{}") as unknown as { id: string };
+  `, "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "features", "screen.ts"), `
+    import { client } from "../api/client";
+    export function screen(props: unknown) {
+      const unsafe = props as any;
+      return unsafe ?? client;
+    }
+  `, "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "index.ts"), `
+    export { client } from "./api/client";
+    export { screen } from "./features/screen";
+  `, "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "type-safety-quality",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 100,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "type-safety-quality",
+    formats: ["json"],
+  });
+
+  const codeCategory = report.categories.find((category) => category.id === "code");
+  const strictnessMetric = codeCategory?.metrics.find((metric) => metric.id === "tsconfig_type_safety");
+  const typeEscapeMetric = codeCategory?.metrics.find((metric) => metric.id === "type_escape_count");
+
+  assert.equal(strictnessMetric?.verdict, "pass");
+  assert.match(strictnessMetric?.actual ?? "", /full=0\/1, strict=1\/1/u);
+  assert.equal(typeEscapeMetric?.verdict, "fail");
+  assert.doesNotMatch(typeEscapeMetric?.actual ?? "", /^0$/u);
+  assert.match(typeEscapeMetric?.summary ?? "", /unsafe assertion/u);
+  assert.ok((typeEscapeMetric?.evidence.length ?? 0) >= 1);
+  assert.ok(typeEscapeMetric?.evidence.some((evidence) => evidence.filePath?.endsWith(path.join("src", "api", "client.ts"))));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator uses test imports as coverage evidence and ignores story files and storybook support noise", async () => {
   const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-heuristics-"));
   const outputDir = path.join(projectRoot, "out");
 
   await fs.mkdir(path.join(projectRoot, "src", "components", "ui"), { recursive: true });
   await fs.mkdir(path.join(projectRoot, "src", "components", "shared"), { recursive: true });
   await fs.mkdir(path.join(projectRoot, "src", "components", "forms"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "__tests__"), { recursive: true });
   await fs.mkdir(path.join(projectRoot, ".storybook", "components"), { recursive: true });
   await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
     compilerOptions: {
@@ -1112,6 +1982,22 @@ test("QualityReportGenerator treats story files as coverage evidence and ignores
     "export function InputName() {",
     "  return <TextField placeholder=\"1970\" title=\"1\" />;",
     "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "components", "ui", "Input.test.tsx"), [
+    "import { expect, test } from \"vitest\";",
+    "import { Input } from \"./Input\";",
+    "",
+    "test(\"Input\", () => {",
+    "  expect(Input).toBeDefined();",
+    "});",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "__tests__", "InputName.test.tsx"), [
+    "import { expect, test } from \"vitest\";",
+    "import { InputName } from \"../components/forms/InputName\";",
+    "",
+    "test(\"InputName\", () => {",
+    "  expect(InputName).toBeDefined();",
+    "});",
   ].join("\n"), "utf8");
   await fs.writeFile(path.join(projectRoot, "src", "components", "ui", "Input.stories.tsx"), [
     "import { Input } from \"./Input\";",
@@ -1215,10 +2101,196 @@ test("QualityReportGenerator treats story files as coverage evidence and ignores
   assert.equal(bespokeMetric?.verdict, "pass");
   assert.equal(responsibilityMetric?.actual, "0");
   assert.equal(responsibilityMetric?.verdict, "pass");
-  assert.equal(testPresenceMetric?.actual, "100.0%");
+  assert.equal(testPresenceMetric?.actual, "80.0%");
   assert.equal(testPresenceMetric?.verdict, "pass");
+  assert.ok(testPresenceMetric?.evidence.some((item) => item.label === "UI重み" && item.value === "1.0 / 2.0 (50.0%)"));
+  assert.ok(testPresenceMetric?.evidence.some((item) => item.label === "Form重み" && item.value === "3.0 / 3.0 (100.0%)"));
+  assert.ok(testPresenceMetric?.evidence.some((item) => item.label === "static一致数" && item.value === "2"));
+  assert.ok(testPresenceMetric?.evidence.some((item) =>
+    item.label === "test-link" && /import:src\/__tests__\/InputName\.test\.tsx depth=0/u.test(item.value)
+  ));
   assert.equal(hardcodedTextMetric?.actual, "0");
   assert.equal(hardcodedTextMetric?.verdict, "pass");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator keeps static evidence through test helper files without expanding into full production transitive closure", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-helper-static-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src", "app"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "__tests__", "helpers"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "app", "page.tsx"), [
+    "import { Card } from \"../ui/Card\";",
+    "",
+    "export default function Page() {",
+    "  return <Card />;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.mkdir(path.join(projectRoot, "src", "ui"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "src", "ui", "Card.tsx"), "export function Card() { return <section />; }\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "__tests__", "helpers", "renderPage.tsx"), [
+    "import Page from \"../../app/page\";",
+    "export function renderPage() {",
+    "  return Page;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "__tests__", "page.test.tsx"), [
+    "import { expect, test } from \"vitest\";",
+    "import { renderPage } from \"./helpers/renderPage\";",
+    "",
+    "test(\"Page\", () => {",
+    "  expect(renderPage()).toBeDefined();",
+    "});",
+  ].join("\n"), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "quality-helper-static",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 50,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "quality-helper-static",
+    formats: ["json"],
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const testPresenceMetric = testCategory!.metrics.find((metric) => metric.id === "matching_test_file_presence");
+
+  assert.equal(testPresenceMetric?.actual, "83.3%");
+  assert.ok(testPresenceMetric?.evidence.some((item) =>
+    item.label === "test-link" && /import:src\/__tests__\/page\.test\.tsx depth=1/u.test(item.value)
+  ));
+  assert.ok(testPresenceMetric?.evidence.some((item) => item.label === "証跡未検出数" && item.value === "1"));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator ignores unused design-system imports when JSX does not use them", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-unused-ds-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src", "app"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "components", "ui"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "components", "ui", "Button.tsx"), "export function Button() { return <button />; }\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "app", "page.tsx"), [
+    "import { Button } from \"../components/ui/Button\";",
+    "",
+    "export default function Page() {",
+    "  void Button;",
+    "  return <main>plain page</main>;",
+    "}",
+  ].join("\n"), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "quality-unused-ds",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 50,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "quality-unused-ds",
+    formats: ["json"],
+  });
+
+  const uiCategory = report.categories.find((category) => category.id === "uiux");
+  const designSystemMetric = uiCategory!.metrics.find((metric) => metric.id === "design_system_usage_rate");
+  const bespokeMetric = uiCategory!.metrics.find((metric) => metric.id === "bespoke_ui_file_count");
+
+  assert.equal(designSystemMetric?.actual, "0.0%");
+  assert.equal(designSystemMetric?.verdict, "fail");
+  assert.equal(bespokeMetric?.actual, "1");
+  assert.equal(bespokeMetric?.verdict, "warn");
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
@@ -1242,7 +2314,7 @@ test("QualityReportGenerator weights route and feature coverage above UI primiti
     createAnalysisResult(path.join(projectRoot, "src", "app", "page.tsx"), { name: "Page" }),
     createAnalysisResult(path.join(projectRoot, "src", "features", "UserCard.tsx"), { name: "UserCard" }),
     createAnalysisResult(path.join(projectRoot, "src", "components", "ui", "Dialog.tsx"), { name: "DialogCloseButton" }),
-    createAnalysisResult(path.join(projectRoot, "src", "components", "ui", "Dialog.stories.tsx"), { name: "DialogStory" }),
+    createAnalysisResult(path.join(projectRoot, "src", "components", "ui", "Dialog.test.tsx"), { name: "DialogTest" }),
   ];
 
   const qualityReportGenerator = new QualityReportGenerator();
@@ -1341,8 +2413,12 @@ test("QualityReportGenerator marks partially automated categories as PARTIAL whe
     "}",
   ].join("\n"), "utf8");
   await fs.writeFile(path.join(projectRoot, "src", "app", "page.test.tsx"), [
+    "import { expect, test } from \"vitest\";",
     "import Page from \"./page\";",
-    "void Page;",
+    "",
+    "test(\"Page\", () => {",
+    "  expect(Page).toBeDefined();",
+    "});",
   ].join("\n"), "utf8");
 
   const configManager = new ConfigManager();
@@ -1466,8 +2542,12 @@ test("QualityReportGenerator separates product and library i18n text in the same
     "export const Primary = () => <DialogCloseButton />;",
   ].join("\n"), "utf8");
   await fs.writeFile(path.join(projectRoot, "src", "app", "page.test.tsx"), [
+    "import { expect, test } from \"vitest\";",
     "import Page from \"./page\";",
-    "void Page;",
+    "",
+    "test(\"Page\", () => {",
+    "  expect(Page).toBeDefined();",
+    "});",
   ].join("\n"), "utf8");
 
   const configManager = new ConfigManager();
@@ -1531,6 +2611,102 @@ test("QualityReportGenerator separates product and library i18n text in the same
   assert.match(hardcodedTextMetric?.summary ?? "", /製品文言 1 件、共通UIラベル 1 件/u);
   assert.ok(hardcodedTextMetric?.evidence.some((item) => item.label === "product-text"));
   assert.ok(hardcodedTextMetric?.evidence.some((item) => item.label === "library-text"));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator detects static JSX expression text bindings", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-i18n-expression-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src", "app"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "react-env.d.ts"), [
+    "type ElementProps = {",
+    "  children?: unknown;",
+    "  [key: string]: unknown;",
+    "};",
+    "",
+    "declare namespace JSX {",
+    "  interface IntrinsicElements {",
+    "    [elemName: string]: ElementProps;",
+    "  }",
+    "}",
+    "",
+    "declare module \"react/jsx-runtime\" {",
+    "  export const Fragment: unknown;",
+    "  export function jsx(...args: unknown[]): unknown;",
+    "  export function jsxs(...args: unknown[]): unknown;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "app", "page.tsx"), [
+    "export default function Page() {",
+    "  const cta = \"Submit order\";",
+    "  const helper = \"Need review\";",
+    "  return <main><button title={helper}>{cta}</button></main>;",
+    "}",
+  ].join("\n"), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "quality-i18n-expression",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 20,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "quality-i18n-expression",
+    formats: ["json"],
+  });
+
+  const i18nCategory = report.categories.find((category) => category.id === "i18n");
+  const hardcodedTextMetric = i18nCategory!.metrics.find((metric) => metric.id === "hardcoded_jsx_text");
+
+  assert.equal(hardcodedTextMetric?.actual, "2");
+  assert.ok(hardcodedTextMetric?.evidence.some((item) => item.label === "product-text" && /\{Submit order\}/u.test(item.value)));
+  assert.ok(hardcodedTextMetric?.evidence.some((item) => item.label === "product-text" && /title=\{Need review\}/u.test(item.value)));
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
@@ -1881,13 +3057,14 @@ test("CLI quality gate ignores derived automatic failures when primary metrics p
       "utf8",
     );
     await fs.writeFile(
-      path.join(projectRoot, "src", "components", "ui", `${componentName}.stories.tsx`),
+      path.join(projectRoot, "src", "components", "ui", `${componentName}.test.tsx`),
       [
-        `import type { Meta } from "@storybook/react";`,
+        "import { expect, test } from \"vitest\";",
         `import { ${componentName} } from "./${componentName}";`,
         "",
-        `const meta = { component: ${componentName} } satisfies Meta<typeof ${componentName}>;`,
-        "export default meta;",
+        `test("${componentName}", () => {`,
+        `  expect(${componentName}).toBeDefined();`,
+        "});",
       ].join("\n"),
       "utf8",
     );
@@ -1931,6 +3108,67 @@ test("CLI quality gate ignores derived automatic failures when primary metrics p
   assert.equal(overallMetric?.verdict, "pass");
   assert.equal(routeMetric?.aggregation, "derived");
   assert.equal(routeMetric?.verdict, "fail");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("CLI quality collect keeps test evidence under source-only and matches __tests__ imports", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-source-only-tests-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src", "app"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "src", "__tests__"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "app", "page.tsx"), [
+    "export default function Page() {",
+    "  return <main>hello</main>;",
+    "}",
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "__tests__", "page.test.tsx"), [
+    "import { expect, test } from \"vitest\";",
+    "import Page from \"../app/page\";",
+    "",
+    "test(\"Page\", () => {",
+    "  expect(Page).toBeDefined();",
+    "});",
+  ].join("\n"), "utf8");
+
+  await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality",
+    "collect",
+    projectRoot,
+    "--analysis-scope",
+    "source-only",
+    "--output",
+    outputDir,
+    "--prefix",
+    "source-only-tests",
+    "--format",
+    "json",
+  ]);
+
+  const report = JSON.parse(
+    await fs.readFile(path.join(outputDir, "source-only-tests_quality_report.json"), "utf8"),
+  ) as QualityReport;
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const overallMetric = testCategory?.metrics.find((metric) => metric.id === "matching_test_file_presence");
+  const routeMetric = testCategory?.metrics.find((metric) => metric.id === "route_test_file_presence");
+
+  assert.equal(overallMetric?.actual, "100.0%");
+  assert.equal(overallMetric?.verdict, "pass");
+  assert.equal(routeMetric?.actual, "100.0%");
+  assert.equal(routeMetric?.verdict, "pass");
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
@@ -2125,7 +3363,15 @@ test("CLI quality gate exits with code 2 when automatic metrics regress from bas
     include: ["src"],
   }, null, 2), "utf8");
   await fs.writeFile(path.join(projectRoot, "src", "App.ts"), "export const appName = 'release';\n", "utf8");
-  await fs.writeFile(path.join(projectRoot, "src", "App.test.ts"), "import { appName } from './App';\nvoid appName;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.test.ts"), [
+    "import { expect, test } from \"vitest\";",
+    "import { appName } from './App';",
+    "",
+    "test('appName', () => {",
+    "  expect(appName).toBe('release');",
+    "});",
+    "",
+  ].join("\n"), "utf8");
   await fs.writeFile(path.join(projectRoot, "README.md"), "# Release checklist\n", "utf8");
 
   await execFileAsync("node", [
@@ -2197,7 +3443,15 @@ test("CLI quality gate allows monitored regression metrics from analyzer config"
     include: ["src"],
   }, null, 2), "utf8");
   await fs.writeFile(path.join(projectRoot, "src", "App.ts"), "export const appName = 'release';\n", "utf8");
-  await fs.writeFile(path.join(projectRoot, "src", "App.test.ts"), "import { appName } from './App';\nvoid appName;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.test.ts"), [
+    "import { expect, test } from \"vitest\";",
+    "import { appName } from './App';",
+    "",
+    "test('appName', () => {",
+    "  expect(appName).toBe('release');",
+    "});",
+    "",
+  ].join("\n"), "utf8");
   await fs.writeFile(path.join(projectRoot, "README.md"), "# Release checklist\n", "utf8");
 
   await execFileAsync("node", [
@@ -2259,7 +3513,15 @@ test("CLI quality gate blocking metric list narrows regression gate scope", asyn
     include: ["src"],
   }, null, 2), "utf8");
   await fs.writeFile(path.join(projectRoot, "src", "App.ts"), "export const appName = 'release';\n", "utf8");
-  await fs.writeFile(path.join(projectRoot, "src", "App.test.ts"), "import { appName } from './App';\nvoid appName;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.test.ts"), [
+    "import { expect, test } from \"vitest\";",
+    "import { appName } from './App';",
+    "",
+    "test('appName', () => {",
+    "  expect(appName).toBe('release');",
+    "});",
+    "",
+  ].join("\n"), "utf8");
   await fs.writeFile(path.join(projectRoot, "README.md"), "# Release checklist\n", "utf8");
 
   await execFileAsync("node", [
@@ -2311,6 +3573,7 @@ test("ReportGenerator classifies test, story, fixture, and config files in csv o
   const outputDir = path.join(projectRoot, "out");
   const reportGenerator = new ReportGenerator();
   const results: AnalysisResult[] = [
+    createAnalysisResult(path.join(projectRoot, "test", "bundling", "scripts", "fixtureTemplateValues.js")),
     createAnalysisResult(path.join(projectRoot, "src", "components", "Button.test.tsx"), { name: "ButtonTest" }),
     createAnalysisResult(path.join(projectRoot, "src", "components", "Button.stories.tsx"), { name: "ButtonStory" }),
     createAnalysisResult(path.join(projectRoot, "src", "__fixtures__", "Button.fixture.tsx"), { name: "ButtonFixture" }),
@@ -2330,6 +3593,7 @@ test("ReportGenerator classifies test, story, fixture, and config files in csv o
   const componentsCsv = await fs.readFile(path.join(outputDir, "classification_components.csv"), "utf8");
 
   assert.match(filesCsv, /src\/components\/Button\.test\.tsx,Test,/u);
+  assert.match(filesCsv, /test\/bundling\/scripts\/fixtureTemplateValues\.js,Test,/u);
   assert.match(filesCsv, /src\/components\/Button\.stories\.tsx,Story,/u);
   assert.match(filesCsv, /src\/__fixtures__\/Button\.fixture\.tsx,Fixture,/u);
   assert.match(filesCsv, /src\/components\/ui\/Dialog\.tsx,UI component,/u);
@@ -2360,6 +3624,9 @@ test("ReportGenerator classifies feature, hook, context, API, barrel, schema, va
     createAnalysisResult(path.join(projectRoot, "src", "utils", "formatDate.ts")),
     createAnalysisResult(path.join(projectRoot, "src", "components", "index.ts")),
     createAnalysisResult(path.join(projectRoot, "vitest.shims.d.ts")),
+    createAnalysisResult(path.join(projectRoot, "packages", "mui-material", "src", "Button", "Button.tsx"), { name: "Button" }),
+    createAnalysisResult(path.join(projectRoot, "packages", "mui-material", "src", "Button", "index.ts")),
+    createAnalysisResult(path.join(projectRoot, "packages", "mui-material", "src", "Slider", "useSlider.ts")),
   ];
 
   await reportGenerator.generateReports(results, createEmptyGraphMetrics(), {
@@ -2385,6 +3652,485 @@ test("ReportGenerator classifies feature, hook, context, API, barrel, schema, va
   assert.match(filesCsv, /src\/utils\/formatDate\.ts,Utils,No,S-L,/u);
   assert.match(filesCsv, /src\/components\/index\.ts,Barrel,No,S-L,/u);
   assert.match(filesCsv, /vitest\.shims\.d\.ts,Type Support,No,S-L,/u);
+  assert.match(filesCsv, /packages\/mui-material\/src\/Button\/Button\.tsx,UI component,No,S-L,/u);
+  assert.match(filesCsv, /packages\/mui-material\/src\/Button\/index\.ts,Barrel,No,S-L,/u);
+  assert.match(filesCsv, /packages\/mui-material\/src\/Slider\/useSlider\.ts,Hook,No,S-L,/u);
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("CLI analyze applies source-only analysis scope before report generation", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-source-scope-"));
+  const outputDir = path.join(projectRoot, "out");
+  const cliPath = path.join(workspaceRoot, "dist", "src", "cli.js");
+
+  await fs.mkdir(path.join(projectRoot, "src", "components"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "test"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, ".storybook"), { recursive: true });
+
+  await fs.writeFile(path.join(projectRoot, "src", "components", "Button.tsx"), "export const Button = () => <button />;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "test", "Button.test.tsx"), "export const testCase = 1;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "components", "Button.stories.tsx"), "export const Story = {};\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, ".storybook", "main.ts"), "export default {};\n", "utf8");
+
+  await execFileAsync(process.execPath, [
+    cliPath,
+    "analyze",
+    projectRoot,
+    "--output",
+    outputDir,
+    "--prefix",
+    "source-scope",
+    "--analysis-scope",
+    "source-only",
+    "--format",
+    "json",
+  ]);
+
+  const report = JSON.parse(
+    await fs.readFile(path.join(outputDir, "source-scope_report.json"), "utf8"),
+  ) as PersistedAnalysisReport;
+
+  assert.equal(report.statistics.fileCount, 1);
+  assert.equal(report.files.length, 1);
+  assert.match(report.files[0]?.path ?? "", /src\/components\/Button\.tsx$/u);
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("TypeCheckAnalyzer scopes root files when includedFilePaths are provided", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-typecheck-scope-"));
+  const srcDir = path.join(projectRoot, "src");
+  await fs.mkdir(srcDir, { recursive: true });
+
+  const okFile = path.join(srcDir, "ok.ts");
+  const brokenFile = path.join(srcDir, "broken.ts");
+  const tsConfigPath = path.join(projectRoot, "tsconfig.json");
+
+  await fs.writeFile(okFile, "export const ok: string = 'ok';\n", "utf8");
+  await fs.writeFile(brokenFile, "export const broken: string = 42;\n", "utf8");
+  await fs.writeFile(tsConfigPath, JSON.stringify({
+    compilerOptions: {
+      strict: true,
+      noEmit: true,
+      target: "ES2020",
+      module: "ESNext",
+      moduleResolution: "Bundler",
+    },
+    include: ["src/**/*.ts"],
+  }, null, 2), "utf8");
+
+  const analyzer = new TypeCheckAnalyzer();
+  const fullSummary = analyzer.analyzeProject(projectRoot, tsConfigPath);
+  const scopedSummary = analyzer.analyzeProject(projectRoot, tsConfigPath, {
+    includedFilePaths: [okFile],
+  });
+
+  assert.equal(fullSummary.totalErrors, 1);
+  assert.equal(scopedSummary.totalErrors, 0);
+  assert.equal(scopedSummary.checkedFiles, 1);
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("TypeCheckAnalyzer keeps projectReferences during scoped type checks", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-typecheck-project-refs-"));
+  const srcDir = path.join(projectRoot, "src");
+  const sharedDir = path.join(projectRoot, "packages", "shared", "src");
+  const sharedRoot = path.join(projectRoot, "packages", "shared");
+  await fs.mkdir(srcDir, { recursive: true });
+  await fs.mkdir(sharedDir, { recursive: true });
+
+  const appFile = path.join(srcDir, "main.ts");
+  const sharedFile = path.join(sharedDir, "index.ts");
+  const tsConfigPath = path.join(projectRoot, "tsconfig.json");
+  const sharedTsConfigPath = path.join(sharedRoot, "tsconfig.json");
+
+  await fs.writeFile(sharedFile, "export const broken: string = 42;\nexport type Shared = { label: string };\n", "utf8");
+  await fs.writeFile(path.join(sharedRoot, "package.json"), JSON.stringify({
+    name: "shared",
+    types: "./src/index.ts",
+  }, null, 2), "utf8");
+  await fs.writeFile(appFile, "import type { Shared } from \"shared\";\nexport const value: Shared = { label: \"ok\" };\n", "utf8");
+  await fs.writeFile(sharedTsConfigPath, JSON.stringify({
+    compilerOptions: {
+      composite: true,
+      declaration: true,
+      emitDeclarationOnly: true,
+      noEmit: false,
+      outDir: "dist",
+      rootDir: "src",
+      strict: true,
+      target: "ES2020",
+      module: "ESNext",
+      moduleResolution: "Bundler",
+      baseUrl: ".",
+    },
+    include: ["src/**/*.ts"],
+  }, null, 2), "utf8");
+  await fs.writeFile(tsConfigPath, JSON.stringify({
+    compilerOptions: {
+      strict: true,
+      noEmit: true,
+      target: "ES2020",
+      module: "ESNext",
+      moduleResolution: "Bundler",
+      baseUrl: ".",
+      paths: {
+        shared: ["./packages/shared"],
+      },
+    },
+    include: ["src/**/*.ts"],
+    references: [{ path: "./packages/shared/tsconfig.json" }],
+  }, null, 2), "utf8");
+
+  const analyzer = new TypeCheckAnalyzer();
+  const summary = analyzer.analyzeProject(projectRoot, tsConfigPath, {
+    includedFilePaths: [appFile],
+  });
+
+  assert.equal(summary.totalErrors, 1);
+  assert.equal(summary.checkedFiles, 1);
+  assert.equal(summary.issues[0]?.code, 6305);
+  assert.ok(summary.issues[0]?.filePath.endsWith(path.join("src", "main.ts")));
+  assert.ok(summary.issues.every((issue) => !issue.filePath.endsWith(path.join("packages", "shared", "src", "index.ts"))));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("TypeCheckAnalyzer discovers nested tsconfig files in monorepos", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-typecheck-monorepo-"));
+  const appARoot = path.join(projectRoot, "apps", "app-a");
+  const appBRoot = path.join(projectRoot, "apps", "app-b");
+  await fs.mkdir(path.join(appARoot, "src"), { recursive: true });
+  await fs.mkdir(path.join(appBRoot, "src"), { recursive: true });
+
+  await fs.writeFile(path.join(appARoot, "src", "ok.ts"), "export const ok: string = 'ok';\n", "utf8");
+  await fs.writeFile(path.join(appBRoot, "src", "broken.ts"), "export const broken: string = 42;\n", "utf8");
+
+  const tsConfig = {
+    compilerOptions: {
+      strict: true,
+      noEmit: true,
+      target: "ES2020",
+      module: "ESNext",
+      moduleResolution: "Bundler",
+    },
+    include: ["src/**/*.ts"],
+  };
+  await fs.writeFile(path.join(appARoot, "tsconfig.json"), JSON.stringify(tsConfig, null, 2), "utf8");
+  await fs.writeFile(path.join(appBRoot, "tsconfig.json"), JSON.stringify(tsConfig, null, 2), "utf8");
+
+  const analyzer = new TypeCheckAnalyzer();
+  const summary = analyzer.analyzeProject(projectRoot);
+
+  assert.equal(summary.totalErrors, 1);
+  assert.equal(summary.checkedFiles, 2);
+  assert.equal(summary.skippedReason, undefined);
+  assert.ok(summary.issues.some((issue) => issue.filePath.endsWith(path.join("app-b", "src", "broken.ts"))));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("TypeCheckAnalyzer falls back to workspace discovery when an explicit root tsconfig is missing", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-typecheck-fallback-"));
+  const appRoot = path.join(projectRoot, "apps", "app-a");
+  await fs.mkdir(path.join(appRoot, "src"), { recursive: true });
+
+  await fs.writeFile(path.join(appRoot, "src", "ok.ts"), "export const ok: string = 'ok';\n", "utf8");
+  await fs.writeFile(path.join(appRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      strict: true,
+      noEmit: true,
+      target: "ES2020",
+      module: "ESNext",
+      moduleResolution: "Bundler",
+    },
+    include: ["src/**/*.ts"],
+  }, null, 2), "utf8");
+
+  const analyzer = new TypeCheckAnalyzer();
+  const summary = analyzer.analyzeProject(projectRoot, path.join(projectRoot, "tsconfig.json"));
+
+  assert.equal(summary.totalErrors, 0);
+  assert.equal(summary.checkedFiles, 1);
+  assert.equal(summary.skippedReason, undefined);
+  assert.equal(summary.strictnessSummary?.configCount, 1);
+  assert.equal(summary.strictnessSummary?.strictConfigCount, 1);
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("TypeCheckAnalyzer discovers tsconfig dot-variant files and ignores support-only base configs", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-typecheck-dot-config-"));
+  const appRoot = path.join(projectRoot, "apps", "app-a");
+  await fs.mkdir(path.join(appRoot, "src"), { recursive: true });
+
+  await fs.writeFile(path.join(projectRoot, "tsconfig.base.json"), JSON.stringify({
+    compilerOptions: {
+      strict: true,
+      noEmit: true,
+      target: "ES2020",
+      module: "ESNext",
+      moduleResolution: "Bundler",
+    },
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(appRoot, "src", "broken.ts"), "export const broken: string = 42;\n", "utf8");
+  await fs.writeFile(path.join(appRoot, "tsconfig.json"), JSON.stringify({
+    extends: "../../tsconfig.base.json",
+    references: [{ path: "./tsconfig.app.json" }],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(appRoot, "tsconfig.app.json"), JSON.stringify({
+    extends: "../../tsconfig.base.json",
+    include: ["src/**/*.ts"],
+  }, null, 2), "utf8");
+
+  const analyzer = new TypeCheckAnalyzer();
+  const summary = analyzer.analyzeProject(projectRoot);
+
+  assert.equal(summary.totalErrors, 1);
+  assert.equal(summary.checkedFiles, 1);
+  assert.equal(summary.strictnessSummary?.configCount, 1);
+  assert.ok(summary.strictnessSummary?.configs[0]?.tsConfigPath.endsWith(path.join("app-a", "tsconfig.app.json")));
+  assert.ok(summary.issues.some((issue) => issue.filePath.endsWith(path.join("app-a", "src", "broken.ts"))));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("TypeCheckAnalyzer skips oversized scoped type checks when maxRootNames is exceeded", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-typecheck-limit-"));
+  const srcDir = path.join(projectRoot, "src");
+  await fs.mkdir(srcDir, { recursive: true });
+
+  const fileA = path.join(srcDir, "a.ts");
+  const fileB = path.join(srcDir, "b.ts");
+  const tsConfigPath = path.join(projectRoot, "tsconfig.json");
+
+  await fs.writeFile(fileA, "export const a = 1;\n", "utf8");
+  await fs.writeFile(fileB, "export const b = 2;\n", "utf8");
+  await fs.writeFile(tsConfigPath, JSON.stringify({
+    compilerOptions: {
+      strict: true,
+      noEmit: true,
+      target: "ES2020",
+      module: "ESNext",
+      moduleResolution: "Bundler",
+    },
+    include: ["src/**/*.ts"],
+  }, null, 2), "utf8");
+
+  const analyzer = new TypeCheckAnalyzer();
+  const summary = analyzer.analyzeProject(projectRoot, tsConfigPath, {
+    includedFilePaths: [fileA, fileB],
+    maxRootNames: 1,
+  });
+
+  assert.equal(summary.totalErrors, 0);
+  assert.equal(summary.checkedFiles, 2);
+  assert.match(summary.skippedReason ?? "", /上限 1 を超える/u);
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator marks TypeScript metric as manual when type check is skipped", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-typecheck-skip-"));
+  const outputDir = path.join(projectRoot, "out");
+  const srcDir = path.join(projectRoot, "src");
+  await fs.mkdir(srcDir, { recursive: true });
+
+  await fs.writeFile(path.join(srcDir, "App.tsx"), "export const App = () => <main />;\n", "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    {
+      outputDir,
+      filePrefix: "quality-typecheck-skip",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+    },
+  );
+
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 100,
+  }, {
+    outputDir,
+    prefix: "quality-typecheck-skip",
+    formats: ["json"],
+    onProgress: () => undefined,
+  });
+
+  const codeCategory = report.categories.find((category) => category.id === "code");
+  const typeScriptMetric = codeCategory?.metrics.find((metric) => metric.id === "typescript_errors");
+
+  assert.equal(typeScriptMetric?.verdict, "manual");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator applies library profile thresholds and emits workspace segments", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-library-profile-"));
+  const outputDir = path.join(projectRoot, "out");
+  await fs.mkdir(path.join(projectRoot, "apps", "demo"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "packages", "ui"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "packages", "core", "api"), { recursive: true });
+
+  await fs.writeFile(path.join(projectRoot, "apps", "demo", "page.tsx"), "export default function Page() { return <main>Hello</main>; }\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "packages", "ui", "Button.tsx"), "export function Button() { return <button>Button</button>; }\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "packages", "ui", "Button.test.tsx"), "export const buttonTest = true;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "packages", "core", "api", "client.ts"), "export async function client() { return fetch('/api'); }\n", "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    {
+      outputDir,
+      filePrefix: "library-profile",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+      qualityProfile: "library-repo",
+    },
+  );
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    for (const dependency of deps.dependencies) {
+      if (!dependency.isExternal) {
+        graph.addDependency(dependency.source, dependency.target);
+      }
+    }
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 100,
+    qualityProfile: "library-repo",
+    maxTypeCheckRootNames: 10,
+  }, {
+    outputDir,
+    prefix: "library-profile",
+    formats: ["json"],
+    onProgress: () => undefined,
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const apiCategory = report.categories.find((category) => category.id === "api");
+  const dependencyCategory = report.categories.find((category) => category.id === "dependencies");
+  const segmentLabels = new Set((report.workspaceSegments ?? []).map((segment) => segment.label));
+
+  assert.equal(report.qualityProfile, "library-repo");
+  assert.ok(segmentLabels.has("apps/*"));
+  assert.ok(segmentLabels.has("packages/*"));
+  assert.equal(testCategory?.metrics.find((metric) => metric.id === "matching_test_file_presence")?.threshold, "PASS>=60% / WARN>=25%");
+  assert.equal(apiCategory?.metrics.find((metric) => metric.id === "zod_adoption")?.verdict, "not_applicable");
+  assert.equal(dependencyCategory?.metrics.find((metric) => metric.id === "external_package_count")?.threshold, "<= 80 / WARN<=160");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator emits feature summaries in quality reports", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-features-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+      noEmit: true,
+    },
+    include: [],
+  }, null, 2), "utf8");
+
+  const results: AnalysisResult[] = [
+    createAnalysisResult(path.join(projectRoot, "src", "features", "user", "UserPage.tsx"), { name: "UserPage" }, {
+      overallComplexity: 4,
+    }),
+    createAnalysisResult(path.join(projectRoot, "src", "features", "user", "schemas", "user.schema.ts"), undefined, {
+      overallComplexity: 2,
+    }),
+    createAnalysisResult(path.join(projectRoot, "src", "features", "billing", "BillingPage.tsx"), { name: "BillingPage" }, {
+      overallComplexity: 7,
+    }),
+    createAnalysisResult(path.join(projectRoot, "tests", "features", "billing", "BillingPage.spec.tsx"), { name: "BillingPageSpec" }),
+  ];
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: [],
+    graphMetrics: createEmptyGraphMetrics(),
+    executionTimeMs: 100,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "feature-summary",
+    formats: ["json", "markdown", "html"],
+    onProgress: () => undefined,
+  });
+
+  const featureLabels = new Set((report.featureSummaries ?? []).map((feature) => feature.label));
+  const userFeature = report.featureSummaries?.find((feature) => feature.label === "src/features/user");
+  const billingFeature = report.featureSummaries?.find((feature) => feature.label === "src/features/billing");
+
+  assert.ok(featureLabels.has("src/features/user"));
+  assert.ok(featureLabels.has("src/features/billing"));
+  assert.equal(userFeature?.fileCount, 2);
+  assert.equal(userFeature?.averageComplexity, 3);
+  assert.equal(userFeature?.maxComplexity, 4);
+  assert.equal(billingFeature?.fileCount, 1);
+  assert.equal(billingFeature?.weightedTestRate, 100);
+
+  const markdownReport = await fs.readFile(path.join(outputDir, "feature-summary_quality_report.md"), "utf8");
+  const htmlReport = await fs.readFile(path.join(outputDir, "feature-summary_quality_report.html"), "utf8");
+
+  assert.match(markdownReport, /## フィーチャー内訳/u);
+  assert.match(markdownReport, /### 規模と複雑度/u);
+  assert.match(markdownReport, /### 品質リスク/u);
+  assert.match(markdownReport, /\| src\/features\/user \| 2 \| 1 \| 3\.0 \| 4\.0 \|/u);
+  assert.match(markdownReport, /\| src\/features\/billing \| 1 \| 1 \| 7\.0 \| 7\.0 \|/u);
+  assert.match(htmlReport, /フィーチャー内訳/u);
+  assert.match(htmlReport, /規模と複雑度/u);
+  assert.match(htmlReport, /品質リスク/u);
+  assert.match(htmlReport, /src\/features\/billing/u);
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
@@ -2515,20 +4261,20 @@ test("ReportGenerator separates expected and unexpected scan notes and formats a
 
   const markdownReport = await fs.readFile(path.join(outputDir, "scan-notes_report.md"), "utf8");
   assert.match(markdownReport, /## スキャン結果/u);
-  assert.match(markdownReport, /スキャン段階で想定どおり除外されたものと、異常として扱うべき事象を分離して示します。/u);
-  assert.match(markdownReport, /### 想定どおりの除外/u);
-  assert.match(markdownReport, /### 想定外の除外/u);
-  assert.match(markdownReport, /### 想定外のエラー/u);
+  assert.match(markdownReport, /外部依存、生成物、設定除外、要調査項目を分離して、調べるべきものだけが残るようにしています。/u);
+  assert.match(markdownReport, /### 設定どおりの除外/u);
+  assert.match(markdownReport, /### 要調査の除外/u);
+  assert.match(markdownReport, /### スキャンエラー/u);
   assert.match(markdownReport, /### パースエラー/u);
   assert.match(markdownReport, /node_modules\/react\/index\.js \(Excluded pattern match\)/u);
   assert.match(markdownReport, /src\/huge\.ts \(File size exceeds 10485760 bytes\)/u);
   assert.match(markdownReport, /src\/broken\.ts \(EACCES: permission denied\)/u);
   assert.match(markdownReport, /src\/invalid\.tsx \(diagnostics=2\)/u);
-  assert.match(markdownReport, /\*\*src\/features\/order\/OrderPage\.tsx\*\*/u);
-  assert.match(markdownReport, /理由: matrix=L-H, complexity=17, codeLines=320, functions=3, hooks=2, any=3, dependencyCount=12/u);
-  assert.match(markdownReport, /1\. src\/features\/order\/OrderPage\.tsx/u);
-  assert.match(markdownReport, /理由: クラスタ=L-H, complexity=17, any=3, fan-out=12, codeLines=320/u);
-  assert.match(markdownReport, /対応: /u);
+  assert.match(markdownReport, /\| 1 \| src\/features\/order\/OrderPage\.tsx \| Critical \| 構造 \| 141 \|/u);
+  assert.match(markdownReport, /- \*\*対象\*\*: src\/features\/order\/OrderPage\.tsx/u);
+  assert.match(markdownReport, /- \*\*score帯\*\*: Critical/u);
+  assert.match(markdownReport, /- \*\*複雑度内訳\*\*: weighted=17, peakFn=7, top3avg=6, nesting=3, hookPressure=2/u);
+  assert.match(markdownReport, /- \*\*推奨対応\*\*: explicit anyの除去 \+ unsafe castの局所化/u);
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
@@ -2722,14 +4468,27 @@ test("CLI diff command writes diff reports against a baseline report", async () 
     summary: { changedFiles: number };
     files: Array<{ path: string; status: string; complexityDelta: number }>;
     hotSpotDelta?: {
-      changed?: Array<{ path: string; scoreDelta: number; currentDisplayPath: string }>;
-      added?: Array<{ path: string }>;
-      removed?: Array<{ path: string }>;
+      changed?: Array<{
+        path: string;
+        scoreDelta: number;
+        currentDisplayPath: string;
+        complexityDriverDelta?: string[];
+        currentComplexityDrivers?: string[];
+        baselineComplexityDrivers?: string[];
+      }>;
+      added?: Array<{ path: string; complexityDrivers?: string[] }>;
+      removed?: Array<{ path: string; complexityDrivers?: string[] }>;
     };
     impact?: {
       impactedFiles?: string[];
       changedFiles?: string[];
-      prioritizedFiles?: Array<{ path: string; score: number }>;
+      prioritizedFiles?: Array<{
+        path: string;
+        score: number;
+        complexityPressure?: number;
+        complexitySignals?: string[];
+        reasons?: string[];
+      }>;
       subtrees?: Array<{
         root: string;
         impactedFiles: string[];
@@ -2742,10 +4501,21 @@ test("CLI diff command writes diff reports against a baseline report", async () 
   assert.ok((diffReport.impact?.changedFiles?.length ?? 0) >= 1);
   assert.ok((diffReport.impact?.impactedFiles?.length ?? 0) >= 1);
   assert.ok((diffReport.impact?.prioritizedFiles?.length ?? 0) >= 1);
+  assert.ok(diffReport.impact?.prioritizedFiles?.some((item) =>
+    item.path.endsWith(path.join("src", "App.tsx")) && (item.complexityPressure ?? 0) > 0
+  ));
+  assert.ok(diffReport.impact?.prioritizedFiles?.some((item) =>
+    item.path.endsWith(path.join("src", "App.tsx")) && (item.complexitySignals?.some((signal) => signal.startsWith("weighted=+")) ?? false)
+  ));
   assert.ok((diffReport.impact?.subtrees?.length ?? 0) >= 1);
   assert.ok(typeof diffReport.impact?.subtrees?.[0]?.metrics?.maxScore === "number");
   assert.ok((diffReport.hotSpotDelta?.changed?.length ?? 0) >= 1);
   assert.ok(diffReport.hotSpotDelta?.changed?.some((item) => item.path.endsWith(path.join("src", "App.tsx"))));
+  assert.ok(diffReport.hotSpotDelta?.changed?.some((item) =>
+    item.path.endsWith(path.join("src", "App.tsx")) && (item.complexityDriverDelta?.some((driver) => driver.startsWith("weighted=")) ?? false)
+  ));
+  assert.ok(diffReport.hotSpotDelta?.changed?.every((item) => (item.currentComplexityDrivers?.length ?? 0) >= 1));
+  assert.ok(diffReport.hotSpotDelta?.changed?.every((item) => (item.baselineComplexityDrivers?.length ?? 0) >= 1));
   const diffHtml = await fs.readFile(path.join(outputDir, "delta_diff.html"), "utf8");
   const diffMarkdown = await fs.readFile(path.join(outputDir, "delta_diff.md"), "utf8");
   assert.match(diffHtml, /Analysis Diff Report/u);
@@ -2756,9 +4526,17 @@ test("CLI diff command writes diff reports against a baseline report", async () 
   assert.match(diffHtml, /subtree-sort/u);
   assert.match(diffHtml, /subtree-metrics/u);
   assert.match(diffHtml, /impact-score/u);
+  assert.match(diffHtml, /complexityPressure=/u);
   assert.match(diffHtml, /file:\/\//u);
+  assert.match(diffHtml, /drivers=weighted=/u);
+  assert.match(diffHtml, /Added Hot Spots/u);
+  assert.match(diffHtml, /Removed Hot Spots/u);
+  assert.match(diffHtml, /weighted=\+/u);
   assert.match(diffMarkdown, /## Hot Spot Delta/u);
   assert.match(diffMarkdown, /src\/App\.tsx scoreDelta=/u);
+  assert.match(diffMarkdown, /drivers=weighted=/u);
+  assert.match(diffMarkdown, /complexityPressure=/u);
+  assert.match(diffMarkdown, /weighted=\+/u);
 
   await fs.rm(tempProject, { recursive: true, force: true });
 });
