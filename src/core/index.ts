@@ -4,6 +4,8 @@ export * from "./ComplexityAnalyzer.js";
 export * from "./ConfigManager.js";
 export * from "./DependencyAnalyzer.js";
 export * from "./DiffGenerator.js";
+export * from "./DirectoryPurposeAuditor.js";
+export * from "./FileConventions.js";
 export * from "./FileScanner.js";
 export * from "./GraphBuilder.js";
 export * from "./Logger.js";

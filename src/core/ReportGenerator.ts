@@ -2,7 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { classifyFileType } from "./FileConventions.js";
+import { auditDirectoryPurposes } from "./DirectoryPurposeAuditor.js";
+import { classifyFileType, getFileTypePurpose, KNOWN_FILE_TYPES } from "./FileConventions.js";
 import type {
   AnalysisResult,
   CacheStats,
@@ -49,27 +50,7 @@ interface CycleInsight {
 
 const LOW_COMPLEXITY_MAX = 6;
 const MEDIUM_COMPLEXITY_MAX = 12;
-const KNOWN_FILE_TYPES = [
-  "Route",
-  "Feature",
-  "Layout",
-  "Form",
-  "UI component",
-  "Shared",
-  "Hook",
-  "Context/State",
-  "API/Infrastructure",
-  "Utils",
-  "Schema",
-  "Validation",
-  "Barrel",
-  "Type Support",
-  "Test",
-  "Story",
-  "Fixture",
-  "Config",
-  "Storybook Support",
-];
+const PURPOSE_FINDINGS_MARKDOWN_LIMIT = 20;
 
 export class ReportGenerator {
   private analysisResults: AnalysisResult[] = [];
@@ -259,6 +240,7 @@ export class ReportGenerator {
       this.generateTypeSafetySection(),
       this.generateDependencyAnalysisSection(),
       this.generateFileTypeDistributionSection(),
+      this.generateDirectoryPurposeSection(),
       this.generateMatrixClusterSection(),
       this.generateComponentsSection(),
       this.generateScanSection(options.skippedFiles ?? [], options.scanErrors ?? [], options.parseIssues ?? []),
@@ -321,11 +303,12 @@ export class ReportGenerator {
       "4. 型安全性",
       "5. 依存関係分析",
       "6. ファイル種別分布",
-      "7. 3x3 マトリクス要約",
-      "8. コンポーネント分析",
-      "9. スキャン結果",
-      "10. 閾値超過ファイル（補足）",
-      "11. 実行サマリー",
+      "7. ディレクトリ目的と改善提案",
+      "8. 3x3 マトリクス要約",
+      "9. コンポーネント分析",
+      "10. スキャン結果",
+      "11. 閾値超過ファイル（補足）",
+      "12. 実行サマリー",
       "",
     ].join("\n");
   }
@@ -536,6 +519,54 @@ export class ReportGenerator {
     const hiddenTypes = KNOWN_FILE_TYPES.length - visibleEntries.length;
     if (hiddenTypes > 0) {
       markdown += `- 0 件の種別 ${hiddenTypes} 件は省略しています。\n\n`;
+    }
+    return markdown;
+  }
+
+  private generateDirectoryPurposeSection(): string {
+    if (this.analysisResults.length === 0) {
+      return "## ディレクトリ目的と改善提案\n\nディレクトリごとの目的定義と、目的と実装内容のずれを確認します。\n\n解析対象ファイルはありません。\n\n";
+    }
+
+    const typeCounts = new Map<string, number>();
+    for (const result of this.analysisResults) {
+      const fileType = this.classifyFileType(result.filePath);
+      typeCounts.set(fileType, (typeCounts.get(fileType) ?? 0) + 1);
+    }
+
+    let markdown = "## ディレクトリ目的と改善提案\n\n";
+    markdown += "配置ディレクトリから推定した各種別の目的定義と、目的と実装内容が食い違うファイルへの改善提案です。\n\n";
+    markdown += "### 種別ごとの目的定義\n\n";
+    markdown += "| ファイル種別 | 目的 | 主な配置 | 目的から導かれる期待 |\n";
+    markdown += "|--------------|------|----------|----------------------|\n";
+
+    const presentTypes = Array.from(typeCounts.entries())
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]));
+    for (const [fileType] of presentTypes) {
+      const definition = getFileTypePurpose(fileType);
+      if (!definition) {
+        continue;
+      }
+      markdown += `| ${fileType} | ${definition.purpose} | ${definition.directoryHints.join(", ")} | ${definition.expectation} |\n`;
+    }
+    markdown += "\n";
+
+    const audit = auditDirectoryPurposes(this.analysisResults, (filePath) => this.toDisplayPath(filePath));
+    markdown += "### 目的に沿った改善提案\n\n";
+    if (audit.findings.length === 0) {
+      markdown += "目的と実装内容の不整合は検出されませんでした。\n\n";
+      return markdown;
+    }
+
+    markdown += `不整合 ${audit.findings.length} 件（high=${audit.summary.high}, medium=${audit.summary.medium}, low=${audit.summary.low}）を検出しました。severity 順に対応してください。\n\n`;
+    markdown += "| 対象 | 種別 | severity | 指摘 | 改善提案 |\n";
+    markdown += "|------|------|----------|------|----------|\n";
+    for (const finding of audit.findings.slice(0, PURPOSE_FINDINGS_MARKDOWN_LIMIT)) {
+      markdown += `| ${finding.filePath} | ${finding.fileType} | ${finding.severity} | ${finding.issue} | ${finding.suggestion} |\n`;
+    }
+    markdown += "\n";
+    if (audit.findings.length > PURPOSE_FINDINGS_MARKDOWN_LIMIT) {
+      markdown += `- 残り ${audit.findings.length - PURPOSE_FINDINGS_MARKDOWN_LIMIT} 件は JSON レポートの \`directoryPurposeAudit\` を参照してください。\n\n`;
     }
     return markdown;
   }
@@ -946,6 +977,7 @@ export class ReportGenerator {
       incrementalStats: options.incrementalStats,
       graphJson: options.graphJson,
       decisionSummary,
+      directoryPurposeAudit: auditDirectoryPurposes(this.analysisResults, (filePath) => this.toDisplayPath(filePath)),
     };
 
     await fs.writeFile(path.join(outputDir, `${prefix}_report.json`), JSON.stringify(report, null, 2), "utf8");

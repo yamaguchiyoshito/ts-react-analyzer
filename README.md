@@ -8,6 +8,7 @@ React / TypeScript プロジェクト向けの静的解析 CLI です。
 - ファイル単位の複雑度
 - import / export / dynamic import 依存
 - 循環依存、SCC、中心性、hub / fan-out hotspot
+- ディレクトリ目的の定義と、目的に沿った改善提案
 - JSON / Markdown / CSV / HTML レポート
 - baseline 比較による diff レポート
 - impact score による CI ゲート
@@ -142,8 +143,8 @@ node dist/src/cli.js quality diff ./my-app --output ./out --prefix release --bas
 
 | ファイル | 内容 |
 |---|---|
-| `<prefix>_report.json` | 機械処理向けの完全レポート。統計、decision summary、ファイル別メトリクス、依存、graph metrics、cache stats を含みます |
-| `<prefix>_report.md` | 人間が読むためのサマリーレポート。意思決定サマリー、リスク分布、依存分析、優先対応タスクを確認できます |
+| `<prefix>_report.json` | 機械処理向けの完全レポート。統計、decision summary、ファイル別メトリクス、依存、graph metrics、cache stats、`directoryPurposeAudit` を含みます |
+| `<prefix>_report.md` | 人間が読むためのサマリーレポート。意思決定サマリー、リスク分布、依存分析、ディレクトリ目的の改善提案、優先対応タスクを確認できます |
 | `<prefix>_report.html` | ブラウザで見るレポート。依存グラフ、ファイル表、`file://` リンクを含みます |
 | `<prefix>_files.csv` | ファイル単位の一覧。`File Type`、`Has Test File`、`Matrix Cluster`、複雑度、依存数、型安全性を出します |
 | `<prefix>_dependencies.csv` | import / export / dynamic import の依存一覧。source、target、種別、external、有効 import 名を出します |
@@ -194,6 +195,7 @@ node dist/src/cli.js quality diff ./my-app --output ./out --prefix release --bas
 - file cache / analysis cache / incremental 再利用統計
 - 3x3 マトリクス要約
 - File Type 分布
+- ディレクトリ目的の定義表と目的整合の改善提案
 - リスク分布の 3 軸表示
   - 複雑度
   - 構造
@@ -250,32 +252,55 @@ node dist/src/cli.js quality diff ./my-app --output ./out --prefix release --bas
 - 自動悪化件数と手動悪化件数
 - 新規追加された指標と削除された指標
 
-## File Type 分類
+## File Type 分類とディレクトリ目的
 
-`<prefix>_files.csv` と `<prefix>_components.csv` の `File Type` は次のカテゴリを使います。
+`<prefix>_files.csv` と `<prefix>_components.csv` の `File Type` は次のカテゴリを使います。  
+各カテゴリには「ディレクトリの目的」を定義しており、レポートの改善提案はこの目的定義を基準に判定します。
 
-- `Route`
-- `Schema`
-- `Feature`
-- `Validation`
-- `Layout`
-- `Form`
-- `UI component`
-- `Storybook Support`
-- `Context/State`
-- `Hook`
-- `API/Infrastructure`
-- `Utils`
-- `Type Support`
-- `Barrel`
-- `Shared`
-- `Test`
-- `Story`
-- `Fixture`
-- `Config`
+| File Type | 目的 | 主な配置 |
+|---|---|---|
+| `Route` | URL に対応する画面の入口。画面の組み立てと Feature への振り分け | `app/`, `pages/`, `page.tsx` |
+| `Feature` | 業務機能単位のロジックと機能固有 UI | `features/`, `modules/`, `domains/` |
+| `Layout` | 画面の骨格とスロット提供 | `layouts/`, `Header` / `Sidebar` など |
+| `Form` | 入力フォームの組み立てと入力状態・送信の制御 | `forms/`, `*Form` |
+| `UI component` | 再利用可能な表示部品。データ取得や業務判断を持たない | `components/`, `components/ui/` |
+| `Hook` | 状態・副作用ロジックの再利用単位。JSX を持たない | `hooks/`, `use*` |
+| `Context/State` | アプリ状態の保持と配布 | `contexts/`, `*Provider` / `*Store` |
+| `API/Infrastructure` | 外部 API・永続化などの入出力境界。UI を知らない | `api/`, `services/`, `repositories/` |
+| `Utils` | 特定機能に依存しない汎用処理 | `lib/`, `utils/`, `helpers/` |
+| `Schema` | データ構造と制約の宣言的定義 | `schemas/`, `*.schema.*` |
+| `Validation` | 入力検証ルールの一元管理 | `validations/`, `*.validator.*` |
+| `Barrel` | 再エクスポートによる公開 API 面の整理 | `index.ts` |
+| `Type Support` | 型定義・型補助。実行時コードを持たない | `*.d.ts`, `shims` |
+| `Shared` | 責務未確定の共有コードの一時的な置き場 | 分類規約に一致しないファイル |
+| `Test` | 自動テスト | `*.test.*`, `__tests__/` |
+| `Story` | Storybook ストーリー | `*.stories.*` |
+| `Fixture` | テスト用固定データ | `fixtures/`, `*.fixture.*` |
+| `Config` | ビルド・ツール設定 | `*.config.*`, `tsconfig.json` |
+| `Storybook Support` | Storybook 実行補助 | `.storybook/` |
 
 分類はディレクトリ、ファイル名、拡張子、周辺文脈を組み合わせて決めます。  
 例として `components/ui/**` は `UI component`、`schemas/**` は `Schema`、`validations/**` は `Validation`、`*.d.ts` は `Type Support` です。
+
+### ディレクトリ目的の整合チェック
+
+`analyze` は上記の目的定義と実装内容を突き合わせ、食い違うファイルに改善提案を出します。  
+結果は `<prefix>_report.md` の「ディレクトリ目的と改善提案」セクションと、`<prefix>_report.json` の `directoryPurposeAudit` に出力します。
+
+現在の検出ルール:
+
+| ルール | severity | 内容 |
+|---|---|---|
+| `component-in-non-ui-layer` | high | `Utils` / `API/Infrastructure` に React コンポーネントが定義されている |
+| `react-in-data-layer` | high | `Schema` / `Validation` が React に依存している |
+| `implementation-in-barrel` | medium | `Barrel` (index) に再エクスポート以外の実装がある |
+| `runtime-code-in-type-support` | medium | `Type Support` に実行時コードがある |
+| `ui-depends-on-infrastructure` | medium | `UI component` / `Layout` が `API/Infrastructure` を直接参照している |
+| `heavy-logic-in-route` | medium | `Route` の複雑度が 12 以上 |
+| `jsx-in-hook` | medium | `Hook` ファイルに React コンポーネントが定義されている |
+| `unclassified-shared-growth` | low | `Shared` のままコード行数 40 以上または複雑度 8 以上に成長している |
+
+Markdown には severity 順に最大 20 件を表示し、全件は JSON の `directoryPurposeAudit` に保持します。
 
 ## 設定ファイル
 
