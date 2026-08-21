@@ -244,9 +244,7 @@ export class ReportGenerator {
   }
 
   private async generateMarkdownReport(outputDir: string, prefix: string, options: GenerationOptions): Promise<void> {
-    const sections = [
-      "# TypeScript/React 静的解析レポート",
-      this.generateTableOfContentsSection(),
+    const bodySections = [
       this.generateDecisionSummarySection(options.complexityThreshold),
       this.generateStatisticsSection(),
       this.generateTypeSafetySection(),
@@ -260,9 +258,32 @@ export class ReportGenerator {
       this.generateSummarySection(options.cacheStats, options.analysisCacheStats, options.incrementalStats),
       this.generateMetadataSection(),
     ];
-    const markdown = sections.map((section) => this.withSectionBreak(section)).join("");
+    const body = bodySections.map((section) => this.withSectionBreak(section)).join("");
+    // 目次は実際に出力したセクション見出しから生成し、リンク切れ・番号ずれを防ぐ
+    const markdown = [
+      "# TypeScript/React 静的解析レポート",
+      this.buildTableOfContents(body),
+    ].map((section) => this.withSectionBreak(section)).join("") + body;
 
     await fs.writeFile(path.join(outputDir, `${prefix}_report.md`), markdown, "utf8");
+  }
+
+  private buildTableOfContents(body: string): string {
+    const headings = Array.from(body.matchAll(/^## (.+)$/gmu)).map((match) => match[1]!);
+    return [
+      "## 目次",
+      "",
+      ...headings.map((heading, index) => `${index + 1}. [${heading}](#${this.toMarkdownAnchor(heading)})`),
+      "",
+    ].join("\n");
+  }
+
+  private toMarkdownAnchor(title: string): string {
+    return title
+      .toLowerCase()
+      .replace(/[^\p{Letter}\p{Number}\s-]/gu, "")
+      .trim()
+      .replace(/\s+/gu, "-");
   }
 
   private generateSummarySection(
@@ -303,26 +324,6 @@ export class ReportGenerator {
       incrementalLine.trimEnd(),
       "",
     ].filter(Boolean).join("\n");
-  }
-
-  private generateTableOfContentsSection(): string {
-    return [
-      "## 目次",
-      "",
-      "1. 要点",
-      "2. 優先対応 Top 5",
-      "3. リスク概況",
-      "4. 型安全性",
-      "5. 依存関係分析",
-      "6. ファイル種別分布",
-      "7. ディレクトリ目的と改善提案",
-      "8. 3x3 マトリクス要約",
-      "9. コンポーネント分析",
-      "10. スキャン結果",
-      "11. 閾値超過ファイル（補足）",
-      "12. 実行サマリー",
-      "",
-    ].join("\n");
   }
 
   private generateDecisionSummarySection(threshold: number): string {

@@ -272,7 +272,7 @@ test("ReportGenerator emits directory purpose section and audit output", async (
   });
 
   const markdownReport = await fs.readFile(path.join(outputDir, "purpose_report.md"), "utf8");
-  assert.match(markdownReport, /7\. ディレクトリ目的と改善提案/u);
+  assert.match(markdownReport, /\d+\. \[ディレクトリ目的と改善提案\]\(#ディレクトリ目的と改善提案\)/u);
   assert.match(markdownReport, /## ディレクトリ目的と改善提案/u);
   assert.match(markdownReport, /### 種別ごとの目的定義/u);
   assert.match(markdownReport, /\| Utils \| 特定機能に依存しない汎用処理を提供する \|/u);

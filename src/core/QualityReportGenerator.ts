@@ -1222,18 +1222,8 @@ export class QualityReportGenerator {
     const blockingMetrics = this.collectBlockingAutomaticMetrics(report, 3);
     const lines: string[] = ["# React 出荷審査 品質レポート", ""];
 
-    const tocItems = ["判定凡例", "要点", "優先対応", "不足証跡", "集計"];
-    if (showWorkspaceSegments) {
-      tocItems.push("ワークスペース内訳");
-    }
-    if (showFeatureSummaries) {
-      tocItems.push("フィーチャー内訳");
-    }
-    tocItems.push("観点別詳細");
-    if (manualOnlyCategories.length > 0) {
-      tocItems.push("付録: 手動確認カテゴリ");
-    }
-    lines.push("## 目次", "", ...tocItems.map((item, index) => `${index + 1}. ${item}`), "");
+    // 目次は本文確定後に実際の h2 見出しから生成する (プレースホルダを後で置換)
+    lines.push("{{QUALITY_TOC}}", "");
 
     lines.push(
       "## 判定凡例",
@@ -1454,7 +1444,22 @@ export class QualityReportGenerator {
     }
 
     lines.push("## メタデータ", "", `- 生成時刻: ${report.timestamp}`, `- 実行時間: ${report.executionTimeMs}ms`, `- プロジェクト: ${report.projectRoot}`, `- 品質プロファイル: ${qualityProfile}`, "");
-    return lines.join("\n");
+    const body = lines.join("\n");
+    const headings = Array.from(body.matchAll(/^## (.+)$/gmu)).map((match) => match[1]!);
+    const toc = [
+      "## 目次",
+      "",
+      ...headings.map((heading, index) => `${index + 1}. [${heading}](#${this.toMarkdownAnchor(heading)})`),
+    ].join("\n");
+    return body.replace("{{QUALITY_TOC}}", toc);
+  }
+
+  private toMarkdownAnchor(title: string): string {
+    return title
+      .toLowerCase()
+      .replace(/[^\p{Letter}\p{Number}\s-]/gu, "")
+      .trim()
+      .replace(/\s+/gu, "-");
   }
 
   private collectBlockingAutomaticMetrics(
