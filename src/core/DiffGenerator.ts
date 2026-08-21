@@ -26,11 +26,15 @@ const IMPACT_REASON_LABELS: Record<string, string> = {
 
 export class DiffGenerator {
   compare(
-    current: PersistedAnalysisReport,
-    baseline: PersistedAnalysisReport,
+    rawCurrent: PersistedAnalysisReport,
+    rawBaseline: PersistedAnalysisReport,
     baselinePath: string,
     currentPath: string,
+    options: { projectRoot?: string } = {},
   ): AnalysisDiffReport {
+    // 旧形式 (絶対パス) の baseline は projectRoot 相対へ正規化してから比較する
+    const current = this.normalizePersistedReport(rawCurrent, options.projectRoot);
+    const baseline = this.normalizePersistedReport(rawBaseline, options.projectRoot);
     const currentFiles = new Map(current.files.map((file) => [file.path, file]));
     const baselineFiles = new Map(baseline.files.map((file) => [file.path, file]));
     const allPaths = Array.from(new Set([...currentFiles.keys(), ...baselineFiles.keys()])).sort();
@@ -65,6 +69,42 @@ export class DiffGenerator {
         baseline.graphJson,
       ),
       files,
+    };
+  }
+
+  private normalizePersistedReport(report: PersistedAnalysisReport, fallbackRoot?: string): PersistedAnalysisReport {
+    const root = report.projectRoot ?? (fallbackRoot ? path.resolve(fallbackRoot) : undefined);
+    const hasAbsolutePaths = report.files.some((file) => path.isAbsolute(file.path));
+    if (!root || !hasAbsolutePaths) {
+      return report;
+    }
+
+    const rel = (filePath: string): string => {
+      if (!path.isAbsolute(filePath)) {
+        return filePath.split(path.sep).join("/");
+      }
+      const relative = path.relative(root, filePath);
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+        return filePath.split(path.sep).join("/");
+      }
+      return relative.split(path.sep).join("/");
+    };
+
+    return {
+      ...report,
+      files: report.files.map((file) => ({ ...file, path: rel(file.path) })),
+      graphJson: report.graphJson
+        ? {
+            nodes: report.graphJson.nodes.map((node) => ({ ...node, id: rel(node.id) })),
+            edges: report.graphJson.edges.map((edge) => ({ ...edge, source: rel(edge.source), target: rel(edge.target) })),
+          }
+        : undefined,
+      decisionSummary: report.decisionSummary
+        ? {
+            ...report.decisionSummary,
+            topHotSpots: report.decisionSummary.topHotSpots.map((item) => ({ ...item, path: rel(item.path) })),
+          }
+        : undefined,
     };
   }
 
@@ -262,6 +302,8 @@ export class DiffGenerator {
   }
 
   private toHtml(diff: AnalysisDiffReport, options: DiffRenderOptions = {}): string {
+    const toAbsolute = (filePath: string): string =>
+      options.projectRoot && !path.isAbsolute(filePath) ? path.join(options.projectRoot, filePath) : filePath;
     const changedSet = new Set(diff.impact.changedFiles);
     const impactedSet = new Set(diff.impact.impactedFiles);
     const threshold = options.impactScoreThreshold ?? 0;
@@ -276,7 +318,7 @@ export class DiffGenerator {
       .filter((file) => file.status !== "unchanged")
       .map((file) => {
         const warningDelta = file.warningDelta.length > 0 ? file.warningDelta.join(", ") : "";
-        return `<tr class="${file.status}" data-file="${this.escapeHtml(file.path)}"><td><a href="${this.toFileHref(file.path)}">${this.escapeHtml(this.toRenderDisplayPath(file.path, options.projectRoot))}</a></td><td>${file.status}</td><td>${file.complexityDelta}</td><td>${file.dependencyDelta}</td><td>${this.escapeHtml(warningDelta)}</td></tr>`;
+        return `<tr class="${file.status}" data-file="${this.escapeHtml(file.path)}"><td><a href="${this.toFileHref(toAbsolute(file.path))}">${this.escapeHtml(this.toRenderDisplayPath(file.path, options.projectRoot))}</a></td><td>${file.status}</td><td>${file.complexityDelta}</td><td>${file.dependencyDelta}</td><td>${this.escapeHtml(warningDelta)}</td></tr>`;
       })
       .join("\n");
     const warningDelta = diff.graphDelta.warningDelta.length > 0
@@ -284,17 +326,17 @@ export class DiffGenerator {
       : "<li>Warning Delta: none</li>";
     const hotSpotChanged = diff.hotSpotDelta.changed.length > 0
       ? `<ul>${diff.hotSpotDelta.changed.slice(0, 10).map((item) =>
-        `<li><a href="${this.toFileHref(item.path)}">${this.escapeHtml(item.currentDisplayPath)}</a> scoreDelta=${item.scoreDelta} complexityDelta=${item.complexityDelta} dependencyDelta=${item.dependencyDelta} anyDelta=${item.anyDelta} cluster=${this.escapeHtml(item.clusterBefore)}-&gt;${this.escapeHtml(item.clusterAfter)}${this.renderHtmlDriverMeta(item.complexityDriverDelta)}</li>`
+        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${this.escapeHtml(item.currentDisplayPath)}</a> scoreDelta=${item.scoreDelta} complexityDelta=${item.complexityDelta} dependencyDelta=${item.dependencyDelta} anyDelta=${item.anyDelta} cluster=${this.escapeHtml(item.clusterBefore)}-&gt;${this.escapeHtml(item.clusterAfter)}${this.renderHtmlDriverMeta(item.complexityDriverDelta)}</li>`
       ).join("")}</ul>`
       : "<p>No changed hot spots.</p>";
     const hotSpotAdded = diff.hotSpotDelta.added.length > 0
       ? `<ul>${diff.hotSpotDelta.added.slice(0, 10).map((item) =>
-        `<li><a href="${this.toFileHref(item.path)}">${this.escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${this.escapeHtml(item.cluster)}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
+        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${this.escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${this.escapeHtml(item.cluster)}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
       ).join("")}</ul>`
       : "<p>No added hot spots.</p>";
     const hotSpotRemoved = diff.hotSpotDelta.removed.length > 0
       ? `<ul>${diff.hotSpotDelta.removed.slice(0, 10).map((item) =>
-        `<li><a href="${this.toFileHref(item.path)}">${this.escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${this.escapeHtml(item.cluster)}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
+        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${this.escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${this.escapeHtml(item.cluster)}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
       ).join("")}</ul>`
       : "<p>No removed hot spots.</p>";
     const impactGraph = JSON.stringify(diff.impact.graph).replace(/</gu, "\\u003c");
@@ -348,7 +390,7 @@ export class DiffGenerator {
   <div class="card" style="margin-bottom:16px;font-weight:600">${this.escapeHtml(verdictText)}</div>
   <div class="meta">
     <div class="card"><strong>Baseline</strong><br /><code>${this.escapeHtml(diff.baselinePath)}</code></div>
-    <div class="card"><strong>Current</strong><br /><a href="${this.toFileHref(diff.currentPath)}"><code>${this.escapeHtml(diff.currentPath)}</code></a></div>
+    <div class="card"><strong>Current</strong><br /><a href="${this.toFileHref(toAbsolute(diff.currentPath))}"><code>${this.escapeHtml(diff.currentPath)}</code></a></div>
     <div class="card"><strong>Generated At</strong><br />${this.escapeHtml(diff.generatedAt)}</div>
     <div class="card"><strong>Changed Files</strong><br />${diff.summary.changedFiles}</div>
     <div class="card"><strong>Added / Removed</strong><br />${diff.summary.addedFiles} / ${diff.summary.removedFiles}</div>
@@ -506,8 +548,12 @@ export class DiffGenerator {
       }
     }
 
+    const projectRootForHref = ${this.serializeForHtmlScript(options.projectRoot ?? "")};
     function toHref(filePath) {
-      return "file://" + encodeURI(filePath);
+      const absolute = projectRootForHref && !filePath.startsWith("/") && !/^[A-Za-z]:/.test(filePath)
+        ? projectRootForHref.replace(/[/\\]+$/, "") + "/" + filePath
+        : filePath;
+      return "file://" + encodeURI(absolute);
     }
 
     function renderSubtreeMetrics(sortKey) {
@@ -1065,6 +1111,10 @@ export class DiffGenerator {
       .replace(/</gu, "&lt;")
       .replace(/>/gu, "&gt;")
       .replace(/"/gu, "&quot;");
+  }
+
+  private serializeForHtmlScript(value: string): string {
+    return JSON.stringify(value).replace(/</gu, "\\u003c");
   }
 
   private toFileHref(filePath: string): string {

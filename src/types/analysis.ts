@@ -428,6 +428,7 @@ export interface DirectoryPurposeAuditReport {
 export interface PersistedAnalysisReport {
   timestamp: string;
   executionTimeMs: number;
+  projectRoot?: string;
   statistics: {
     fileCount: number;
     totalLines: number;

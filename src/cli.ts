@@ -316,7 +316,7 @@ async function diffProject(projectDir: string, config: AnalysisConfig, baselineP
 
     const currentReportPath = path.join(config.outputDir, `${config.filePrefix}_report.json`);
     const diffGenerator = new DiffGenerator();
-    const diff = diffGenerator.compare(currentReport, baseline, baselinePath, currentReportPath);
+    const diff = diffGenerator.compare(currentReport, baseline, baselinePath, currentReportPath, { projectRoot: projectDir });
     await diffGenerator.writeReports(diff, config.outputDir, config.filePrefix, {
       projectRoot: projectDir,
       impactScoreThreshold: config.impactScoreThreshold,

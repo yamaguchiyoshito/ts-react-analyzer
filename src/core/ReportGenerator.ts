@@ -1025,9 +1025,14 @@ export class ReportGenerator {
 
   private buildPersistedReport(options: GenerationOptions): PersistedAnalysisReport {
     const decisionSummary = this.buildDecisionSummary(options.complexityThreshold);
+    // パスは projectDir 相対で永続化する。絶対パスのままだと、別マシンや
+    // CI の別ワークスペースで作った baseline と diff したとき全ファイルが
+    // added/removed 判定になり比較が成立しない。
+    const rel = (filePath: string): string => this.toDisplayPath(filePath);
     const report: PersistedAnalysisReport = {
       timestamp: new Date().toISOString(),
       executionTimeMs: this.executionTime,
+      projectRoot: this.projectRoot,
       statistics: {
         fileCount: this.analysisResults.length,
         totalLines: this.analysisResults.reduce((sum, result) => sum + result.complexity.totalLines, 0),
@@ -1038,20 +1043,40 @@ export class ReportGenerator {
           : 0,
       },
       files: this.analysisResults.map((result) => ({
-        path: result.filePath,
+        path: rel(result.filePath),
         complexity: result.complexity,
-        dependencies: result.dependencies,
+        dependencies: result.dependencies.map((dependency) => ({
+          ...dependency,
+          source: rel(dependency.source),
+          target: dependency.isExternal ? dependency.target : rel(dependency.target),
+        })),
         dependencyErrors: result.dependencyErrors,
         warnings: this.generateWarnings(result, options.complexityThreshold),
       })),
-      graph: this.graphMetrics,
+      graph: {
+        ...this.graphMetrics,
+        cycles: this.graphMetrics.cycles.map((cycle) => ({ ...cycle, nodes: cycle.nodes.map(rel) })),
+        stronglyConnectedComponents: this.graphMetrics.stronglyConnectedComponents.map((component) => component.map(rel)),
+        weaklyConnectedComponents: this.graphMetrics.weaklyConnectedComponents.map((component) => component.map(rel)),
+        topPageRank: this.graphMetrics.topPageRank.map((entry) => ({ ...entry, id: rel(entry.id) })),
+        topInDegree: this.graphMetrics.topInDegree.map((entry) => ({ ...entry, id: rel(entry.id) })),
+        topOutDegree: this.graphMetrics.topOutDegree.map((entry) => ({ ...entry, id: rel(entry.id) })),
+      },
       skippedFiles: options.skippedFiles ?? [],
       scanErrors: options.scanErrors ?? [],
       cacheStats: options.cacheStats,
       analysisCacheStats: options.analysisCacheStats,
       incrementalStats: options.incrementalStats,
-      graphJson: options.graphJson,
-      decisionSummary,
+      graphJson: options.graphJson
+        ? {
+            nodes: options.graphJson.nodes.map((node) => ({ ...node, id: rel(node.id) })),
+            edges: options.graphJson.edges.map((edge) => ({ ...edge, source: rel(edge.source), target: rel(edge.target) })),
+          }
+        : undefined,
+      decisionSummary: {
+        ...decisionSummary,
+        topHotSpots: decisionSummary.topHotSpots.map((item) => ({ ...item, path: rel(item.path) })),
+      },
       directoryPurposeAudit: auditDirectoryPurposes(this.analysisResults, (filePath) => this.toDisplayPath(filePath)),
     };
 

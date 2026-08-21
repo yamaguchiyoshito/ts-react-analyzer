@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 import ts from "typescript";
 
-import { ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, FileScanner, GraphBuilder, QualityDiffGenerator, QualityReportGenerator, ReportGenerator, TypeCheckAnalyzer } from "../src/core/index.js";
+import { ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, QualityDiffGenerator, QualityReportGenerator, ReportGenerator, TypeCheckAnalyzer } from "../src/core/index.js";
 import type { AnalysisResult, Dependency, GraphMetrics, PersistedAnalysisReport, QualityDiffReport, QualityReport } from "../src/types/index.js";
 
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -4922,6 +4922,43 @@ test("CLI diff command writes diff reports against a baseline report", async () 
   assert.doesNotMatch(diffMarkdown, /^- \/(?:tmp|home|var)\//mu);
 
   await fs.rm(tempProject, { recursive: true, force: true });
+});
+
+test("DiffGenerator matches files across different workspace roots via relative paths", async () => {
+  const rootA = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-diff-root-a-"));
+  const rootB = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-diff-root-b-"));
+
+  const buildReport = async (projectRoot: string, complexityValue: number) => {
+    const filePath = path.join(projectRoot, "src", "App.tsx");
+    const results: AnalysisResult[] = [
+      createAnalysisResult(filePath, { name: "App" }, { overallComplexity: complexityValue }),
+    ];
+    const outputDir = path.join(projectRoot, "out");
+    return new ReportGenerator().generateReports(results, createEmptyGraphMetrics(), {
+      outputDir,
+      prefix: "portable",
+      formats: ["json"],
+      complexityThreshold: 10,
+      projectRoot,
+    });
+  };
+
+  // 別々のワークスペース (CI の別実行を想定) で生成したレポート同士を比較する
+  const baseline = await buildReport(rootA, 1);
+  const current = await buildReport(rootB, 5);
+
+  assert.equal(baseline.files[0]?.path, "src/App.tsx");
+
+  const diff = new DiffGenerator().compare(current, baseline, "baseline.json", "current.json", { projectRoot: rootB });
+  // パスが相対で永続化されるため、ルートが違っても added/removed にならず changed として突合できる
+  assert.equal(diff.summary.addedFiles, 0);
+  assert.equal(diff.summary.removedFiles, 0);
+  assert.equal(diff.summary.changedFiles, 1);
+  assert.equal(diff.files[0]?.path, "src/App.tsx");
+  assert.equal(diff.files[0]?.complexityDelta, 4);
+
+  await fs.rm(rootA, { recursive: true, force: true });
+  await fs.rm(rootB, { recursive: true, force: true });
 });
 
 test("CLI diff can fail on impact threshold for CI usage", async () => {
