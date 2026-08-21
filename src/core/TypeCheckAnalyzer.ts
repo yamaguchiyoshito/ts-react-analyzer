@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import ts from "typescript";
@@ -48,6 +49,8 @@ export interface TypeCheckSummary {
 export interface TypeCheckAnalyzerOptions {
   includedFilePaths?: string[];
   maxRootNames?: number;
+  // 指定時は .tsbuildinfo をこの配下に保存し、2 回目以降を増分型検査にする
+  cacheDir?: string;
   onProgress?: (message: string, metadata?: Record<string, unknown>) => void;
 }
 
@@ -159,20 +162,12 @@ export class TypeCheckAnalyzer {
       rootNames: rootNames.length,
       originalRootNames: parsed.fileNames.length,
       scoped: Boolean(includedFilePathSet),
+      incremental: Boolean(options.cacheDir),
       tsConfigPath: resolvedTsConfigPath,
     });
-    const program = ts.createProgram({
-      rootNames,
-      options: parsed.options,
-      projectReferences: parsed.projectReferences,
-    });
-    options.onProgress?.("TypeScript diagnostics collection started", {
-      rootNames: rootNames.length,
-      tsConfigPath: resolvedTsConfigPath,
-    });
+    const rawDiagnostics = this.collectDiagnostics(rootNames, parsed, resolvedTsConfigPath, options);
     const diagnostics = this.filterDiagnosticsForScope(
-      ts.getPreEmitDiagnostics(program)
-        .filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error),
+      rawDiagnostics.filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error),
       ownProjectFilePathSet,
       Boolean(includedFilePathSet),
     );
@@ -184,6 +179,51 @@ export class TypeCheckAnalyzer {
       tsConfigPath: resolvedTsConfigPath,
       strictnessSummary,
     };
+  }
+
+  private collectDiagnostics(
+    rootNames: string[],
+    parsed: ts.ParsedCommandLine,
+    resolvedTsConfigPath: string,
+    options: TypeCheckAnalyzerOptions,
+  ): readonly ts.Diagnostic[] {
+    if (!options.cacheDir) {
+      const program = ts.createProgram({
+        rootNames,
+        options: parsed.options,
+        projectReferences: parsed.projectReferences,
+      });
+      return ts.getPreEmitDiagnostics(program);
+    }
+
+    // .tsbuildinfo を使った増分型検査。2 回目以降は変更の影響を受けたファイル
+    // だけを再検査し、残りは前回の診断結果を再利用する (tsc --incremental --noEmit 相当)。
+    const buildInfoDir = path.join(options.cacheDir, "typecheck");
+    fs.mkdirSync(buildInfoDir, { recursive: true });
+    const configKey = crypto.createHash("sha256").update(resolvedTsConfigPath).digest("hex").slice(0, 16);
+    const incrementalOptions: ts.CompilerOptions = {
+      ...parsed.options,
+      incremental: true,
+      noEmit: true,
+      tsBuildInfoFile: path.join(buildInfoDir, `${configKey}.tsbuildinfo`),
+    };
+    const host = ts.createIncrementalCompilerHost(incrementalOptions);
+    const builder = ts.createIncrementalProgram({
+      rootNames,
+      options: incrementalOptions,
+      projectReferences: parsed.projectReferences,
+      host,
+    });
+    const diagnostics = [
+      ...builder.getConfigFileParsingDiagnostics(),
+      ...builder.getOptionsDiagnostics(),
+      ...builder.getGlobalDiagnostics(),
+      ...builder.getSyntacticDiagnostics(),
+      ...builder.getSemanticDiagnostics(),
+    ];
+    // noEmit のため emit は .tsbuildinfo の書き出しのみを行う
+    builder.emit();
+    return diagnostics;
   }
 
   private filterDiagnosticsForScope(

@@ -42,6 +42,7 @@ interface QualityGenerationInput {
   testPresenceSettings?: TestPresenceSettings;
   maxTypeCheckRootNames?: number;
   tsConfigPath?: string;
+  cacheDir?: string;
   manualInputs?: ManualQualityMetricInput[];
 }
 
@@ -245,8 +246,9 @@ export class QualityReportGenerator {
       });
       return result;
     };
+    // 型検査は同期実行でイベントループを塞ぐため配列の最後に置き、
+    // アーティファクト走査などの非同期 I/O を先に発行させる
     const [
-      rawTypeCheckSummary,
       browserAuditSummary,
       testArtifactSummary,
       uiTestArtifactSummary,
@@ -261,16 +263,8 @@ export class QualityReportGenerator {
       ciPresence,
       docsPresence,
       externalPackageCount,
+      rawTypeCheckSummary,
     ] = await Promise.all([
-      runPhase(
-        "Quality phase: type check",
-        () => new TypeCheckAnalyzer().analyzeProject(input.projectRoot, input.tsConfigPath, {
-          includedFilePaths: strictQualityParsedFiles.map((parsedFile) => parsedFile.filePath),
-          maxRootNames: input.maxTypeCheckRootNames ?? 5000,
-          onProgress,
-        }),
-        { files: strictQualityParsedFiles.length },
-      ),
       runPhase("Quality phase: browser audits", () => new BrowserAuditAnalyzer().analyzeProject(input.projectRoot)),
       runPhase("Quality phase: test artifacts", () => new TestArtifactAnalyzer().analyzeProject(input.projectRoot)),
       runPhase("Quality phase: UI test artifacts", () => new UiTestArtifactAnalyzer().analyzeProject(input.projectRoot)),
@@ -285,6 +279,16 @@ export class QualityReportGenerator {
       runPhase("Quality phase: CI detection", () => this.collectCiPresence(input.projectRoot)),
       runPhase("Quality phase: documentation detection", () => this.collectDocumentationPresence(input.projectRoot)),
       runPhase("Quality phase: dependency summary", () => this.collectExternalPackageCount(input.analysisResults), { files: input.analysisResults.length }),
+      runPhase(
+        "Quality phase: type check",
+        () => new TypeCheckAnalyzer().analyzeProject(input.projectRoot, input.tsConfigPath, {
+          includedFilePaths: strictQualityParsedFiles.map((parsedFile) => parsedFile.filePath),
+          maxRootNames: input.maxTypeCheckRootNames ?? 5000,
+          cacheDir: input.cacheDir,
+          onProgress,
+        }),
+        { files: strictQualityParsedFiles.length },
+      ),
     ]);
     const typeCheckSummary = this.filterTypeCheckSummary(rawTypeCheckSummary);
     const typeEscapeStats = this.collectTypeEscapeStats(strictQualityAnalysisResults);

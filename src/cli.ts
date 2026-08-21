@@ -409,6 +409,7 @@ async function qualityProject(
       qualityProfile: config.qualityProfile,
       testPresenceSettings: config.testPresenceSettings,
       maxTypeCheckRootNames: config.maxTypeCheckRootNames,
+      cacheDir: config.enableCache ? config.cacheDir : undefined,
       manualInputs,
     }, {
       outputDir: config.outputDir,
