@@ -555,6 +555,10 @@ test("ReportGenerator writes json, markdown, csv, and html outputs", async () =>
   assert.match(htmlReport, /Incremental/u);
   assert.match(htmlReport, /file:\/\//u);
   assert.match(htmlReport, /Dependency Graph/u);
+  // HTML も日本語化し、md の中核である優先対応 Top 5 を先頭に持つ
+  assert.match(htmlReport, /優先対応 Top 5/u);
+  assert.match(htmlReport, /推奨対応/u);
+  assert.match(htmlReport, /円の大きさ = 依存グラフ上の中心性/u);
   assert.match(markdownReport, /## 目次/u);
   assert.match(markdownReport, /## 要点/u);
   assert.match(markdownReport, /ここだけ読めば、いま対応すべきものが分かります。/u);

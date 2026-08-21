@@ -1084,12 +1084,26 @@ export class ReportGenerator {
   }
 
   private async generateHTMLReport(outputDir: string, prefix: string, options: GenerationOptions): Promise<void> {
+    const riskLabels: Record<string, string> = { low: "低", medium: "中", high: "高" };
     const rows = this.analysisResults
       .map((result) => {
         const risk = this.getRiskLevel(result.complexity.overallComplexity);
-        return `<tr class="${risk}" data-file="${this.escapeHtml(result.filePath)}"><td><a href="${this.toFileHref(result.filePath)}">${this.escapeHtml(this.toDisplayPath(result.filePath))}</a></td><td>${result.complexity.totalLines}</td><td>${result.complexity.overallComplexity}</td><td>${result.complexity.components.length}</td><td>${risk}</td></tr>`;
+        return `<tr class="${risk}" data-file="${this.escapeHtml(result.filePath)}"><td><a href="${this.toFileHref(result.filePath)}">${this.escapeHtml(this.toDisplayPath(result.filePath))}</a></td><td>${result.complexity.totalLines}</td><td>${result.complexity.overallComplexity}</td><td>${result.complexity.components.length}</td><td>${riskLabels[risk] ?? risk}</td></tr>`;
       })
       .join("\n");
+    // md 版の中核である優先対応 Top 5 を HTML でも先頭に出し、両者の結論を揃える
+    const decisionSummary = this.buildDecisionSummary(options.complexityThreshold);
+    const hotSpotRows = decisionSummary.topHotSpots
+      .map((item, index) =>
+        `<tr><td>${index + 1}</td><td><a href="${this.toFileHref(item.path)}">${this.escapeHtml(item.displayPath)}</a></td><td>${this.escapeHtml(this.getHotSpotSeverity(item.score))}</td><td>${this.escapeHtml(this.getPrimaryRiskAxisLabel(item.path))}</td><td>${item.score}</td><td>${this.escapeHtml(item.action)}</td></tr>`)
+      .join("\n");
+    const hotSpotSection = decisionSummary.topHotSpots.length > 0
+      ? `<h2>優先対応 Top 5</h2>
+  <table>
+    <thead><tr><th>順位</th><th>ファイル</th><th>severity</th><th>主因</th><th>score</th><th>推奨対応</th></tr></thead>
+    <tbody>${hotSpotRows}</tbody>
+  </table>`
+      : "<h2>優先対応 Top 5</h2><p>優先度の高い改修候補はありません。</p>";
     // 数千ノードを埋め込むと HTML が肥大しブラウザ描画も破綻するため、
     // 次数上位のノードに絞って可視化する (全量は JSON レポートに保持)
     const HTML_GRAPH_NODE_LIMIT = 300;
@@ -1105,14 +1119,14 @@ export class ReportGenerator {
         nodes: keptNodes,
         edges: fullGraph.edges.filter((edge) => keptIds.has(edge.source) && keptIds.has(edge.target)),
       };
-      graphTruncatedNote = `<p>Showing top ${HTML_GRAPH_NODE_LIMIT} of ${fullGraph.nodes.length} nodes by degree. Full graph data is in the JSON report.</p>`;
+      graphTruncatedNote = `<p>次数上位 ${HTML_GRAPH_NODE_LIMIT} / 全 ${fullGraph.nodes.length} ノードを表示しています。全量は JSON レポートを参照してください。</p>`;
     }
 
     const html = `<!DOCTYPE html>
-<html lang="en">
+<html lang="ja">
 <head>
   <meta charset="utf-8" />
-  <title>TypeScript/React Static Analysis Report</title>
+  <title>TypeScript/React 静的解析レポート</title>
   <style>
     body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 24px; color: #1f2937; }
     h1, h2 { margin-bottom: 8px; }
@@ -1141,42 +1155,44 @@ export class ReportGenerator {
   </style>
 </head>
 <body>
-  <h1>TypeScript/React Static Analysis Report</h1>
+  <h1>TypeScript/React 静的解析レポート</h1>
   <div class="meta">
-    <div class="card"><strong>Files</strong><br />${this.analysisResults.length}</div>
-    <div class="card"><strong>Dependencies</strong><br />${this.graphMetrics.totalDependencies}</div>
-    <div class="card"><strong>Cycles</strong><br />${this.graphMetrics.cycles.length}</div>
-    <div class="card"><strong>Graph Warnings</strong><br />${this.graphMetrics.warnings.length}</div>
-    <div class="card"><strong>Complexity Threshold</strong><br />${options.complexityThreshold}</div>
-    <div class="card"><strong>File Cache</strong><br />${options.cacheStats?.hits ?? 0} hit / ${options.cacheStats?.misses ?? 0} miss</div>
-    <div class="card"><strong>Analysis Cache</strong><br />${options.analysisCacheStats?.hits ?? 0} hit / ${options.analysisCacheStats?.misses ?? 0} miss</div>
-    <div class="card"><strong>Incremental</strong><br />${options.incrementalStats?.reusedFiles ?? 0} reused / ${options.incrementalStats?.recomputedFiles ?? 0} recomputed</div>
-    <div class="card"><strong>Generated At</strong><br />${new Date().toISOString()}</div>
+    <div class="card"><strong>対象ファイル</strong><br />${this.analysisResults.length}</div>
+    <div class="card"><strong>依存総数</strong><br />${this.graphMetrics.totalDependencies}</div>
+    <div class="card"><strong>循環依存</strong><br />${this.graphMetrics.cycles.length}</div>
+    <div class="card"><strong>グラフ警告</strong><br />${this.graphMetrics.warnings.length}</div>
+    <div class="card"><strong>複雑度閾値</strong><br />${options.complexityThreshold}</div>
+    <div class="card"><strong>ファイルキャッシュ</strong><br />${options.cacheStats?.hits ?? 0} hit / ${options.cacheStats?.misses ?? 0} miss</div>
+    <div class="card"><strong>解析キャッシュ</strong><br />${options.analysisCacheStats?.hits ?? 0} hit / ${options.analysisCacheStats?.misses ?? 0} miss</div>
+    <div class="card"><strong>差分再利用 (Incremental)</strong><br />${options.incrementalStats?.reusedFiles ?? 0} reused / ${options.incrementalStats?.recomputedFiles ?? 0} recomputed</div>
+    <div class="card"><strong>生成時刻</strong><br />${new Date().toISOString()}</div>
   </div>
-  <h2>Dependency Graph</h2>
+  ${hotSpotSection}
+  <h2>依存グラフ (Dependency Graph)</h2>
   <div class="toolbar">
-    <button id="reset-filter">Reset Filter</button>
+    <button id="reset-filter">フィルタ解除</button>
     <div class="legend">
-      <span class="low">Low in-degree</span>
-      <span class="medium">Medium in-degree</span>
-      <span class="high">High in-degree</span>
+      <span class="low">被参照 少</span>
+      <span class="medium">被参照 中</span>
+      <span class="high">被参照 多</span>
+      <span>円の大きさ = 依存グラフ上の中心性</span>
     </div>
   </div>
   ${graphTruncatedNote}
   <div id="graph-shell">
     <div id="graph">
-      <div id="graph-empty">Graph data is not available.</div>
+      <div id="graph-empty">グラフデータがありません。</div>
     </div>
     <aside id="inspector">
-      <strong>Selection</strong>
-      <p id="selection-name">None</p>
-      <p id="selection-meta">Click a node to filter the file table.</p>
+      <strong>選択中</strong>
+      <p id="selection-name">なし</p>
+      <p id="selection-meta">ノードをクリックするとファイル表を絞り込めます。</p>
     </aside>
   </div>
-  <h2>Files</h2>
+  <h2>ファイル一覧</h2>
   <table>
     <thead>
-      <tr><th>File</th><th>Lines</th><th>Complexity</th><th>Components</th><th>Risk</th></tr>
+      <tr><th>ファイル</th><th>行数</th><th>複雑度</th><th>コンポーネント</th><th>複雑度リスク</th></tr>
     </thead>
     <tbody>
       ${rows}
@@ -1184,7 +1200,7 @@ export class ReportGenerator {
   </table>
   <script>
     const graphData = ${this.serializeForScript(graphData)};
-    const tableRows = Array.from(document.querySelectorAll("tbody tr"));
+    const tableRows = Array.from(document.querySelectorAll("tbody tr[data-file]"));
     const selectionName = document.getElementById("selection-name");
     const selectionMeta = document.getElementById("selection-meta");
     const graphHost = document.getElementById("graph");
@@ -1192,8 +1208,8 @@ export class ReportGenerator {
     const SVG_NS = "http://www.w3.org/2000/svg";
     document.getElementById("reset-filter").addEventListener("click", () => {
       for (const row of tableRows) row.style.display = "";
-      selectionName.textContent = "None";
-      selectionMeta.textContent = "Click a node to filter the file table.";
+      selectionName.textContent = "なし";
+      selectionMeta.textContent = "ノードをクリックするとファイル表を絞り込めます。";
     });
 
     if (!graphData.nodes.length) {
