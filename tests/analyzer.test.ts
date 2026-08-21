@@ -269,6 +269,41 @@ test("DependencyAnalyzer keeps side-effect imports in the dependency graph", () 
   ));
 });
 
+test("ConfigManager converts tsconfig exclude globs into anchored patterns", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-exclude-glob-"));
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "out"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "src", "checkout.ts"), "export const checkout = 1;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "buildHelpers.ts"), "export const helper = 1;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "out", "generated.ts"), "export const generated = 1;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+    },
+    include: ["src"],
+    exclude: ["node_modules", "build", "out"],
+  }, null, 2), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    { cacheDir: path.join(projectRoot, ".cache"), enableCache: false },
+  );
+
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const parsedPaths = scanResult.parsed.map((file) => file.filePath);
+
+  assert.ok(parsedPaths.some((filePath) => filePath.endsWith(path.join("src", "checkout.ts"))));
+  assert.ok(parsedPaths.some((filePath) => filePath.endsWith(path.join("src", "buildHelpers.ts"))));
+  assert.ok(!parsedPaths.some((filePath) => filePath.includes(`${path.sep}out${path.sep}`)));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
 test("ComplexityAnalyzer detects hooks, JSX, and explicit any usage", async () => {
   const configManager = new ConfigManager();
   const config = configManager.mergeConfigs(
