@@ -569,15 +569,47 @@ export class ReportGenerator {
       return markdown;
     }
 
+    const sharedCount = typeCounts.get("Shared") ?? 0;
+    const sharedRatio = this.analysisResults.length > 0 ? sharedCount / this.analysisResults.length : 0;
+    if (sharedRatio > 0.5) {
+      markdown += `> このプロジェクトは解析対象の ${(sharedRatio * 100).toFixed(0)}% が責務未分類 (Shared) です。React アプリのディレクトリ規約 (features/ や components/ など) に沿っていない可能性が高く、個別ファイルの指摘より先に配置規約の整備を検討してください。\n\n`;
+    }
+
     markdown += `不整合 ${audit.findings.length} 件（high=${audit.summary.high}, medium=${audit.summary.medium}, low=${audit.summary.low}）を検出しました。severity 順に対応してください。\n\n`;
     markdown += "| 対象 | 種別 | severity | 指摘 | 改善提案 |\n";
     markdown += "|------|------|----------|------|----------|\n";
-    for (const finding of audit.findings.slice(0, PURPOSE_FINDINGS_MARKDOWN_LIMIT)) {
+
+    // 同一ルールの指摘が多発する場合は 1 行に集約し、上位の指摘が埋もれないようにする
+    const AGGREGATE_THRESHOLD = 5;
+    const countsByRule = new Map<string, number>();
+    for (const finding of audit.findings) {
+      countsByRule.set(finding.rule, (countsByRule.get(finding.rule) ?? 0) + 1);
+    }
+    const renderedAggregates = new Set<string>();
+    let renderedRows = 0;
+    for (const finding of audit.findings) {
+      if (renderedRows >= PURPOSE_FINDINGS_MARKDOWN_LIMIT) {
+        break;
+      }
+      const ruleCount = countsByRule.get(finding.rule) ?? 0;
+      if (ruleCount >= AGGREGATE_THRESHOLD) {
+        if (renderedAggregates.has(finding.rule)) {
+          continue;
+        }
+        renderedAggregates.add(finding.rule);
+        markdown += `| ${ruleCount} ファイル（例: ${finding.filePath}） | ${finding.fileType} | ${finding.severity} | ${finding.issue} ほか同種 ${ruleCount - 1} 件 | ${finding.suggestion} 全対象は JSON の \`directoryPurposeAudit\` を参照してください |\n`;
+        renderedRows += 1;
+        continue;
+      }
       markdown += `| ${finding.filePath} | ${finding.fileType} | ${finding.severity} | ${finding.issue} | ${finding.suggestion} |\n`;
+      renderedRows += 1;
     }
     markdown += "\n";
-    if (audit.findings.length > PURPOSE_FINDINGS_MARKDOWN_LIMIT) {
-      markdown += `- 残り ${audit.findings.length - PURPOSE_FINDINGS_MARKDOWN_LIMIT} 件は JSON レポートの \`directoryPurposeAudit\` を参照してください。\n\n`;
+
+    const aggregatedCount = Array.from(renderedAggregates).reduce((sum, rule) => sum + (countsByRule.get(rule) ?? 0), 0);
+    const remaining = audit.findings.length - aggregatedCount - (renderedRows - renderedAggregates.size);
+    if (remaining > 0) {
+      markdown += `- 残り ${remaining} 件は JSON レポートの \`directoryPurposeAudit\` を参照してください。\n\n`;
     }
     return markdown;
   }
