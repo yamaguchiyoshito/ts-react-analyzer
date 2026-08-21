@@ -147,7 +147,31 @@ const SOURCE_ONLY_EXCLUDED_FILE_TYPES = new Set([
   "Storybook Support",
 ]);
 
+// 同一パスへの分類はレポート生成中に何度も呼ばれる (実測でファイルあたり約 29 回) ため、
+// オプションなしの呼び出しをメモ化する。約 20 本の正規表現評価を 1 回に抑える。
+const classificationCache = new Map<string, string>();
+const CLASSIFICATION_CACHE_LIMIT = 100_000;
+
 export function classifyFileType(filePath: string, options: FileTypeClassificationOptions = {}): string {
+  const cacheable = options.componentName === undefined && options.hasChildren === undefined;
+  if (cacheable) {
+    const cached = classificationCache.get(filePath);
+    if (cached !== undefined) {
+      return cached;
+    }
+  }
+
+  const fileType = computeFileType(filePath, options);
+  if (cacheable) {
+    if (classificationCache.size >= CLASSIFICATION_CACHE_LIMIT) {
+      classificationCache.clear();
+    }
+    classificationCache.set(filePath, fileType);
+  }
+  return fileType;
+}
+
+function computeFileType(filePath: string, options: FileTypeClassificationOptions): string {
   const normalized = filePath.replace(/\\/gu, "/");
   const lower = normalized.toLowerCase();
   const rawBase = path.basename(normalized);

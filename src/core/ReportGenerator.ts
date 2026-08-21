@@ -71,6 +71,7 @@ export class ReportGenerator {
   };
   private executionTime = 0;
   private readonly startTime = Date.now();
+  private readonly displayPathCache = new Map<string, string>();
 
   async generateReports(
     analysisResults: AnalysisResult[],
@@ -79,6 +80,7 @@ export class ReportGenerator {
   ): Promise<PersistedAnalysisReport> {
     this.analysisResults = analysisResults;
     this.projectRoot = options.projectRoot ? path.resolve(options.projectRoot) : undefined;
+    this.displayPathCache.clear();
     this.graphMetrics = graphMetrics;
     this.executionTime = Math.max(1, options.executionTimeMs ?? (Date.now() - this.startTime));
 
@@ -1273,21 +1275,27 @@ export class ReportGenerator {
   }
 
   private toDisplayPath(filePath: string): string {
+    // 各セクション・CSV から同じパスに対して繰り返し呼ばれるためメモ化する
+    const cached = this.displayPathCache.get(filePath);
+    if (cached !== undefined) {
+      return cached;
+    }
+
     const normalized = filePath.split(path.sep).join("/");
-    if (!this.projectRoot || !path.isAbsolute(filePath)) {
-      return normalized;
+    let displayPath = normalized;
+    if (this.projectRoot && path.isAbsolute(filePath)) {
+      const relativePath = path.relative(this.projectRoot, filePath);
+      if (relativePath && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)) {
+        displayPath = relativePath.split(path.sep).join("/");
+      }
     }
 
-    const relativePath = path.relative(this.projectRoot, filePath);
-    if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
-      return normalized;
-    }
-
-    return relativePath.split(path.sep).join("/");
+    this.displayPathCache.set(filePath, displayPath);
+    return displayPath;
   }
 
   private classifyFileType(filePath: string, componentName?: string, hasChildren = false): string {
-    return classifyFileType(this.toDisplayPath(filePath).split(path.sep).join("/"), { componentName, hasChildren });
+    return classifyFileType(this.toDisplayPath(filePath), { componentName, hasChildren });
   }
 
   private hasCorrespondingTestFile(filePath: string, testTargets: Set<string>): boolean {

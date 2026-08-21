@@ -183,6 +183,7 @@ const DEFAULT_TEST_PRESENCE_SETTINGS: TestPresenceSettings = {
 export class QualityReportGenerator {
   private projectRoot?: string;
   private gateContext?: QualityGateRenderContext;
+  private readonly displayPathCache = new Map<string, string>();
   private qualityProfile: QualityProfile = "application";
   private testPresenceSettings: TestPresenceSettings = {
     thresholds: {
@@ -228,6 +229,7 @@ export class QualityReportGenerator {
     onProgress?: (message: string, metadata?: Record<string, unknown>) => void,
   ): Promise<QualityReport> {
     this.projectRoot = path.resolve(input.projectRoot);
+    this.displayPathCache.clear();
     this.qualityProfile = input.qualityProfile ?? "application";
     this.testPresenceSettings = this.cloneTestPresenceSettings(input.testPresenceSettings ?? DEFAULT_TEST_PRESENCE_SETTINGS);
     const strictQualityAnalysisResults = input.analysisResults.filter((result) => this.isStrictQualityCheckTargetFile(result.filePath));
@@ -3570,17 +3572,23 @@ export class QualityReportGenerator {
   }
 
   private toDisplayPath(filePath: string): string {
+    // 分類・照合ヘルパーから同じパスに対して繰り返し呼ばれるためメモ化する
+    const cached = this.displayPathCache.get(filePath);
+    if (cached !== undefined) {
+      return cached;
+    }
+
     const normalized = filePath.split(path.sep).join("/");
-    if (!this.projectRoot || !path.isAbsolute(filePath)) {
-      return normalized;
+    let displayPath = normalized;
+    if (this.projectRoot && path.isAbsolute(filePath)) {
+      const relativePath = path.relative(this.projectRoot, filePath);
+      if (relativePath && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)) {
+        displayPath = relativePath.split(path.sep).join("/");
+      }
     }
 
-    const relativePath = path.relative(this.projectRoot, filePath);
-    if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
-      return normalized;
-    }
-
-    return relativePath.split(path.sep).join("/");
+    this.displayPathCache.set(filePath, displayPath);
+    return displayPath;
   }
 
   private cloneTestPresenceSettings(settings: TestPresenceSettings): TestPresenceSettings {
