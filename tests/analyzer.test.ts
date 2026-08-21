@@ -557,7 +557,7 @@ test("ReportGenerator writes json, markdown, csv, and html outputs", async () =>
   assert.match(htmlReport, /Dependency Graph/u);
   assert.match(markdownReport, /## 目次/u);
   assert.match(markdownReport, /## 要点/u);
-  assert.match(markdownReport, /最初の 30 秒で読むべき情報だけを先頭に集約しています。/u);
+  assert.match(markdownReport, /ここだけ読めば、いま対応すべきものが分かります。/u);
   assert.match(markdownReport, /## 優先対応 Top 5/u);
   assert.match(markdownReport, /## 3x3 マトリクス要約/u);
   assert.match(markdownReport, /コード行数と複雑度の 3x3 マトリクスで、設計負債の位置を俯瞰します。/u);

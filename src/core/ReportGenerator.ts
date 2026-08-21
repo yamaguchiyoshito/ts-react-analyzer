@@ -332,7 +332,10 @@ export class ReportGenerator {
     const primary = hotSpots[0];
 
     let markdown = "## 要点\n\n";
-    markdown += "最初の 30 秒で読むべき情報だけを先頭に集約しています。\n\n";
+    markdown += "ここだけ読めば、いま対応すべきものが分かります。\n\n";
+    if (this.analysisResults.length === 0) {
+      markdown += "> ⚠ 解析対象が 0 件でした。projectDir の指定、tsconfig の include、除外設定 (exclude) を確認してください。\n\n";
+    }
     markdown += `- **最優先ファイル**: ${primary ? primary.displayPath : "なし"}\n`;
     markdown += `- **優先改修候補数**: ${hotSpots.length}\n`;
     markdown += `- **循環依存の状態**: ${decisionSummary.cycleStatus}\n`;
@@ -341,7 +344,7 @@ export class ReportGenerator {
     markdown += `- **型安全性の警戒信号**: 高=${decisionSummary.riskSummary.typeSafety.high}, 中=${decisionSummary.riskSummary.typeSafety.medium}, any=${decisionSummary.typeSafetyAlerts.anyCount}, ts-ignore=${decisionSummary.typeSafetyAlerts.tsIgnoreCount}\n\n`;
 
     markdown += "## 優先対応 Top 5\n\n";
-    markdown += "重複説明を避けるため、着手順・主因・推奨対応をこの表に一本化しています。score は複雑度・依存・型安全性・Hooks を合算した優先順位で、severity は Critical>=120 / High>=80 / Medium>=40 / Low<40 です。\n\n";
+    markdown += "この表の上から順に着手すると効率的です。score は複雑度・依存・型安全性・Hooks の合算 (severity: Critical>=120 / High>=80 / Medium>=40 / Low<40)、依存は 内部+外部 の内訳付きです。\n\n";
     if (hotSpots.length === 0) {
       markdown += "優先度の高い改修候補はありません。\n\n";
       return markdown;
@@ -350,7 +353,7 @@ export class ReportGenerator {
     markdown += "| 順位 | ファイル | severity | 主因 | score | 複雑度 | 依存 | any | Hooks | クラスタ | 推奨対応 |\n";
     markdown += "|------|----------|----------|------|-------|----------|------|-----|-------|----------|----------|\n";
     hotSpots.forEach((item, index) => {
-      markdown += `| ${index + 1} | ${item.displayPath} | ${this.getHotSpotSeverity(item.score)} | ${this.getPrimaryRiskAxisLabel(item.path)} | ${item.score} | ${item.complexity} | ${item.dependencies} | ${item.anyCount} | ${item.hooks} | ${item.cluster} | ${item.action} |\n`;
+      markdown += `| ${index + 1} | ${item.displayPath} | ${this.getHotSpotSeverity(item.score)} | ${this.getPrimaryRiskAxisLabel(item.path)} | ${item.score} | ${item.complexity} | ${this.formatDependencyBreakdown(item.path, item.dependencies)} | ${item.anyCount} | ${item.hooks} | ${item.cluster} | ${item.action} |\n`;
     });
     markdown += "\n";
 
@@ -379,7 +382,7 @@ export class ReportGenerator {
     return [
       "## リスク概況",
       "",
-      "複雑度・構造・型安全性の偏りを、意思決定に必要な粒度まで圧縮して示します。",
+      "どの軸 (複雑度・構造・型安全性) に問題が偏っているかが分かります。",
       "",
       "| 軸 | 低 | 中 | 高 |",
       "|----|----|----|----|",
@@ -477,7 +480,7 @@ export class ReportGenerator {
     }
 
     let markdown = "## ファイル種別分布\n\n";
-    markdown += "件数が多い責務から順に並べ、偏りを先に読めるようにしています。0 件の種別は既定で省略します。\n\n";
+    markdown += "どの責務にコードが偏っているかが分かります。0 件の種別は省略しています。\n\n";
     markdown += "| ファイル種別 | 件数 | 比率 | 平均複雑度 | 平均コード行数 |\n";
     markdown += "|--------------|------|------|------------|----------------|\n";
 
@@ -676,7 +679,11 @@ export class ReportGenerator {
     const totalScore = allScoredFiles.reduce((sum, item) => sum + item.score, 0);
     const dominant = allScoredFiles[0];
     if (dominant && totalScore > 0) {
-      markdown += `- **支配要因**: ${dominant.path} が型逃げスコア全体の ${((dominant.score / totalScore) * 100).toFixed(1)}% を占めます。\n\n`;
+      const topHotSpotPaths = new Set(this.getHotSpots(10, 5).map((item) => item.displayPath));
+      const outsideTop = topHotSpotPaths.size > 0 && !topHotSpotPaths.has(dominant.path)
+        ? "総合の優先対応 Top 5 には入っていないため、型安全性の観点で個別に対応してください。"
+        : "";
+      markdown += `- **支配要因**: ${dominant.path} が型逃げスコア全体の ${((dominant.score / totalScore) * 100).toFixed(1)}% を占めます。${outsideTop}\n\n`;
     }
     return markdown;
   }
@@ -828,11 +835,11 @@ export class ReportGenerator {
 
     if (hookHeavy.length > 0) {
       markdown += "### Hooks 多用コンポーネント\n\n";
-      markdown += "Hooks 名の生列挙ではなく、件数と主要 Hook だけを残します。\n\n";
+      markdown += "Hooks の利用が集中しているコンポーネントです。件数の多い Hook から表示します。\n\n";
       markdown += "| コンポーネント | ファイル | Hooks数 | 主な Hooks |\n";
       markdown += "|----------------|----------|---------|------------|\n";
       for (const component of hookHeavy) {
-        markdown += `| ${component.name} | ${component.file} | ${component.hookCount} | ${component.hooksUsed.map((hook) => hook.name).join(", ")} |\n`;
+        markdown += `| ${component.name} | ${component.file} | ${component.hookCount} | ${this.summarizeHookUsage(component.hooksUsed)} |\n`;
       }
       markdown += "\n";
     }
@@ -1547,6 +1554,28 @@ export class ReportGenerator {
       drivers.push(`elevatedFns=${elevatedFunctionCount}`);
     }
     return drivers;
+  }
+
+  private summarizeHookUsage(hooks: HookInfo[]): string {
+    const counts = new Map<string, number>();
+    for (const hook of hooks) {
+      counts.set(hook.name, (counts.get(hook.name) ?? 0) + 1);
+    }
+    const parts = Array.from(counts.entries())
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]));
+    const visible = parts.slice(0, 5).map(([name, count]) => (count > 1 ? `${name}×${count}` : name));
+    const remainder = parts.length - visible.length;
+    return visible.join(", ") + (remainder > 0 ? `, ほか${remainder}種` : "");
+  }
+
+  private formatDependencyBreakdown(filePath: string, fallbackTotal: number): string {
+    const result = this.analysisResults.find((entry) => entry.filePath === filePath);
+    if (!result) {
+      return String(fallbackTotal);
+    }
+    const external = result.dependencies.filter((dependency) => dependency.isExternal).length;
+    const internal = result.dependencies.length - external;
+    return `${result.dependencies.length} (内${internal}+外${external})`;
   }
 
   private formatMetric(value: number): string {
