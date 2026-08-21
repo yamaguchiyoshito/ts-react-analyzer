@@ -180,8 +180,12 @@ export function classifyFileType(filePath: string, options: FileTypeClassificati
     || lower.startsWith(".storybook/")
     || base.includes(".config.");
   const isBarrelFile = /(^|\/)index\.[cm]?[jt]sx?$/u.test(lower);
-  const isRouteFile = /(^|\/)(app|pages)\//u.test(lower)
-    || /^(app|root|page|loading|error|template|route)\.[cm]?[jt]sx?$/u.test(base);
+  // ベース名による Route 判定は app/・pages/ 配下かソースルート直下のみに限定する。
+  // 無条件に適用すると src/lib/error.ts や src/utils/app.ts まで Route になる。
+  const isRouteBaseName = /^(app|root|page|loading|error|template|route)\.[cm]?[jt]sx?$/u.test(base);
+  const isRouteDirectory = /(^|\/)(app|pages)\//u.test(lower);
+  const isSourceRootFile = /^(?:src\/)?[^/]+$/u.test(lower);
+  const isRouteFile = isRouteDirectory || (isRouteBaseName && isSourceRootFile);
   const isSchemaFile = /(^|\/)schemas?(\/|$)/u.test(lower)
     || /\.schema\.[cm]?[jt]sx?$/u.test(base);
   const isValidationFile = /(^|\/)(validations?|validators?)(\/|$)/u.test(lower)

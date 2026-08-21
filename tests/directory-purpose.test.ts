@@ -166,6 +166,18 @@ test("FILE_TYPE_PURPOSES defines a purpose for every known file type", () => {
   }
 });
 
+test("classifyFileType applies route base names only near the source root", () => {
+  // app/・pages/ 配下とソースルート直下は Route
+  assert.equal(classifyFileType("src/app/dashboard/page.tsx"), "Route");
+  assert.equal(classifyFileType("pages/home.tsx"), "Route");
+  assert.equal(classifyFileType("src/app.tsx"), "Route");
+  assert.equal(classifyFileType("app.tsx"), "Route");
+  // 他レイヤのディレクトリ配下では、ベース名が route 系でも Route にしない
+  assert.equal(classifyFileType("src/lib/error.ts"), "Utils");
+  assert.equal(classifyFileType("src/utils/app.ts"), "Utils");
+  assert.equal(classifyFileType("src/features/checkout/error.ts"), "Feature");
+});
+
 test("auditDirectoryPurposes flags files that contradict their directory purpose", () => {
   const results: AnalysisResult[] = [
     createAnalysisResult("src/utils/Badge.tsx", { componentName: "Badge" }),
