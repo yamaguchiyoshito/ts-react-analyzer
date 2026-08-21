@@ -702,23 +702,27 @@ export class QualityReportGenerator {
     const vitest = testArtifactSummary.vitest;
     const playwright = uiTestArtifactSummary.playwright;
     const storybook = uiTestArtifactSummary.storybook;
-    const junitRate = junit && junit.totalTests > 0 ? (junit.passedTests / junit.totalTests) * 100 : null;
+    // 通過率の分母はスキップを除いた実行件数。skip 混じりでも失敗 0 なら 100% になる。
+    const junitExecuted = junit ? Math.max(0, junit.totalTests - junit.skippedTests) : 0;
+    const junitRate = junit && junitExecuted > 0 ? (junit.passedTests / junitExecuted) * 100 : null;
     const coverageRate = coverage?.lineCoverage ?? null;
-    const playwrightRate = playwright && playwright.totalTests > 0 ? (playwright.passedTests / playwright.totalTests) * 100 : null;
-    const storybookRate = storybook && storybook.totalTests > 0 ? (storybook.passedTests / storybook.totalTests) * 100 : null;
+    const playwrightExecuted = playwright ? Math.max(0, playwright.totalTests - playwright.skippedTests) : 0;
+    const playwrightRate = playwright && playwrightExecuted > 0 ? (playwright.passedTests / playwrightExecuted) * 100 : null;
+    const storybookExecuted = storybook ? Math.max(0, storybook.totalTests - storybook.skippedTests) : 0;
+    const storybookRate = storybook && storybookExecuted > 0 ? (storybook.passedTests / storybookExecuted) * 100 : null;
     const unitPassMetric = junit
       ? this.metric(
         "test",
         "unit_pass_rate",
         "Unitテスト通過率",
-        junit.totalTests > 0 ? `${junitRate?.toFixed(1)}%` : "0件",
+        junit.totalTests === 0 ? "0件" : junitExecuted === 0 ? "実行0件（全てスキップ）" : `${junitRate?.toFixed(1)}%`,
         "100%",
-        junit.totalTests === 0
+        junit.totalTests === 0 || junitExecuted === 0
           ? "warn"
           : junit.failedTests === 0 && junitRate === 100
             ? "pass"
             : "fail",
-        "JUnit XML から tests / failures / errors / skipped を集計しています。",
+        "JUnit XML から tests / failures / errors / skipped を集計しています。通過率はスキップを分母から除外して算出します。",
         [
           this.noteEvidence("総テスト数", String(junit.totalTests)),
           this.noteEvidence("失敗数", String(junit.failedTests)),
@@ -767,14 +771,14 @@ export class QualityReportGenerator {
         "test",
         "storybook_pass_rate",
         "Storybook Interactionテスト通過率",
-        storybook.totalTests > 0 ? `${storybookRate?.toFixed(1)}%` : "0件",
+        storybook.totalTests === 0 ? "0件" : storybookExecuted === 0 ? "実行0件（全てスキップ）" : `${storybookRate?.toFixed(1)}%`,
         "100%",
-        storybook.totalTests === 0
+        storybook.totalTests === 0 || storybookExecuted === 0
           ? "warn"
           : storybook.failedTests === 0 && storybookRate === 100
             ? "pass"
             : "fail",
-        "Storybook 結果 JSON から通過率を集計しています。",
+        "Storybook 結果 JSON から通過率を集計しています。通過率はスキップを分母から除外して算出します。",
         [
           this.noteEvidence("総テスト数", String(storybook.totalTests)),
           this.noteEvidence("失敗数", String(storybook.failedTests)),
@@ -788,14 +792,14 @@ export class QualityReportGenerator {
         "test",
         "e2e_pass_rate",
         "E2Eテスト通過率",
-        playwright.totalTests > 0 ? `${playwrightRate?.toFixed(1)}%` : "0件",
+        playwright.totalTests === 0 ? "0件" : playwrightExecuted === 0 ? "実行0件（全てスキップ）" : `${playwrightRate?.toFixed(1)}%`,
         "100%",
-        playwright.totalTests === 0
+        playwright.totalTests === 0 || playwrightExecuted === 0
           ? "warn"
           : playwright.failedTests === 0 && playwrightRate === 100
             ? "pass"
             : "fail",
-        "Playwright 結果 JSON から通過率を集計しています。",
+        "Playwright 結果 JSON から通過率を集計しています。通過率はスキップを分母から除外して算出します。",
         [
           this.noteEvidence("総テスト数", String(playwright.totalTests)),
           this.noteEvidence("失敗数", String(playwright.failedTests)),

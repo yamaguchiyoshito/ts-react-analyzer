@@ -1015,6 +1015,10 @@ test("QualityReportGenerator counts self-closing JUnit testcases correctly", asy
 
   assert.ok(unitPassMetric?.evidence.some((item) => item.label === "総テスト数" && item.value === "3"));
   assert.ok(unitPassMetric?.evidence.some((item) => item.label === "失敗数" && item.value === "0"));
+  assert.ok(unitPassMetric?.evidence.some((item) => item.label === "スキップ数" && item.value === "1"));
+  // スキップは分母から除外されるため、失敗 0 件なら通過率 100% で pass になる
+  assert.equal(unitPassMetric?.actual, "100.0%");
+  assert.equal(unitPassMetric?.verdict, "pass");
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
