@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
 import type {
@@ -8,6 +10,20 @@ import type {
   CachedAnalysisPayload,
   CachedAnalysisRecord,
 } from "../types/index.js";
+
+// アナライザ自身の版をキャッシュキーへ混ぜ、解析ロジック更新後に
+// 旧バージョンの解析結果を再利用しないようにする。
+const ANALYZER_VERSION = readAnalyzerVersion();
+
+function readAnalyzerVersion(): string {
+  try {
+    const packagePath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "package.json");
+    const parsed = JSON.parse(readFileSync(packagePath, "utf8")) as { version?: string };
+    return parsed.version ?? "0";
+  } catch {
+    return "0";
+  }
+}
 
 export class AnalysisCache {
   private readonly cacheFile: string;
@@ -19,7 +35,7 @@ export class AnalysisCache {
   constructor(cacheDir: string, projectRoot: string, compilerOptions: ts.CompilerOptions) {
     const projectKey = this.hash(projectRoot).slice(0, 16);
     this.cacheFile = path.join(cacheDir, "analysis", `${projectKey}.json`);
-    this.baseConfigHash = this.hash(this.stableStringify(compilerOptions));
+    this.baseConfigHash = this.hash(`${ANALYZER_VERSION}::${this.stableStringify(compilerOptions)}`);
   }
 
   async initialize(): Promise<void> {
