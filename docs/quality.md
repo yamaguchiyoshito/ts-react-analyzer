@@ -70,6 +70,13 @@ node dist/src/cli.js quality gate ./my-app \
 `quality diff` は baseline の `*_quality_report.json` と比較し、悪化・改善・追加・削除された観点を差分化します。  
 件数集計に使われるのは親指標だけで、派生指標は診断情報として保持されます。
 
+「悪化」には判定の悪化 (`pass -> warn` など) に加えて、次も含まれます。
+
+- **判定が warn / fail のままの数値悪化** — 例: 型エラー 108 件 → 110 件。「FAIL のまま少しずつ腐る」変化も悪化として数えます
+- **証跡の喪失** — 実測できていた指標が manual (証跡待ち) に落ちた場合。改善扱いにはなりません
+
+なお `quality gate --baseline` が終了コード `2` で落とすのは判定の悪化だけです。同一判定内の数値悪化は差分レポートでの可視化に留まります。
+
 ## 手動証跡 (quality.manual.json)
 
 要件トレーサビリティや残存バグ数のような自動化できない指標は、`<projectDir>/quality.manual.json` を置くと自動で取り込まれます (`--manual-input` で別パスも指定可能)。

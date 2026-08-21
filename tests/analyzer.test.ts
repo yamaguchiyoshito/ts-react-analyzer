@@ -3424,6 +3424,75 @@ test("CLI quality collect keeps test evidence under source-only and matches __te
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
 
+test("QualityDiffGenerator detects value-direction changes and lost evidence as regressions", () => {
+  const generator = new QualityDiffGenerator();
+  const buildReport = (metrics: Array<{ id: string; actual: string; threshold: string; verdict: QualityReport["categories"][number]["metrics"][number]["verdict"]; automation?: "automatic" | "manual" }>): QualityReport => ({
+    timestamp: "2026-03-20T00:00:00.000Z",
+    executionTimeMs: 1,
+    projectRoot: "/proj",
+    summary: {
+      totalMetrics: metrics.length,
+      derivedMetricCount: 0,
+      passCount: 0,
+      partialCount: 0,
+      partialCategoryCount: 0,
+      warnCount: 0,
+      failCount: 0,
+      manualCount: 0,
+      notApplicableCount: 0,
+      overallVerdict: "fail",
+    },
+    categories: [
+      {
+        id: "code",
+        label: "コード品質",
+        verdict: "fail",
+        summary: "",
+        metrics: metrics.map((metric) => ({
+          id: metric.id,
+          category: "code" as const,
+          label: metric.id,
+          aggregation: "primary" as const,
+          actual: metric.actual,
+          threshold: metric.threshold,
+          verdict: metric.verdict,
+          automation: metric.automation ?? "automatic",
+          summary: "",
+          evidence: [],
+        })),
+      },
+    ],
+  });
+
+  const baseline = buildReport([
+    { id: "typescript_errors", actual: "108", threshold: "0", verdict: "fail" },
+    { id: "unit_pass_rate", actual: "80.0%", threshold: "100%", verdict: "fail" },
+    { id: "coverage_rate", actual: "95.0%", threshold: ">= 80%", verdict: "pass" },
+    { id: "cycles", actual: "3", threshold: "0", verdict: "warn" },
+  ]);
+  const current = buildReport([
+    { id: "typescript_errors", actual: "110", threshold: "0", verdict: "fail" },
+    { id: "unit_pass_rate", actual: "手動証跡待ち", threshold: "100%", verdict: "manual", automation: "manual" },
+    { id: "coverage_rate", actual: "90.0%", threshold: ">= 80%", verdict: "pass" },
+    { id: "cycles", actual: "2", threshold: "0", verdict: "warn" },
+  ]);
+
+  const diff = generator.compare(current, baseline, "/proj/base.json", "/proj/current.json");
+  const byId = new Map(diff.metrics.map((metric) => [metric.id, metric]));
+
+  // fail のまま件数が増えた → 悪化
+  assert.equal(byId.get("typescript_errors")?.trend, "regressed");
+  // 実測 (fail) から manual への遷移 = 証跡喪失 → 改善ではなく悪化
+  assert.equal(byId.get("unit_pass_rate")?.trend, "regressed");
+  // pass のままの数値変動は基準内なので neutral
+  assert.equal(byId.get("coverage_rate")?.trend, "neutral");
+  // warn のまま件数が減った → 改善
+  assert.equal(byId.get("cycles")?.trend, "improved");
+
+  assert.equal(diff.summary.regressedMetrics, 2);
+  assert.equal(diff.summary.improvedMetrics, 1);
+});
+
 test("QualityDiffGenerator excludes derived regressions from primary summary counts", () => {
   const generator = new QualityDiffGenerator();
   const baseline: QualityReport = {

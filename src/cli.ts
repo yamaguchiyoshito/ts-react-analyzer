@@ -587,6 +587,11 @@ function selectBlockingRegressionMetrics(
     if (metric.trend !== "regressed" || metric.currentAutomation !== "automatic") {
       return false;
     }
+    // 同一判定内の数値悪化 (fail のまま件数増など) は差分レポートで可視化する
+    // のみとし、gate はドキュメントどおり判定の悪化 (pass->warn 等) だけで落とす
+    if (metric.baselineVerdict === metric.currentVerdict) {
+      return false;
+    }
     if (monitoringMetricIds.has(metric.id)) {
       return false;
     }
