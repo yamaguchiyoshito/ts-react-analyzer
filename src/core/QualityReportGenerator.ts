@@ -22,6 +22,7 @@ import type {
   QualityMetricAggregation,
   QualityMetricReport,
   QualityProfile,
+  QualityGateRenderContext,
   QualityReport,
   QualitySummary,
   TestPresenceSettings,
@@ -49,6 +50,9 @@ interface QualityGenerationOptions {
   prefix: string;
   formats: Array<"json" | "markdown" | "csv" | "html" | "all">;
   onProgress?: (message: string, metadata?: Record<string, unknown>) => void;
+  // レポート構築後・書き出し前に呼ばれ、gate 判定やベースライン比較の結果を
+  // レポート本文 (要点の「ゲート判定」「前回比」) に反映するためのフック
+  gate?: (report: QualityReport) => QualityGateRenderContext | undefined;
 }
 
 interface AuditFinding {
@@ -177,6 +181,7 @@ const DEFAULT_TEST_PRESENCE_SETTINGS: TestPresenceSettings = {
 
 export class QualityReportGenerator {
   private projectRoot?: string;
+  private gateContext?: QualityGateRenderContext;
   private qualityProfile: QualityProfile = "application";
   private testPresenceSettings: TestPresenceSettings = {
     thresholds: {
@@ -196,6 +201,7 @@ export class QualityReportGenerator {
 
     const report = await this.buildReport(input, options.onProgress);
     report.executionTimeMs = Math.max(report.executionTimeMs, input.executionTimeMs + (Date.now() - startedAt));
+    this.gateContext = options.gate?.(report);
     const formats = options.formats.includes("all")
       ? ["json", "markdown", "csv", "html"]
       : options.formats;
@@ -1242,8 +1248,9 @@ export class QualityReportGenerator {
     lines.push(
       "## 要点",
       "",
+      ...this.buildGateVerdictLines(),
       `- 総合判定: ${this.verdictLabel(report.summary.overallVerdict)}`,
-      `- 前回比: N/A（ベースライン未設定）`,
+      this.buildBaselineComparisonLine(report),
       `- 自動判定カバレッジ: ${automaticCoverage.automaticCount}/${automaticCoverage.totalCount} 指標 (${automaticCoverage.coverageRate.toFixed(1)}%)`,
       `- 実測ベーススコア: PASS率 ${measuredSignalStats.passRate.toFixed(1)}%（PASS ${measuredSignalStats.pass} / WARN ${measuredSignalStats.warn} / FAIL ${measuredSignalStats.fail} / PARTIAL ${measuredSignalStats.partial}）`,
       `- 推定込みスコア: PASS率 ${modeledSignalStats.passRate.toFixed(1)}%（PASS ${modeledSignalStats.pass} / WARN ${modeledSignalStats.warn} / FAIL ${modeledSignalStats.fail} / PARTIAL ${modeledSignalStats.partial}）`,
@@ -1935,7 +1942,8 @@ export class QualityReportGenerator {
     <h2>要点</h2>
     <ul class="bullet-list">
       <li>総合判定: ${this.escapeHtml(this.verdictLabel(report.summary.overallVerdict))}</li>
-      <li>前回比: N/A（ベースライン未設定）</li>
+      ${this.buildGateVerdictLines().map((line) => `<li>${this.escapeHtml(line.replace(/^[-\s]*/u, "").replace(/\*\*/gu, ""))}</li>`).join("\n      ")}
+      <li>${this.escapeHtml(this.buildBaselineComparisonLine(report).replace(/^[-\s]*/u, ""))}</li>
       <li>自動阻害指標: ${this.escapeHtml(blockingMetrics.length > 0 ? blockingMetrics.map((entry) => `${entry.categoryLabel}/${entry.metric.label}`).join("、") : "なし")}</li>
       <li>注目下位指標: ${this.escapeHtml(derivedInsights.length > 0 ? derivedInsights.map((entry) => `${entry.categoryLabel}/${entry.metric.label} ${entry.metric.actual} (${this.verdictLabel(entry.metric.verdict)})`).join("、") : "なし")}</li>
       <li>FAILカテゴリ: ${this.escapeHtml(failCategories.length > 0 ? failCategories.join("、") : "なし")}</li>
@@ -3520,6 +3528,41 @@ export class QualityReportGenerator {
       filePath,
       value: value ? `${filePath}: ${value}` : filePath,
     };
+  }
+
+  private buildBaselineComparisonLine(report: QualityReport): string {
+    const context = this.gateContext;
+    if (!context?.baselinePath) {
+      return "- 前回比: N/A（ベースライン未設定）";
+    }
+    const baselineLabel = context.baselineOverallVerdict ? this.verdictLabel(context.baselineOverallVerdict) : "不明";
+    const currentLabel = this.verdictLabel(report.summary.overallVerdict);
+    return `- 前回比: ${baselineLabel} -> ${currentLabel}（悪化 ${context.regressedCount ?? 0} 件 / 改善 ${context.improvedCount ?? 0} 件、ベースライン: ${this.toDisplayPath(context.baselinePath)}）`;
+  }
+
+  private buildGateVerdictLines(): string[] {
+    const context = this.gateContext;
+    if (!context || context.mode !== "gate") {
+      return [];
+    }
+    if (context.gateVerdict !== "fail") {
+      return ["- **ゲート判定: PASS**（自動FAILなし、ベースライン悪化なし）"];
+    }
+
+    const lines = [
+      `- **ゲート判定: FAIL**（自動FAIL ${context.failingAutomaticMetrics.length} 件 / ベースライン悪化 ${context.blockingRegressions.length} 件、終了コード 2）`,
+    ];
+    for (const offender of context.failingAutomaticMetrics.slice(0, 5)) {
+      lines.push(`  - 阻害: ${offender.category} / ${offender.label} — 実績 ${offender.actual}（基準 ${offender.threshold}）`);
+    }
+    for (const regression of context.blockingRegressions.slice(0, 5)) {
+      lines.push(`  - 悪化: ${regression.category} / ${regression.label} — ${regression.baselineVerdict} -> ${regression.currentVerdict}`);
+    }
+    const hiddenCount = Math.max(0, context.failingAutomaticMetrics.length - 5) + Math.max(0, context.blockingRegressions.length - 5);
+    if (hiddenCount > 0) {
+      lines.push(`  - ほか ${hiddenCount} 件は観点別詳細を参照`);
+    }
+    return lines;
   }
 
   private toDisplayPath(filePath: string): string {

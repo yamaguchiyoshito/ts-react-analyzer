@@ -621,6 +621,31 @@ export interface FeatureSummary {
   productTextCount: number;
 }
 
+export interface QualityGateOffender {
+  category: string;
+  label: string;
+  actual: string;
+  threshold: string;
+}
+
+export interface QualityGateRegression {
+  category: string;
+  label: string;
+  baselineVerdict: string;
+  currentVerdict: string;
+}
+
+export interface QualityGateRenderContext {
+  mode: "collect" | "report" | "gate" | "diff";
+  baselinePath?: string;
+  baselineOverallVerdict?: QualityVerdict;
+  regressedCount?: number;
+  improvedCount?: number;
+  gateVerdict?: "pass" | "fail";
+  failingAutomaticMetrics: QualityGateOffender[];
+  blockingRegressions: QualityGateRegression[];
+}
+
 export interface QualityReport {
   timestamp: string;
   executionTimeMs: number;

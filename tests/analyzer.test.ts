@@ -826,6 +826,50 @@ test("CLI quality collect auto-loads quality.manual.json and merges manual metri
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
 
+test("CLI quality gate writes gate verdict and baseline comparison into the report", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-gate-verdict-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.tsx"), [
+    "export const App = () => <main dangerouslySetInnerHTML={{ __html: \"<b>x</b>\" }} />;",
+  ].join("\n"), "utf8");
+
+  await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality", "collect", projectRoot,
+    "--output", outputDir, "--prefix", "base", "--format", "json",
+  ]);
+
+  const gateResult = await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality", "gate", projectRoot,
+    "--output", outputDir, "--prefix", "rel", "--format", "json,markdown",
+    "--baseline", path.join(outputDir, "base_quality_report.json"),
+  ]).then(() => ({ code: 0 })).catch((error: { code?: number }) => ({ code: error.code ?? -1 }));
+
+  assert.equal(gateResult.code, 2);
+
+  const markdownReport = await fs.readFile(path.join(outputDir, "rel_quality_report.md"), "utf8");
+  assert.match(markdownReport, /- \*\*ゲート判定: FAIL\*\*（自動FAIL \d+ 件 \/ ベースライン悪化 \d+ 件、終了コード 2）/u);
+  assert.match(markdownReport, /  - 阻害: セキュリティ品質 \/ dangerouslySetInnerHTML使用件数 — 実績 1（基準 0）/u);
+  assert.match(markdownReport, /- 前回比: FAIL -> FAIL（悪化 \d+ 件 \/ 改善 \d+ 件、ベースライン: /u);
+  assert.doesNotMatch(markdownReport, /前回比: N\/A（ベースライン未設定）/u);
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
 test("QualityReportGenerator renders automatic file evidences with project-relative paths", async () => {
   const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-relative-paths-"));
   const outputDir = path.join(projectRoot, "out");

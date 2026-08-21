@@ -387,6 +387,12 @@ async function qualityProject(
     }
 
     const qualityReportGenerator = new QualityReportGenerator();
+    const currentReportPath = path.join(config.outputDir, `${config.filePrefix}_quality_report.json`);
+    const qualityDiffGenerator = new QualityDiffGenerator();
+    let failingAutomaticMetrics: Array<{ category: string; metric: QualityReport["categories"][number]["metrics"][number] }> = [];
+    let diff: QualityDiffReport | undefined;
+    let blockingRegressionMetrics: ReturnType<typeof selectBlockingRegressionMetrics> = [];
+
     const report = await qualityReportGenerator.generateReports({
       projectRoot: projectDir,
       analysisResults: artifacts.results,
@@ -407,20 +413,45 @@ async function qualityProject(
         ? [...config.outputFormats, "json"]
         : config.outputFormats,
       onProgress: (message, metadata) => logger.info(message, metadata),
+      // レポート書き出し前に gate 判定とベースライン比較を確定させ、
+      // 「ゲート判定」「前回比」を md / html 本文へ反映する
+      gate: (builtReport) => {
+        failingAutomaticMetrics = builtReport.categories
+          .flatMap((category) => category.metrics.map((metric) => ({ category: category.label, metric })))
+          .filter(({ metric }) => metric.aggregation === "primary" && metric.automation === "automatic" && metric.verdict === "fail");
+        const shouldCompareWithBaseline = Boolean(baselineReport && baselinePath && (mode === "diff" || mode === "gate"));
+        diff = shouldCompareWithBaseline
+          ? qualityDiffGenerator.compare(builtReport, baselineReport!, baselinePath!, currentReportPath)
+          : undefined;
+        blockingRegressionMetrics = diff ? selectBlockingRegressionMetrics(diff, config) : [];
+
+        if (mode !== "gate" && !diff) {
+          return undefined;
+        }
+        return {
+          mode,
+          baselinePath: diff ? baselinePath : undefined,
+          baselineOverallVerdict: baselineReport?.summary.overallVerdict,
+          regressedCount: diff?.summary.regressedMetrics,
+          improvedCount: diff?.summary.improvedMetrics,
+          gateVerdict: failingAutomaticMetrics.length > 0 || blockingRegressionMetrics.length > 0 ? "fail" : "pass",
+          failingAutomaticMetrics: failingAutomaticMetrics.map(({ category, metric }) => ({
+            category,
+            label: metric.label,
+            actual: metric.actual,
+            threshold: metric.threshold,
+          })),
+          blockingRegressions: blockingRegressionMetrics.map((metric) => ({
+            category: metric.categoryLabel,
+            label: metric.label,
+            baselineVerdict: metric.baselineVerdict ?? "不明",
+            currentVerdict: metric.currentVerdict ?? "不明",
+          })),
+        };
+      },
     });
 
-    const failingAutomaticMetrics = report.categories
-      .flatMap((category) => category.metrics.map((metric) => ({ category: category.label, metric })))
-      .filter(({ metric }) => metric.aggregation === "primary" && metric.automation === "automatic" && metric.verdict === "fail");
-    const shouldCompareWithBaseline = Boolean(baselineReport && baselinePath && (mode === "diff" || mode === "gate"));
-    const qualityDiffGenerator = shouldCompareWithBaseline ? new QualityDiffGenerator() : undefined;
-    const currentReportPath = path.join(config.outputDir, `${config.filePrefix}_quality_report.json`);
-    const diff = shouldCompareWithBaseline && qualityDiffGenerator
-      ? qualityDiffGenerator.compare(report, baselineReport!, baselinePath!, currentReportPath)
-      : undefined;
-    const blockingRegressionMetrics = diff ? selectBlockingRegressionMetrics(diff, config) : [];
-
-    if (diff && qualityDiffGenerator) {
+    if (diff) {
       await qualityDiffGenerator.writeReports(diff, config.outputDir, config.filePrefix, config.outputFormats);
     }
 
