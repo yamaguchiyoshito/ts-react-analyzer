@@ -150,7 +150,7 @@ export class TypeCheckAnalyzer {
       });
       return {
         totalErrors: 0,
-        checkedFiles: rootNames.filter((fileName) => fileName.startsWith(projectRoot)).length,
+        checkedFiles: rootNames.filter((fileName) => this.isWithinDirectory(fileName, projectRoot)).length,
         issues: [],
         tsConfigPath: resolvedTsConfigPath,
         skippedReason: `TypeScript 対象が ${rootNames.length} ファイルで上限 ${options.maxRootNames} を超えるため、型検査をスキップしました。`,
@@ -174,11 +174,16 @@ export class TypeCheckAnalyzer {
 
     return {
       totalErrors: diagnostics.length,
-      checkedFiles: rootNames.filter((fileName) => fileName.startsWith(projectRoot)).length,
+      checkedFiles: rootNames.filter((fileName) => this.isWithinDirectory(fileName, projectRoot)).length,
       issues: diagnostics.map((diagnostic) => this.toIssue(diagnostic, resolvedTsConfigPath)),
       tsConfigPath: resolvedTsConfigPath,
       strictnessSummary,
     };
+  }
+
+  private isWithinDirectory(fileName: string, directory: string): boolean {
+    const relative = path.relative(directory, fileName);
+    return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
   }
 
   private collectDiagnostics(
@@ -399,7 +404,7 @@ export class TypeCheckAnalyzer {
             results.push(candidate.path);
           }
         }
-        if (!entry.isDirectory() || excludedDirectories.has(entry.name) || entry.name === "src") {
+        if (!entry.isDirectory() || excludedDirectories.has(entry.name)) {
           continue;
         }
         queue.push(path.join(currentDir, entry.name));

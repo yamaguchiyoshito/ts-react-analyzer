@@ -470,6 +470,7 @@ export interface AnalysisDiffReport {
   graphDelta: {
     cycleDelta: number;
     dependencyDelta: number;
+    externalDependencyDelta?: number;
     warningDelta: string[];
   };
   hotSpotDelta: {

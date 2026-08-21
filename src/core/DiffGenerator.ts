@@ -53,6 +53,7 @@ export class DiffGenerator {
       graphDelta: {
         cycleDelta: (current.graph.cycles?.length ?? 0) - (baseline.graph.cycles?.length ?? 0),
         dependencyDelta: current.graph.totalDependencies - baseline.graph.totalDependencies,
+        externalDependencyDelta: (current.graph.externalDependencies ?? 0) - (baseline.graph.externalDependencies ?? 0),
         warningDelta: this.diffStrings(current.graph.warnings ?? [], baseline.graph.warnings ?? []),
       },
       hotSpotDelta: this.buildHotSpotDelta(current, baseline),
@@ -138,14 +139,14 @@ export class DiffGenerator {
     markdown += `${this.buildImpactVerdictLine(diff, violations.length, threshold, maxScore)}\n`;
     markdown += `- 変更ファイル: 追加 ${diff.summary.addedFiles} / 削除 ${diff.summary.removedFiles} / 変更 ${diff.summary.changedFiles} / 変更なし ${diff.summary.unchangedFiles}\n`;
     markdown += `- 平均複雑度差分: ${this.formatSigned(diff.summary.complexityDelta, 2)}\n`;
-    markdown += `- 依存総数差分: ${this.formatSigned(diff.graphDelta.dependencyDelta)}\n`;
+    markdown += `- 依存総数差分: ${this.formatDependencyDelta(diff)}\n`;
     markdown += `- baseline: ${display(diff.baselinePath)}\n`;
     markdown += `- 生成時刻: ${diff.generatedAt}\n\n`;
     markdown += "score は「変更ファイルからの距離・被依存数・複雑度の変化」を合成した影響度です。`--impact-threshold`（CI 既定 60）以上を要注意とみなします。\n\n";
 
     markdown += "## グラフ差分\n\n";
     markdown += `- 循環依存差分: ${this.formatSigned(diff.graphDelta.cycleDelta)}\n`;
-    markdown += `- 依存総数差分: ${this.formatSigned(diff.graphDelta.dependencyDelta)}\n`;
+    markdown += `- 依存総数差分: ${this.formatDependencyDelta(diff)}\n`;
     if (diff.graphDelta.warningDelta.length > 0) {
       markdown += `- 警告差分:\n${diff.graphDelta.warningDelta.map((warning) => `  - ${warning}`).join("\n")}\n\n`;
     } else {
@@ -212,6 +213,16 @@ export class DiffGenerator {
     }
 
     return markdown;
+  }
+
+  private formatDependencyDelta(diff: AnalysisDiffReport): string {
+    const total = this.formatSigned(diff.graphDelta.dependencyDelta);
+    const external = diff.graphDelta.externalDependencyDelta;
+    if (external === undefined) {
+      return total;
+    }
+    const internal = diff.graphDelta.dependencyDelta - external;
+    return `${total}（内部 ${this.formatSigned(internal)} / 外部 ${this.formatSigned(external)}）`;
   }
 
   private buildImpactVerdictLine(
