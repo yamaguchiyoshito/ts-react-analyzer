@@ -243,12 +243,13 @@ test("ReportGenerator aggregates repeated purpose findings of the same rule", as
   });
 
   const markdownReport = await fs.readFile(path.join(outputDir, "aggregate_report.md"), "utf8");
+  const purposeSection = markdownReport.split("### 目的に沿った改善提案")[1]?.split("\n## ")[0] ?? "";
   // 同一ルール 6 件は 1 行に集約され、high の個別指摘はそのまま残る
-  assert.match(markdownReport, /\| 6 ファイル（例: src\/misc\/legacy-0\.ts） \| Shared \| low \|/u);
-  assert.match(markdownReport, /\| src\/utils\/Badge\.tsx \| Utils \| high \|/u);
-  assert.doesNotMatch(markdownReport, /\| src\/misc\/legacy-1\.ts \|/u);
+  assert.match(purposeSection, /\| 6 ファイル（例: src\/misc\/legacy-0\.ts） \| Shared \| low \|/u);
+  assert.match(purposeSection, /\| src\/utils\/Badge\.tsx \| Utils \| high \|/u);
+  assert.doesNotMatch(purposeSection, /\| src\/misc\/legacy-1\.ts \|/u);
   // Shared 比率が過半のため構造レベルの注記が出る
-  assert.match(markdownReport, /React アプリのディレクトリ規約/u);
+  assert.match(purposeSection, /React アプリのディレクトリ規約/u);
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
