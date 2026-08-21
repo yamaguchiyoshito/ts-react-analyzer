@@ -51,6 +51,7 @@ node dist/src/cli.js quality gate ./my-app
 | 設定ファイル・環境変数・キャッシュ | [設定リファレンス](docs/configuration.md) |
 | File Type 分類とディレクトリ目的・改善提案のルール | [File Type とディレクトリ目的](docs/file-types.md) |
 | 品質レポート・quality gate・手動証跡の仕様 | [品質レポート](docs/quality.md) |
+| GitLab CI への組み込みテンプレート | [ci-templates/gitlab](ci-templates/gitlab/README.md) |
 
 ## 開発者向け
 

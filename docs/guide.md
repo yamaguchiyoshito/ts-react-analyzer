@@ -89,6 +89,8 @@ node dist/src/cli.js quality gate ./target-app \
 
 ## CI に組み込む
 
+GitLab CI を使っている場合は、[同梱の GitLab CI テンプレート](../ci-templates/gitlab/README.md) を include するだけで、以下の PR ゲートと出荷ゲート (baseline の受け渡し込み) が設定できます。ここでは仕組みを理解するために素のコマンドを示します。
+
 ### PR ゲート — 危険な変更だけを止める
 
 ```bash

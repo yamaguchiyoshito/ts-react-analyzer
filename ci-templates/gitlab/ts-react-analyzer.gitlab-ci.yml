@@ -1,0 +1,130 @@
+# ============================================================================
+# ts-react-analyzer を GitLab CI に組み込むテンプレート
+#
+# 3 つのジョブを提供します。
+#   tsra:baseline      デフォルトブランチで基準点 (baseline) を更新する
+#   tsra:diff          MR ごとに、影響度の高い危険な変更だけを止める (MR ゲート)
+#   tsra:quality-gate  デフォルトブランチとタグで、品質悪化を止める (出荷ゲート)
+#
+# 使い方・変数の説明は同じディレクトリの README.md を参照してください。
+# ============================================================================
+
+variables:
+  # 解析対象ディレクトリ (リポジトリルートからの相対パス)
+  TSRA_PROJECT_DIR: "."
+  # レポート出力先 (TSRA_PROJECT_DIR 基準)
+  TSRA_OUTPUT_DIR: "analysis-reports"
+  # 出力ファイルの接頭辞
+  TSRA_PREFIX: "ci"
+  # この影響度スコア以上のファイルがあると MR を失敗させる
+  TSRA_IMPACT_THRESHOLD: "60"
+  # 悪化しても出荷は止めず、監視だけにする品質指標 ID (カンマ区切り、空で無効)
+  TSRA_QUALITY_MONITORING_METRICS: ""
+  # 解析前に実行するコマンド (例: "npm ci"。型エラー数を正しく測りたい場合に指定)
+  TSRA_SETUP_CMD: ""
+  # 実行イメージ
+  TSRA_NODE_IMAGE: "node:22"
+  # ts-react-analyzer の取得元とリビジョン
+  TSRA_REPO_URL: "https://github.com/yamaguchiyoshito/ts-react-analyzer.git"
+  TSRA_REPO_REF: "master"
+
+# 共通設定: ツールの取得・ビルドと、解析キャッシュの永続化
+.tsra-base:
+  image: "$TSRA_NODE_IMAGE"
+  cache:
+    key: "tsra-$CI_COMMIT_REF_SLUG"
+    paths:
+      - "$TSRA_PROJECT_DIR/.ts-analyzer-cache/"
+  before_script:
+    - git clone --depth 1 --branch "$TSRA_REPO_REF" "$TSRA_REPO_URL" /tmp/tsra
+    - (cd /tmp/tsra && npm install --no-audit --no-fund && npm run build)
+    - export TSRA_CLI=/tmp/tsra/dist/src/cli.js
+    # 出力ディレクトリのリポジトリルートからのパス (artifacts / API 取得用)
+    - |
+      _p="${TSRA_PROJECT_DIR#./}"; _p="${_p%/}"
+      if [ "$_p" = "." ] || [ -z "$_p" ]; then _p=""; else _p="$_p/"; fi
+      export TSRA_REPORTS_PATH="${_p}${TSRA_OUTPUT_DIR}"
+    - if [ -n "$TSRA_SETUP_CMD" ]; then (cd "$TSRA_PROJECT_DIR" && eval "$TSRA_SETUP_CMD"); fi
+
+# ----------------------------------------------------------------------------
+# デフォルトブランチで基準点を更新する
+# ここで保存した baseline を、MR ゲートと出荷ゲートが比較元として取得します
+# ----------------------------------------------------------------------------
+tsra:baseline:
+  extends: .tsra-base
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - node "$TSRA_CLI" analyze "$TSRA_PROJECT_DIR" --output "$TSRA_OUTPUT_DIR" --prefix "$TSRA_PREFIX"
+    - node "$TSRA_CLI" quality collect "$TSRA_PROJECT_DIR" --output "$TSRA_OUTPUT_DIR" --prefix "$TSRA_PREFIX"
+  artifacts:
+    paths:
+      - "$TSRA_REPORTS_PATH/"
+    expire_in: 90 days
+
+# ----------------------------------------------------------------------------
+# MR ゲート: 今回の変更で危険になった箇所だけを止める
+# baseline はターゲットブランチの最新 tsra:baseline ジョブの成果物から取得します
+# baseline がまだ無い初回は、現状解析だけ実行して成功します
+# ----------------------------------------------------------------------------
+tsra:diff:
+  extends: .tsra-base
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - |
+      baseline_json="$CI_PROJECT_DIR/tsra-baseline_report.json"
+      if curl --silent --fail --location \
+           --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+           --output "$baseline_json" \
+           "$CI_API_V4_URL/projects/$CI_PROJECT_ID/jobs/artifacts/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME/raw/$TSRA_REPORTS_PATH/${TSRA_PREFIX}_report.json?job=tsra%3Abaseline"; then
+        node "$TSRA_CLI" diff "$TSRA_PROJECT_DIR" \
+          --output "$TSRA_OUTPUT_DIR" \
+          --prefix "$TSRA_PREFIX" \
+          --baseline "$baseline_json" \
+          --impact-threshold "$TSRA_IMPACT_THRESHOLD" \
+          --fail-on-impact
+      else
+        echo "baseline がまだありません。今回は現状解析のみ実行します。"
+        echo "デフォルトブランチで tsra:baseline が一度成功すると、次の MR から差分ゲートが有効になります。"
+        node "$TSRA_CLI" analyze "$TSRA_PROJECT_DIR" --output "$TSRA_OUTPUT_DIR" --prefix "$TSRA_PREFIX"
+      fi
+  artifacts:
+    when: always
+    paths:
+      - "$TSRA_REPORTS_PATH/"
+    expire_in: 30 days
+
+# ----------------------------------------------------------------------------
+# 出荷ゲート: 品質レポートの FAIL と、前回からの品質悪化で失敗させる
+# デフォルトブランチとタグ (リリース) で実行します
+# ----------------------------------------------------------------------------
+tsra:quality-gate:
+  extends: .tsra-base
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: "$CI_COMMIT_TAG"
+  script:
+    - |
+      baseline_json="$CI_PROJECT_DIR/tsra-baseline_quality_report.json"
+      gate_args=""
+      if curl --silent --fail --location \
+           --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+           --output "$baseline_json" \
+           "$CI_API_V4_URL/projects/$CI_PROJECT_ID/jobs/artifacts/$CI_DEFAULT_BRANCH/raw/$TSRA_REPORTS_PATH/${TSRA_PREFIX}_quality_report.json?job=tsra%3Abaseline"; then
+        gate_args="--baseline $baseline_json"
+      else
+        echo "前回の品質レポートがまだありません。今回は現状の品質だけで判定します。"
+      fi
+      if [ -n "$TSRA_QUALITY_MONITORING_METRICS" ]; then
+        gate_args="$gate_args --quality-gate-monitoring-metrics $TSRA_QUALITY_MONITORING_METRICS"
+      fi
+      node "$TSRA_CLI" quality gate "$TSRA_PROJECT_DIR" \
+        --output "$TSRA_OUTPUT_DIR" \
+        --prefix "$TSRA_PREFIX" \
+        $gate_args
+  artifacts:
+    when: always
+    paths:
+      - "$TSRA_REPORTS_PATH/"
+    expire_in: 90 days
