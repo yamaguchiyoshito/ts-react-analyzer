@@ -353,6 +353,49 @@ test("ComplexityAnalyzer classifies ts directives and unsafe assertion patterns"
   assert.ok(metrics.typeMetrics.uncheckedPatterns.includes("double-assertion"));
 });
 
+test("ComplexityAnalyzer does not double-count nested function branches into the parent", () => {
+  const source = `
+    export function Parent() {
+      const onClick = () => {
+        if (Math.random() > 0.5) {
+          return 1;
+        }
+        return 0;
+      };
+      return onClick;
+    }
+  `;
+  const sourceFile = ts.createSourceFile("nested.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const metrics = new ComplexityAnalyzer().analyzeFile(sourceFile, "/virtual/nested.ts");
+
+  const parent = metrics.functions.find((fn) => fn.name === "Parent");
+  const handler = metrics.functions.find((fn) => fn.name !== "Parent");
+
+  // onClick 内の if は onClick 側 (cc=2) にのみ計上され、Parent は cc=1 のまま
+  assert.equal(parent?.cyclomaticComplexity, 1);
+  assert.equal(handler?.cyclomaticComplexity, 2);
+});
+
+test("ComplexityAnalyzer counts switch case clauses without counting the switch itself", () => {
+  const source = `
+    export function pick(kind: string) {
+      switch (kind) {
+        case "a":
+          return 1;
+        case "b":
+          return 2;
+        default:
+          return 0;
+      }
+    }
+  `;
+  const sourceFile = ts.createSourceFile("switch.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const metrics = new ComplexityAnalyzer().analyzeFile(sourceFile, "/virtual/switch.ts");
+
+  // 標準的な cyclomatic complexity: 1 + case 2 個 = 3 (default と switch 自体は数えない)
+  assert.equal(metrics.functions[0]?.cyclomaticComplexity, 3);
+});
+
 test("ComplexityAnalyzer weights peak complexity, nesting, and hook pressure into file score", () => {
   const source = `
     import { useEffect, useMemo, useState } from "react";

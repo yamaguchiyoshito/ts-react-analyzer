@@ -174,10 +174,16 @@ export class ComplexityAnalyzer {
     let maxNestingDepth = 0;
 
     const visit = (child: ts.Node, depth: number): void => {
+      // ネストした関数は独立に解析されるため、その内部の分岐を親へ二重計上しない
+      if (this.isAnalyzableFunction(child)) {
+        return;
+      }
+
       maxNestingDepth = Math.max(maxNestingDepth, depth);
       const nestedDepth = this.isControlFlowNestingNode(child) ? depth + 1 : depth;
 
-      if (ts.isIfStatement(child) || ts.isCaseClause(child) || ts.isConditionalExpression(child) || ts.isSwitchStatement(child)) {
+      // switch 自体は数えず case 節のみ数える (標準的な cyclomatic complexity)
+      if (ts.isIfStatement(child) || ts.isCaseClause(child) || ts.isConditionalExpression(child)) {
         branchCount += 1;
         cyclomaticComplexity += 1;
       }
