@@ -1104,6 +1104,81 @@ test("QualityReportGenerator ignores non-executable helper files inside test dir
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
 
+test("QualityReportGenerator classifies files relative to projectRoot even under test-like parent directories", async () => {
+  const baseRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-abs-path-"));
+  const projectRoot = path.join(baseRoot, "test", "app");
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src", "features"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "features", "UserCard.tsx"), [
+    "export function UserCard() {",
+    "  return <section>User</section>;",
+    "}",
+  ].join("\n"), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "abs-path",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+      enableCache: false,
+    },
+  );
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 10,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "abs-path",
+    formats: ["json"],
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const overallMetric = testCategory?.metrics.find((metric) => metric.id === "matching_test_file_presence");
+
+  // 上位ディレクトリ名 "test" の影響で UserCard.tsx がテストファイル扱いになると
+  // 対象ソースが 0 件になり actual が N/A になる。プロジェクト相対で分類されていれば
+  // Feature としてテスト対象に数えられ、テスト未整備 (0.0% / fail) と判定される。
+  assert.equal(overallMetric?.actual, "0.0%");
+  assert.equal(overallMetric?.verdict, "fail");
+
+  await fs.rm(baseRoot, { recursive: true, force: true });
+});
+
 test("QualityReportGenerator uses JUnit executed test files as runtime evidence", async () => {
   const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-junit-runtime-"));
   const outputDir = path.join(projectRoot, "out");

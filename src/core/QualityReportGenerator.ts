@@ -2270,7 +2270,7 @@ export class QualityReportGenerator {
 
   private collectZodAdoption(parsedFiles: ParsedFile[]): { totalFiles: number; adoptedFiles: number; rate: number } {
     const candidates = parsedFiles.filter((parsedFile) => {
-      const normalized = parsedFile.filePath.replace(/\\/gu, "/").toLowerCase();
+      const normalized = this.toDisplayPath(parsedFile.filePath).replace(/\\/gu, "/").toLowerCase();
       return /(^|\/)(api|infra|service|services|client|clients|repository|repositories|schema|schemas|validation|validations)(\/|$)/u.test(normalized)
         && !this.isTestFile(parsedFile.filePath)
         && !/stories?\./u.test(normalized);
@@ -2914,7 +2914,9 @@ export class QualityReportGenerator {
   }
 
   private classifyFileType(filePath: string): string {
-    return classifyFileType(filePath);
+    // 分類パターンはパス全体に照合されるため、プロジェクトより上位のディレクトリ名
+    // (例: CI の /home/runner/work/app/app) が判定へ混入しないよう相対化してから渡す。
+    return classifyFileType(this.toDisplayPath(filePath));
   }
 
   private isStoryFile(filePath: string): boolean {
@@ -2943,7 +2945,7 @@ export class QualityReportGenerator {
   }
 
   private isTestFile(filePath: string): boolean {
-    const normalized = filePath.replace(/\\/gu, "/").toLowerCase();
+    const normalized = this.toDisplayPath(filePath).replace(/\\/gu, "/").toLowerCase();
     return /(?:^|\/)(?:tests?|__tests__|e2e|playwright|cypress)(?:\/|$)/u.test(normalized)
       || /\.(?:test|spec|e2e|cy|ct)\.[jt]sx?$/u.test(normalized);
   }
@@ -3117,7 +3119,7 @@ export class QualityReportGenerator {
       return "library";
     }
 
-    const normalized = filePath.replace(/\\/gu, "/").toLowerCase();
+    const normalized = this.toDisplayPath(filePath).replace(/\\/gu, "/").toLowerCase();
     if (normalized.includes("/components/ui/")
       || normalized.includes("/shared/ui/")
       || normalized.includes("/components/commons/")) {

@@ -27,7 +27,10 @@ export interface ApiArtifactSummary {
 }
 
 export class ApiArtifactAnalyzer {
+  private projectRoot?: string;
+
   async analyzeProject(projectRoot: string, parsedFiles: ParsedFile[]): Promise<ApiArtifactSummary> {
+    this.projectRoot = path.resolve(projectRoot);
     const specFiles = await this.findOpenApiSpecFiles(projectRoot);
     const diffFiles = await this.findOpenApiDiffFiles(projectRoot);
     const breakingChanges = diffFiles.length > 0 ? await this.parseBreakingChanges(diffFiles) : null;
@@ -146,11 +149,25 @@ export class ApiArtifactAnalyzer {
   }
 
   private getApiFiles(parsedFiles: ParsedFile[]): ParsedFile[] {
+    // プロジェクトより上位のディレクトリ名 (例: /home/user/services/proj) が
+    // API 層判定に混入しないよう、プロジェクト相対パスで照合する。
     return parsedFiles.filter((parsedFile) =>
       /(^|\/)(api|infra|service|services|client|clients|repository|repositories|gateway)(\/|$)/iu.test(
-        parsedFile.filePath.replace(/\\/gu, "/"),
+        this.toProjectRelativePath(parsedFile.filePath),
       )
     );
+  }
+
+  private toProjectRelativePath(filePath: string): string {
+    const normalized = filePath.replace(/\\/gu, "/");
+    if (!this.projectRoot || !path.isAbsolute(filePath)) {
+      return normalized;
+    }
+    const relative = path.relative(this.projectRoot, filePath);
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+      return normalized;
+    }
+    return relative.split(path.sep).join("/");
   }
 
   private async findFiles(
