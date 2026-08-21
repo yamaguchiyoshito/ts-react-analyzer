@@ -121,6 +121,7 @@ export interface CachedAnalysisPayload {
   dependencies: Dependency[];
   dependencyErrors: ExtractionError[];
   complexity: FileComplexityAnalysis;
+  parseDiagnosticCount?: number;
 }
 
 export interface CachedAnalysisRecord {

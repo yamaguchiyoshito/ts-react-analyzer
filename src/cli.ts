@@ -4,7 +4,7 @@ import { parseArgs } from "node:util";
 
 import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, ManualQualityInputLoader, QualityDiffGenerator, QualityReportGenerator, ReportGenerator } from "./core/index.js";
 import { shouldIncludeInAnalysisScope } from "./core/FileConventions.js";
-import type { AnalysisConfig, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, PersistedAnalysisReport, QualityDiffReport, QualityMetricDiffEntry, QualityReport } from "./types/index.js";
+import type { AnalysisConfig, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, ParseIssue, PersistedAnalysisReport, QualityDiffReport, QualityMetricDiffEntry, QualityReport } from "./types/index.js";
 
 interface RunArtifacts {
   results: AnalysisResult[];
@@ -16,6 +16,7 @@ interface RunArtifacts {
   graphMetrics: GraphMetrics;
   analysisCacheStats: CacheStats;
   incrementalStats: IncrementalStats;
+  parseIssues: ParseIssue[];
 }
 
 function printHelp(): void {
@@ -90,10 +91,19 @@ async function buildArtifacts(
   const graphBuilder = new GraphBuilder();
   const results: AnalysisResult[] = [];
   const allResults: AnalysisResult[] = [];
+  const parseIssues: ParseIssue[] = [];
 
   for (const parsedFile of fullScanResult.parsed) {
     const analysisContextHash = dependencyAnalyzer.getAnalysisContextHash(parsedFile.filePath);
     const cached = analysisCache.get(parsedFile.filePath, parsedFile.metadata.sha256, analysisContextHash);
+    // parseDiagnosticCount へのアクセスは遅延パースを起動するため、キャッシュヒット時は
+    // キャッシュ済みの値を使い、AST を生成しない
+    const parseDiagnosticCount = cached
+      ? cached.parseDiagnosticCount ?? 0
+      : parsedFile.metadata.parseDiagnosticCount;
+    if (parseDiagnosticCount > 0 && scopedFilePaths.has(parsedFile.filePath)) {
+      parseIssues.push({ filePath: parsedFile.filePath, diagnosticCount: parseDiagnosticCount });
+    }
     const result = cached
       ? {
           filePath: parsedFile.filePath,
@@ -114,6 +124,7 @@ async function buildArtifacts(
             complexity,
             dependencies: dependencyResult.dependencies,
             dependencyErrors: dependencyResult.errors,
+            parseDiagnosticCount: parsedFile.metadata.parseDiagnosticCount,
           });
           return freshResult;
         })();
@@ -194,6 +205,7 @@ async function buildArtifacts(
       reusedFiles: analysisCache.getStats().hits,
       recomputedFiles: analysisCache.getStats().misses,
     },
+    parseIssues,
   };
 }
 
@@ -216,12 +228,7 @@ async function analyzeProject(projectDir: string, config: AnalysisConfig): Promi
       projectRoot: projectDir,
       skippedFiles: artifacts.scanResult.skipped,
       scanErrors: artifacts.scanResult.errors,
-      parseIssues: artifacts.scanResult.parsed
-        .filter((parsedFile) => parsedFile.metadata.parseDiagnosticCount > 0)
-        .map((parsedFile) => ({
-          filePath: parsedFile.filePath,
-          diagnosticCount: parsedFile.metadata.parseDiagnosticCount,
-        })),
+      parseIssues: artifacts.parseIssues,
       cacheStats: artifacts.scanResult.cacheStats,
       analysisCacheStats: artifacts.analysisCacheStats,
       incrementalStats: artifacts.incrementalStats,
@@ -300,12 +307,7 @@ async function diffProject(projectDir: string, config: AnalysisConfig, baselineP
       projectRoot: projectDir,
       skippedFiles: artifacts.scanResult.skipped,
       scanErrors: artifacts.scanResult.errors,
-      parseIssues: artifacts.scanResult.parsed
-        .filter((parsedFile) => parsedFile.metadata.parseDiagnosticCount > 0)
-        .map((parsedFile) => ({
-          filePath: parsedFile.filePath,
-          diagnosticCount: parsedFile.metadata.parseDiagnosticCount,
-        })),
+      parseIssues: artifacts.parseIssues,
       cacheStats: artifacts.scanResult.cacheStats,
       analysisCacheStats: artifacts.analysisCacheStats,
       incrementalStats: artifacts.incrementalStats,

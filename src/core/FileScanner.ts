@@ -187,21 +187,31 @@ export class FileScanner {
     }
 
     const scriptKind = this.detectScriptKind(filePath);
-    const sourceFile = ts.createSourceFile(
-      filePath,
-      sourceCode,
-      ts.ScriptTarget.Latest,
-      true,
-      scriptKind,
-    );
-
-    const parseDiagnostics = (sourceFile as ts.SourceFile & {
-      parseDiagnostics?: ts.DiagnosticWithLocation[];
-    }).parseDiagnostics ?? [];
+    // AST は初回アクセス時に生成する。解析キャッシュにヒットしたファイルは
+    // AST を一度も使わないため、遅延化で warm 実行のパースコストを省く。
+    let lazySourceFile: ts.SourceFile | undefined;
+    let lazyParseDiagnosticCount = 0;
+    const parseSource = (): ts.SourceFile => {
+      if (!lazySourceFile) {
+        lazySourceFile = ts.createSourceFile(
+          filePath,
+          sourceCode,
+          ts.ScriptTarget.Latest,
+          true,
+          scriptKind,
+        );
+        lazyParseDiagnosticCount = ((lazySourceFile as ts.SourceFile & {
+          parseDiagnostics?: ts.DiagnosticWithLocation[];
+        }).parseDiagnostics ?? []).length;
+      }
+      return lazySourceFile;
+    };
 
     const parsed: ParsedFile = {
       filePath,
-      sourceFile,
+      get sourceFile(): ts.SourceFile {
+        return parseSource();
+      },
       sourceCode,
       metadata: {
         lineCount: sourceCode.split(/\r?\n/u).length,
@@ -212,7 +222,10 @@ export class FileScanner {
         encoding: hasBom ? "utf-8-bom" : "utf-8",
         scriptKind,
         sha256,
-        parseDiagnosticCount: parseDiagnostics.length,
+        get parseDiagnosticCount(): number {
+          parseSource();
+          return lazyParseDiagnosticCount;
+        },
       },
     };
 
