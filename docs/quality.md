@@ -44,7 +44,7 @@ JUnit XML がなく Vitest だけが検出された場合、Unit テスト通過
 
 ## quality gate が失敗する条件
 
-`quality gate` は次のとき終了コード `2` で失敗します。
+`quality gate` は次のとき終了コード `2` で失敗します。判定結果と阻害指標は `*_quality_report.md` の「要点」先頭に「ゲート判定: FAIL（阻害指標一覧）」として出力されるため、ログを見なくてもレポートだけで原因が分かります。
 
 1. 自動判定 `FAIL` の親指標が 1 件でもある
 2. `--baseline` 指定時、親指標の自動判定が前回より悪化した (`pass -> warn` や `warn -> fail`)
