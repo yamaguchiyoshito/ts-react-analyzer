@@ -4480,8 +4480,10 @@ test("ReportGenerator separates expected and unexpected scan notes and formats a
   assert.match(markdownReport, /\| 1 \| src\/features\/order\/OrderPage\.tsx \| Critical \| 構造 \| 141 \|/u);
   assert.match(markdownReport, /- \*\*対象\*\*: src\/features\/order\/OrderPage\.tsx/u);
   assert.match(markdownReport, /- \*\*score帯\*\*: Critical/u);
-  assert.match(markdownReport, /- \*\*複雑度内訳\*\*: weighted=17, peakFn=7, top3avg=6, nesting=3, hookPressure=2/u);
-  assert.match(markdownReport, /- \*\*推奨対応\*\*: explicit anyの除去 \+ unsafe castの局所化/u);
+  assert.match(markdownReport, /- \*\*複雑度内訳\*\*: weighted=17, peakFn=7 \(c, 21行目\), top3avg=6, nesting=3, hookPressure=2/u);
+  // 主因が「構造」(依存 12 件) なので、推奨対応も構造側の処方が出る
+  assert.match(markdownReport, /- \*\*推奨対応\*\*: 依存境界の分割 \+ fan-out削減/u);
+  assert.match(markdownReport, /- \*\*内訳の見方\*\*: weighted=ファイル代表値/u);
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });

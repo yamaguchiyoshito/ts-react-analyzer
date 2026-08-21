@@ -9,6 +9,7 @@ import type {
   CacheStats,
   DecisionSummaryReport,
   Dependency,
+  FunctionMetrics,
   GenerationOptions,
   GraphJSON,
   GraphMetrics,
@@ -348,6 +349,7 @@ export class ReportGenerator {
       markdown += `- **クラスタ**: ${primary.cluster}\n`;
       markdown += `- **複雑度内訳**: ${primary.complexityDrivers!.join(", ")}\n`;
       markdown += `- **推奨対応**: ${primary.action}\n`;
+      markdown += "- **内訳の見方**: weighted=ファイル代表値 / peakFn=最も複雑な関数 / top3avg=上位3関数の平均 / nesting=最大ネスト深度 / hookPressure=コンポーネントあたりHooks数 / elevatedFns=複雑度5以上または深いネストの関数数\n";
       markdown += "\n";
     }
     return markdown;
@@ -375,7 +377,7 @@ export class ReportGenerator {
       "",
       "### 判定基準",
       "",
-      `- **複雑度**: 平均 / 最大 / 上位3関数平均 / ネスト深度 / render分岐 / hook圧の重み付きスコア（低<=${LOW_COMPLEXITY_MAX}, 中<=${MEDIUM_COMPLEXITY_MAX}）`,
+      `- **複雑度**: 平均 / 最大 / 上位3関数平均 / ネスト深度 / render分岐 / hook圧の重み付きスコア（低<=${LOW_COMPLEXITY_MAX}, 中<=${MEDIUM_COMPLEXITY_MAX}）。関数単体の複雑度は分岐数ベースの循環的複雑度で、10 を超えたら分割を検討してください`,
       "- **構造**: 依存数・Hooks 数・コード行数ベース",
       "- **型安全性**: any / assertion / non-null / ts-ignore の重み付きスコアベース",
     ].join("\n");
@@ -687,48 +689,60 @@ export class ReportGenerator {
       }
     }
 
+    // 閾値未満の行を機械的に埋めると「outDegree=0 なのに依存先が多い」のような
+    // 虚偽の含意が出るため、意味のある値だけを表示する
+    const hubEntries = this.graphMetrics.topInDegree.filter((entry) => entry.degree >= 2).slice(0, 3);
+    const fanOutEntries = this.graphMetrics.topOutDegree.filter((entry) => entry.degree >= 3).slice(0, 3);
+    const pageRankScores = this.graphMetrics.topPageRank.map((entry) => entry.score);
+    const minTopPageRank = pageRankScores.length > 0 ? Math.min(...pageRankScores) : 0;
+    const centralEntries = this.graphMetrics.topPageRank
+      .filter((entry) => pageRankScores.length > 1 && entry.score > minTopPageRank)
+      .slice(0, 3);
+
     const structureRows = [
-      ...this.graphMetrics.topInDegree.slice(0, 3).map((entry) => ({
+      ...hubEntries.map((entry) => ({
         aspect: "ハブ",
         file: this.toDisplayPath(entry.id),
         metric: `inDegree=${entry.degree}`,
-        implication: "被依存が多く、変更波及が大きい",
+        implication: `${entry.degree} モジュールから参照されており、変更の波及が大きい`,
       })),
-      ...this.graphMetrics.topOutDegree.slice(0, 3).map((entry) => ({
+      ...fanOutEntries.map((entry) => ({
         aspect: "fan-out",
         file: this.toDisplayPath(entry.id),
         metric: `outDegree=${entry.degree}`,
-        implication: "依存先が多く、責務分割候補",
+        implication: `${entry.degree} モジュールに依存しており、責務分割の候補`,
       })),
-      ...this.graphMetrics.topPageRank.slice(0, 3).map((entry) => ({
+      ...centralEntries.map((entry) => ({
         aspect: "影響中心",
         file: this.toDisplayPath(entry.id),
         metric: `pageRank=${entry.score.toFixed(4)}`,
-        implication: "グラフ全体の中心に近い",
+        implication: "依存グラフの中心に近く、変更が広く波及しやすい",
       })),
     ];
 
+    markdown += "### 構造上位\n\n";
+    markdown += "ハブ・fan-out・中心性のうち、注意が必要な水準のものだけを表示します。\n\n";
     if (structureRows.length > 0) {
-      markdown += "### 構造上位\n\n";
-      markdown += "ハブ・fan-out・中心性の上位だけを一表に圧縮しています。\n\n";
       markdown += "| 観点 | ファイル | 指標 | 含意 |\n";
       markdown += "|------|----------|------|------|\n";
       for (const row of structureRows) {
         markdown += `| ${row.aspect} | ${row.file} | ${row.metric} | ${row.implication} |\n`;
       }
       markdown += "\n";
+    } else {
+      markdown += "注意水準 (inDegree>=2, outDegree>=3) に達するハブ・fan-out はありません。\n\n";
     }
 
-    const topInDegree = this.graphMetrics.topInDegree[0];
-    const topOutDegree = this.graphMetrics.topOutDegree[0];
-    const topPageRank = this.graphMetrics.topPageRank[0];
+    const topInDegree = hubEntries[0];
+    const topOutDegree = fanOutEntries[0];
+    const topPageRank = centralEntries[0];
     if (topInDegree || topOutDegree || topPageRank) {
       markdown += "### 構造解釈\n\n";
       if (topInDegree) {
-        markdown += `- ハブ化: ${this.toDisplayPath(topInDegree.id)} が最も参照される共通依存です。\n`;
+        markdown += `- ハブ化: ${this.toDisplayPath(topInDegree.id)} が最も参照される共通依存です (${topInDegree.degree} モジュールから参照)。\n`;
       }
       if (topOutDegree) {
-        markdown += `- fan-out過多: ${this.toDisplayPath(topOutDegree.id)} が最も多くの依存先を持つ起点です。\n`;
+        markdown += `- fan-out過多: ${this.toDisplayPath(topOutDegree.id)} が最も多くの依存先を持つ起点です (${topOutDegree.degree} モジュールに依存)。\n`;
       }
       if (topPageRank) {
         markdown += `- 影響中心: ${this.toDisplayPath(topPageRank.id)} を変更すると波及しやすい構造です。\n`;
@@ -905,7 +919,9 @@ export class ReportGenerator {
 
   private describeFileTypeRisk(fileType: string, averageComplexity: number, count: number): string {
     if (averageComplexity >= 10) {
-      return `${fileType} が高複雑度です。件数 ${count} 件のため横断対応が必要です。`;
+      return count >= 5
+        ? `${fileType} が高複雑度です。${count} 件に広がっているため横断的な設計見直しが必要です。`
+        : `${fileType} が高複雑度です。件数 ${count} 件なので該当ファイルの分割で収束します。`;
     }
     if (count >= 10) {
       return `${fileType} が多数派です。小さな設計崩れでも波及しやすい状態です。`;
@@ -1383,19 +1399,38 @@ export class ReportGenerator {
   }
 
   private buildHotSpotAction(result: AnalysisResult, dependencies: number, anyCount: number, hooks: number): string {
-    if (anyCount > 0) {
-      return "explicit anyの除去 + unsafe castの局所化";
+    // 推奨対応は「主因」列と同じ軸判定から導く。any があるだけで any 除去を
+    // 最優先にすると、主因が複雑度のファイルへ的外れな処方が出る。
+    const axis = this.getPrimaryRiskAxisLabel(result.filePath);
+    const peakFunction = result.complexity.functions.reduce<FunctionMetrics | null>(
+      (max, metric) => (!max || metric.cyclomaticComplexity > max.cyclomaticComplexity ? metric : max),
+      null,
+    );
+
+    if (axis === "型安全性") {
+      return anyCount > 0
+        ? "explicit anyの除去 + unsafe castの局所化"
+        : "型アサーション / non-null assertion の除去";
+    }
+    if (axis === "複雑度") {
+      if (peakFunction && peakFunction.cyclomaticComplexity >= 8) {
+        return `最複雑関数 ${peakFunction.name} (複雑度${peakFunction.cyclomaticComplexity}, ${peakFunction.startLine}行目) の分割`;
+      }
+      if (hooks >= 2 && result.complexity.components.length > 0) {
+        return "hook分割 + render分岐の分離";
+      }
+      if (result.complexity.functions.length > 0) {
+        return "大関数の分割 + 補助関数の抽出";
+      }
+      return "render分岐の分離 + サブコンポーネント化";
     }
     if (dependencies >= 5) {
       return "依存境界の分割 + fan-out削減";
     }
-    if (hooks >= 2 && result.complexity.components.length > 0) {
-      return "hook分割 + render分岐の分離";
+    if (result.complexity.components.length > 0) {
+      return "サブコンポーネント化 + shared helper抽出";
     }
-    if (result.complexity.functions.length >= 3) {
-      return "大関数の分割 + 補助関数の抽出";
-    }
-    return "サブコンポーネント化 + shared helper抽出";
+    return "依存の整理と責務の明確化";
   }
 
   private buildComplexityDrivers(result: AnalysisResult): string[] {
@@ -1403,6 +1438,10 @@ export class ReportGenerator {
     const functionComplexities = result.complexity.functions
       .map((metric) => metric.cyclomaticComplexity)
       .sort((left, right) => right - left);
+    const peakFunction = result.complexity.functions.reduce<FunctionMetrics | null>(
+      (max, metric) => (!max || metric.cyclomaticComplexity > max.cyclomaticComplexity ? metric : max),
+      null,
+    );
     const peakFunctionComplexity = functionComplexities[0] ?? breakdown?.peakFunctionComplexity ?? 0;
     const topFunctionAverage = functionComplexities.length > 0
       ? functionComplexities.slice(0, 3).reduce((sum, value) => sum + value, 0) / Math.min(functionComplexities.length, 3)
@@ -1429,7 +1468,9 @@ export class ReportGenerator {
       : result.complexity.overallComplexity;
 
     const drivers = [`weighted=${this.formatMetric(weightedScore)}`];
-    if (peakFunctionComplexity > 0) {
+    if (peakFunction && peakFunction.cyclomaticComplexity > 0) {
+      drivers.push(`peakFn=${peakFunction.cyclomaticComplexity} (${peakFunction.name}, ${peakFunction.startLine}行目)`);
+    } else if (peakFunctionComplexity > 0) {
       drivers.push(`peakFn=${peakFunctionComplexity}`);
     }
     if (functionComplexities.length >= 2) {
