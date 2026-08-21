@@ -1369,6 +1369,61 @@ test("QualityReportGenerator uses JUnit executed test files as runtime evidence"
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
 
+test("QualityReportGenerator counts retried flaky Playwright tests as passed", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-playwright-flaky-"));
+  const outputDir = path.join(projectRoot, "out");
+  const reportDir = path.join(projectRoot, "playwright-report");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.mkdir(reportDir, { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "value.ts"), "export const value = 1;\n", "utf8");
+  await fs.writeFile(path.join(reportDir, "results.json"), JSON.stringify({
+    tests: [
+      {
+        location: { file: "tests/e2e/a.spec.ts" },
+        status: "flaky",
+        results: [{ status: "failed" }, { status: "passed" }],
+      },
+      {
+        location: { file: "tests/e2e/b.spec.ts" },
+        status: "expected",
+        results: [{ status: "passed" }],
+      },
+    ],
+  }, null, 2), "utf8");
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: [],
+    parsedFiles: [],
+    graphMetrics: createEmptyGraphMetrics(),
+    executionTimeMs: 10,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "flaky",
+    formats: ["json"],
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const e2eMetric = testCategory?.metrics.find((metric) => metric.id === "e2e_pass_rate");
+
+  // リトライで最終的に成功した flaky は failed に数えない
+  assert.equal(e2eMetric?.actual, "100.0%");
+  assert.equal(e2eMetric?.verdict, "pass");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
 test("QualityReportGenerator uses Playwright executed test files as runtime evidence", async () => {
   const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-playwright-runtime-"));
   const outputDir = path.join(projectRoot, "out");
