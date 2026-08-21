@@ -4854,11 +4854,16 @@ test("CLI diff command writes diff reports against a baseline report", async () 
   assert.match(diffHtml, /Added Hot Spots/u);
   assert.match(diffHtml, /Removed Hot Spots/u);
   assert.match(diffHtml, /weighted=\+/u);
-  assert.match(diffMarkdown, /## Hot Spot Delta/u);
-  assert.match(diffMarkdown, /src\/App\.tsx scoreDelta=/u);
+  assert.match(diffMarkdown, /# 差分レポート（baseline 比較）/u);
+  assert.match(diffMarkdown, /- \*\*影響判定/u);
+  assert.match(diffMarkdown, /## Hot Spot 差分/u);
+  assert.match(diffMarkdown, /\| src\/App\.tsx \| \+?-?\d+ \|/u);
   assert.match(diffMarkdown, /drivers=weighted=/u);
-  assert.match(diffMarkdown, /complexityPressure=/u);
+  assert.match(diffMarkdown, /### 優先対応（影響度スコア順）/u);
+  assert.match(diffMarkdown, /\| ファイル \| score \| 距離 \| 被依存 \| 依存 \| 複雑度圧 \| 理由 \|/u);
   assert.match(diffMarkdown, /weighted=\+/u);
+  // 絶対パスの生出力と、見出しなしの波及先一覧の重複出力が無いこと
+  assert.doesNotMatch(diffMarkdown, /^- \/(?:tmp|home|var)\//mu);
 
   await fs.rm(tempProject, { recursive: true, force: true });
 });

@@ -316,7 +316,10 @@ async function diffProject(projectDir: string, config: AnalysisConfig, baselineP
     const currentReport = JSON.parse(await fs.readFile(currentReportPath, "utf8")) as PersistedAnalysisReport;
     const diffGenerator = new DiffGenerator();
     const diff = diffGenerator.compare(currentReport, baseline, baselinePath, currentReportPath);
-    await diffGenerator.writeReports(diff, config.outputDir, config.filePrefix);
+    await diffGenerator.writeReports(diff, config.outputDir, config.filePrefix, {
+      projectRoot: projectDir,
+      impactScoreThreshold: config.impactScoreThreshold,
+    });
 
     const thresholdViolations = config.impactScoreThreshold > 0
       ? diff.impact.prioritizedFiles.filter((item) => item.score >= config.impactScoreThreshold)

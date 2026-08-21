@@ -11,6 +11,19 @@ import type {
   PersistedFileReport,
 } from "../types/index.js";
 
+export interface DiffRenderOptions {
+  projectRoot?: string;
+  impactScoreThreshold?: number;
+}
+
+const IMPACT_REASON_LABELS: Record<string, string> = {
+  changed: "変更ファイル",
+  "adjacent-to-change": "変更に隣接",
+  "within-2-hops": "変更から2ホップ以内",
+  "high-fan-in": "被依存が多い",
+  "high-fan-out": "依存が多い",
+};
+
 export class DiffGenerator {
   compare(
     current: PersistedAnalysisReport,
@@ -54,11 +67,16 @@ export class DiffGenerator {
     };
   }
 
-  async writeReports(diff: AnalysisDiffReport, outputDir: string, prefix: string): Promise<void> {
+  async writeReports(
+    diff: AnalysisDiffReport,
+    outputDir: string,
+    prefix: string,
+    options: DiffRenderOptions = {},
+  ): Promise<void> {
     await fs.mkdir(outputDir, { recursive: true });
     await fs.writeFile(path.join(outputDir, `${prefix}_diff.json`), JSON.stringify(diff, null, 2), "utf8");
-    await fs.writeFile(path.join(outputDir, `${prefix}_diff.md`), this.toMarkdown(diff), "utf8");
-    await fs.writeFile(path.join(outputDir, `${prefix}_diff.html`), this.toHtml(diff), "utf8");
+    await fs.writeFile(path.join(outputDir, `${prefix}_diff.md`), this.toMarkdown(diff, options), "utf8");
+    await fs.writeFile(path.join(outputDir, `${prefix}_diff.html`), this.toHtml(diff, options), "utf8");
   }
 
   private compareFile(pathname: string, current?: PersistedFileReport, baseline?: PersistedFileReport) {
@@ -106,48 +124,50 @@ export class DiffGenerator {
     return [...added, ...removed];
   }
 
-  private toMarkdown(diff: AnalysisDiffReport): string {
+  private toMarkdown(diff: AnalysisDiffReport, options: DiffRenderOptions = {}): string {
+    const display = (filePath: string): string => this.toRenderDisplayPath(filePath, options.projectRoot);
     const changedFiles = diff.files.filter((file) => file.status !== "unchanged");
-    let markdown = "# Analysis Diff Report\n\n";
-    markdown += `- Baseline: ${diff.baselinePath}\n`;
-    markdown += `- Current: ${diff.currentPath}\n`;
-    markdown += `- Generated At: ${diff.generatedAt}\n\n`;
+    const threshold = options.impactScoreThreshold ?? 0;
+    const violations = threshold > 0
+      ? diff.impact.prioritizedFiles.filter((item) => item.score >= threshold)
+      : [];
+    const maxScore = diff.impact.prioritizedFiles.reduce((max, item) => Math.max(max, item.score), 0);
+    const statusLabel: Record<string, string> = { added: "追加", removed: "削除", changed: "変更" };
 
-    markdown += "## Summary\n\n";
-    markdown += `- Added Files: ${diff.summary.addedFiles}\n`;
-    markdown += `- Removed Files: ${diff.summary.removedFiles}\n`;
-    markdown += `- Changed Files: ${diff.summary.changedFiles}\n`;
-    markdown += `- Unchanged Files: ${diff.summary.unchangedFiles}\n`;
-    markdown += `- Average Complexity Delta: ${diff.summary.complexityDelta.toFixed(2)}\n`;
-    markdown += `- Dependency Delta: ${diff.summary.dependencyDelta}\n\n`;
+    let markdown = "# 差分レポート（baseline 比較）\n\n";
+    markdown += `${this.buildImpactVerdictLine(diff, violations.length, threshold, maxScore)}\n`;
+    markdown += `- 変更ファイル: 追加 ${diff.summary.addedFiles} / 削除 ${diff.summary.removedFiles} / 変更 ${diff.summary.changedFiles} / 変更なし ${diff.summary.unchangedFiles}\n`;
+    markdown += `- 平均複雑度差分: ${this.formatSigned(diff.summary.complexityDelta, 2)}\n`;
+    markdown += `- 依存総数差分: ${this.formatSigned(diff.graphDelta.dependencyDelta)}\n`;
+    markdown += `- baseline: ${display(diff.baselinePath)}\n`;
+    markdown += `- 生成時刻: ${diff.generatedAt}\n\n`;
+    markdown += "score は「変更ファイルからの距離・被依存数・複雑度の変化」を合成した影響度です。`--impact-threshold`（CI 既定 60）以上を要注意とみなします。\n\n";
 
-    markdown += "## Graph Delta\n\n";
-    markdown += `- Cycle Delta: ${diff.graphDelta.cycleDelta}\n`;
-    markdown += `- Dependency Delta: ${diff.graphDelta.dependencyDelta}\n`;
+    markdown += "## グラフ差分\n\n";
+    markdown += `- 循環依存差分: ${this.formatSigned(diff.graphDelta.cycleDelta)}\n`;
+    markdown += `- 依存総数差分: ${this.formatSigned(diff.graphDelta.dependencyDelta)}\n`;
     if (diff.graphDelta.warningDelta.length > 0) {
-      markdown += diff.graphDelta.warningDelta.map((warning) => `- ${warning}`).join("\n");
-      markdown += "\n\n";
+      markdown += `- 警告差分:\n${diff.graphDelta.warningDelta.map((warning) => `  - ${warning}`).join("\n")}\n\n`;
     } else {
-      markdown += "- Warning Delta: none\n\n";
+      markdown += "- 警告差分: なし\n\n";
     }
 
-    markdown += "## Hot Spot Delta\n\n";
-    markdown += `- Added Hot Spots: ${diff.hotSpotDelta.added.length}\n`;
-    markdown += `- Removed Hot Spots: ${diff.hotSpotDelta.removed.length}\n`;
-    markdown += `- Changed Hot Spots: ${diff.hotSpotDelta.changed.length}\n\n`;
+    markdown += "## Hot Spot 差分\n\n";
+    markdown += `- 変動 ${diff.hotSpotDelta.changed.length} 件 / 新規 ${diff.hotSpotDelta.added.length} 件 / 解消 ${diff.hotSpotDelta.removed.length} 件\n\n`;
     if (diff.hotSpotDelta.changed.length > 0) {
+      markdown += "### 変動した Hot Spot\n\n";
+      markdown += "| ファイル | scoreΔ | 複雑度Δ | 依存Δ | anyΔ | クラスタ | 内訳変化 |\n";
+      markdown += "|----------|--------|---------|-------|------|----------|----------|\n";
       for (const item of diff.hotSpotDelta.changed.slice(0, 10)) {
-        markdown += `- ${item.currentDisplayPath} scoreDelta=${item.scoreDelta} complexityDelta=${item.complexityDelta} dependencyDelta=${item.dependencyDelta} anyDelta=${item.anyDelta} cluster=${item.clusterBefore}->${item.clusterAfter}\n`;
-        if ((item.complexityDriverDelta?.length ?? 0) > 0) {
-          markdown += `  drivers=${item.complexityDriverDelta!.join(", ")}\n`;
-        }
+        const drivers = (item.complexityDriverDelta?.length ?? 0) > 0 ? `drivers=${item.complexityDriverDelta!.join(", ")}` : "—";
+        markdown += `| ${item.currentDisplayPath} | ${this.formatSigned(item.scoreDelta)} | ${this.formatSigned(item.complexityDelta)} | ${this.formatSigned(item.dependencyDelta)} | ${this.formatSigned(item.anyDelta)} | ${item.clusterBefore}->${item.clusterAfter} | ${drivers} |\n`;
       }
       markdown += "\n";
     }
     if (diff.hotSpotDelta.added.length > 0) {
-      markdown += "### Added Hot Spots\n\n";
+      markdown += "### 新たに Hot Spot 入り\n\n";
       for (const item of diff.hotSpotDelta.added.slice(0, 10)) {
-        markdown += `- ${item.displayPath} score=${item.score} cluster=${item.cluster}\n`;
+        markdown += `- ${item.displayPath} score=${item.score} クラスタ=${item.cluster}\n`;
         if ((item.complexityDrivers?.length ?? 0) > 0) {
           markdown += `  drivers=${item.complexityDrivers!.join(", ")}\n`;
         }
@@ -155,65 +175,102 @@ export class DiffGenerator {
       markdown += "\n";
     }
     if (diff.hotSpotDelta.removed.length > 0) {
-      markdown += "### Removed Hot Spots\n\n";
+      markdown += "### Hot Spot 解消\n\n";
       for (const item of diff.hotSpotDelta.removed.slice(0, 10)) {
-        markdown += `- ${item.displayPath} score=${item.score} cluster=${item.cluster}\n`;
-        if ((item.complexityDrivers?.length ?? 0) > 0) {
-          markdown += `  drivers=${item.complexityDrivers!.join(", ")}\n`;
-        }
+        markdown += `- ${item.displayPath} score=${item.score} クラスタ=${item.cluster}\n`;
       }
       markdown += "\n";
     }
 
-    markdown += "## Changed Subtree\n\n";
-    markdown += `- Changed Files: ${diff.impact.changedFiles.length}\n`;
-    markdown += `- Impacted Files: ${diff.impact.impactedFiles.length}\n\n`;
+    markdown += "## 影響範囲\n\n";
+    markdown += `- 変更ファイル ${diff.impact.changedFiles.length} 件から、${diff.impact.impactedFiles.length} 件への波及を検出しました。\n`;
+    markdown += "- 波及先の全一覧は JSON レポートの `impact.impactedFiles` を参照してください。\n\n";
     if (diff.impact.prioritizedFiles.length > 0) {
-      markdown += "### Prioritized Impacted Files\n\n";
+      markdown += "### 優先対応（影響度スコア順）\n\n";
+      markdown += "| ファイル | score | 距離 | 被依存 | 依存 | 複雑度圧 | 理由 |\n";
+      markdown += "|----------|-------|------|--------|------|----------|------|\n";
       for (const item of diff.impact.prioritizedFiles.slice(0, 10)) {
-        markdown += `- ${item.path} score=${item.score} distance=${item.distance} inbound=${item.inboundDegree} outbound=${item.outboundDegree} complexityPressure=${item.complexityPressure}`;
-        if (item.reasons.length > 0) {
-          markdown += ` reasons=${item.reasons.join(",")}`;
-        }
-        markdown += "\n";
+        const reasons = item.reasons.length > 0
+          ? item.reasons.map((reason) => IMPACT_REASON_LABELS[reason] ?? reason).join("、")
+          : "—";
+        markdown += `| ${display(item.path)} | ${item.score} | ${item.distance} | ${item.inboundDegree} | ${item.outboundDegree} | ${item.complexityPressure} | ${reasons} |\n`;
       }
       markdown += "\n";
     }
-    if (diff.impact.impactedFiles.length > 0) {
-      markdown += diff.impact.impactedFiles.map((file) => `- ${file}`).join("\n");
-      markdown += "\n\n";
-    }
 
-    markdown += "## Changed Files\n\n";
+    markdown += "## 変更ファイル\n\n";
     if (changedFiles.length === 0) {
-      markdown += "No file-level changes.\n";
+      markdown += "ファイル単位の変更はありません。\n";
       return markdown;
     }
 
+    markdown += "| ファイル | 状態 | 複雑度Δ | 依存Δ | 警告差分 |\n";
+    markdown += "|----------|------|---------|-------|----------|\n";
     for (const file of changedFiles) {
-      markdown += `- ${file.path} [${file.status}] complexityDelta=${file.complexityDelta} dependencyDelta=${file.dependencyDelta}`;
-      if (file.warningDelta.length > 0) {
-        markdown += ` warnings=${file.warningDelta.join(",")}`;
-      }
-      markdown += "\n";
+      const warnings = file.warningDelta.length > 0 ? file.warningDelta.join("、") : "—";
+      markdown += `| ${display(file.path)} | ${statusLabel[file.status] ?? file.status} | ${this.formatSigned(file.complexityDelta)} | ${this.formatSigned(file.dependencyDelta)} | ${warnings} |\n`;
     }
 
     return markdown;
   }
 
-  private toHtml(diff: AnalysisDiffReport): string {
+  private buildImpactVerdictLine(
+    diff: AnalysisDiffReport,
+    violationCount: number,
+    threshold: number,
+    maxScore: number,
+  ): string {
+    const changeCount = diff.summary.addedFiles + diff.summary.removedFiles + diff.summary.changedFiles;
+    if (changeCount === 0) {
+      return "- **影響判定: 変更なし** — baseline との差分はありません";
+    }
+    if (threshold > 0 && violationCount > 0) {
+      return `- **影響判定: ⚠ 要注意** — 影響度スコア ${threshold} 以上のファイルが ${violationCount} 件あります（最大 score ${maxScore}）`;
+    }
+    if (threshold > 0) {
+      return `- **影響判定: 問題なし** — 影響度スコアが閾値 ${threshold} を超えるファイルはありません（最大 score ${maxScore}）`;
+    }
+    return `- **影響判定**: 最大影響度スコア ${maxScore}（閾値未設定のため参考値）`;
+  }
+
+  private formatSigned(value: number, digits = 0): string {
+    const formatted = digits > 0 ? value.toFixed(digits) : String(value);
+    return value > 0 ? `+${formatted}` : formatted;
+  }
+
+  private toRenderDisplayPath(filePath: string, projectRoot?: string): string {
+    const normalized = filePath.split(path.sep).join("/");
+    if (!projectRoot || !path.isAbsolute(filePath)) {
+      return normalized;
+    }
+    const relative = path.relative(projectRoot, filePath);
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+      return normalized;
+    }
+    return relative.split(path.sep).join("/");
+  }
+
+  private toHtml(diff: AnalysisDiffReport, options: DiffRenderOptions = {}): string {
     const changedSet = new Set(diff.impact.changedFiles);
     const impactedSet = new Set(diff.impact.impactedFiles);
+    const threshold = options.impactScoreThreshold ?? 0;
+    const violations = threshold > 0
+      ? diff.impact.prioritizedFiles.filter((item) => item.score >= threshold)
+      : [];
+    const maxScore = diff.impact.prioritizedFiles.reduce((max, item) => Math.max(max, item.score), 0);
+    const verdictText = this.buildImpactVerdictLine(diff, violations.length, threshold, maxScore)
+      .replace(/^[-\s]*/u, "")
+      .replace(/\*\*/gu, "");
     const rows = diff.files
       .filter((file) => file.status !== "unchanged")
       .map((file) => {
         const warningDelta = file.warningDelta.length > 0 ? file.warningDelta.join(", ") : "";
-        return `<tr class="${file.status}"><td><a href="${this.toFileHref(file.path)}">${this.escapeHtml(file.path)}</a></td><td>${file.status}</td><td>${file.complexityDelta}</td><td>${file.dependencyDelta}</td><td>${this.escapeHtml(warningDelta)}</td></tr>`;
+        return `<tr class="${file.status}" data-file="${this.escapeHtml(file.path)}"><td><a href="${this.toFileHref(file.path)}">${this.escapeHtml(this.toRenderDisplayPath(file.path, options.projectRoot))}</a></td><td>${file.status}</td><td>${file.complexityDelta}</td><td>${file.dependencyDelta}</td><td>${this.escapeHtml(warningDelta)}</td></tr>`;
       })
       .join("\n");
     const warningDelta = diff.graphDelta.warningDelta.length > 0
       ? diff.graphDelta.warningDelta.map((warning) => `<li>${this.escapeHtml(warning)}</li>`).join("")
-      : "<li>none</li>";
+      : "<li>Warning Delta: none</li>";
     const hotSpotChanged = diff.hotSpotDelta.changed.length > 0
       ? `<ul>${diff.hotSpotDelta.changed.slice(0, 10).map((item) =>
         `<li><a href="${this.toFileHref(item.path)}">${this.escapeHtml(item.currentDisplayPath)}</a> scoreDelta=${item.scoreDelta} complexityDelta=${item.complexityDelta} dependencyDelta=${item.dependencyDelta} anyDelta=${item.anyDelta} cluster=${this.escapeHtml(item.clusterBefore)}-&gt;${this.escapeHtml(item.clusterAfter)}${this.renderHtmlDriverMeta(item.complexityDriverDelta)}</li>`
@@ -277,6 +334,7 @@ export class DiffGenerator {
 </head>
 <body>
   <h1>Analysis Diff Report</h1>
+  <div class="card" style="margin-bottom:16px;font-weight:600">${this.escapeHtml(verdictText)}</div>
   <div class="meta">
     <div class="card"><strong>Baseline</strong><br /><code>${this.escapeHtml(diff.baselinePath)}</code></div>
     <div class="card"><strong>Current</strong><br /><a href="${this.toFileHref(diff.currentPath)}"><code>${this.escapeHtml(diff.currentPath)}</code></a></div>
@@ -346,7 +404,7 @@ export class DiffGenerator {
     const prioritizedData = ${prioritizedData};
     const changed = new Set(${JSON.stringify(Array.from(changedSet))});
     const impacted = new Set(${JSON.stringify(Array.from(impactedSet))});
-    const changedTableRows = Array.from(document.querySelectorAll("tbody tr"));
+    const changedTableRows = Array.from(document.querySelectorAll("tbody tr[data-file]"));
     const host = document.getElementById("impact-graph");
     const priorityHost = document.getElementById("impact-priority");
     const focusSelect = document.getElementById("impact-focus");
@@ -475,28 +533,25 @@ export class DiffGenerator {
 
     function filterChangedTable(visibleIds) {
       for (const row of changedTableRows) {
-        const link = row.querySelector("a");
-        if (!link) continue;
-        const href = link.getAttribute("href") || "";
-        const decoded = decodeURI(href.replace(/^file:\/\//, ""));
-        row.style.display = visibleIds.has(decoded) ? "" : "none";
+        // visibleIds が null のときは全件表示。行の識別は data-file 属性で行い、
+        // 依存グラフにノードが無い変更ファイルも隠さない。
+        const filePath = row.getAttribute("data-file") || "";
+        row.style.display = visibleIds === null || visibleIds.has(filePath) ? "" : "none";
       }
     }
 
     function applyFocus(root) {
       if (root === "__all__") {
         renderGraph(graphData);
-        const visibleIds = new Set(graphData.nodes.map((node) => node.id));
-        renderList(visibleIds);
-        filterChangedTable(visibleIds);
+        renderList(new Set(graphData.nodes.map((node) => node.id)));
+        filterChangedTable(null);
         return;
       }
       const subtree = subtreeMap.get(root);
       if (!subtree) {
         renderGraph(graphData);
-        const visibleIds = new Set(graphData.nodes.map((node) => node.id));
-        renderList(visibleIds);
-        filterChangedTable(visibleIds);
+        renderList(new Set(graphData.nodes.map((node) => node.id)));
+        filterChangedTable(null);
         return;
       }
       renderGraph(subtree.graph);
