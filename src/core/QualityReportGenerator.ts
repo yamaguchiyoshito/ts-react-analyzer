@@ -6,7 +6,7 @@ import { ApiArtifactAnalyzer } from "./ApiArtifactAnalyzer.js";
 import { BrowserAuditAnalyzer } from "./BrowserAuditAnalyzer.js";
 import { classifyFileType } from "./FileConventions.js";
 import { TestArtifactAnalyzer } from "./TestArtifactAnalyzer.js";
-import { TypeCheckAnalyzer } from "./TypeCheckAnalyzer.js";
+import { TypeCheckAnalyzer, type TypeCheckSummary } from "./TypeCheckAnalyzer.js";
 import { UiTestArtifactAnalyzer } from "./UiTestArtifactAnalyzer.js";
 import { SecurityArtifactAnalyzer } from "./SecurityArtifactAnalyzer.js";
 import type {
@@ -579,7 +579,7 @@ export class QualityReportGenerator {
     ));
 
     return [
-      this.metric("code", "typescript_errors", "TypeScript型エラー数", String(typeCheckSummary.totalErrors), "0", typeCheckVerdict, typeCheckSummary.skippedReason ?? "tsconfig ベースの pre-emit diagnostics を集計しています。", typeCheckSummary.issues.slice(0, 10).map((issue) => this.fileEvidence(`TS${issue.code}`, issue.filePath, `${issue.line}:${issue.character} ${issue.message}`))),
+      this.metric("code", "typescript_errors", "TypeScript型エラー数", String(typeCheckSummary.totalErrors), "0", typeCheckVerdict, typeCheckSummary.skippedReason ?? "tsconfig ベースの pre-emit diagnostics を集計しています。", this.buildTypeCheckEvidence(typeCheckSummary)),
       this.metric("code", "tsconfig_type_safety", "tsconfig型安全設定", strictnessActual, "strict=all configs", strictnessVerdict, strictnessSummary
         ? "strict を主判定とし、noImplicitAny / strictNullChecks / noUncheckedIndexedAccess / exactOptionalPropertyTypes / useUnknownInCatchVariables の補強設定を証跡として集計しています。"
         : "tsconfig 情報が無いため手動確認扱いです。", strictnessEvidence),
@@ -1239,6 +1239,8 @@ export class QualityReportGenerator {
       "",
       `- 総合判定ルール: ${this.describeOverallVerdictRule()}`,
       "- 信頼度: 高=実測/集計, 中=静的推定, 低=手動入力または未収集",
+      "- 集計「親」= カテゴリ判定と件数集計に使う主指標 / 「派生」= 親の内訳や参照 (総合判定には使わない診断情報)",
+      "- カテゴリの PARTIAL は、指標単体の PARTIAL が無くても手動確認待ちが残っている場合に付きます",
       "",
     );
 
@@ -1265,15 +1267,20 @@ export class QualityReportGenerator {
     if (priorityMetrics.length === 0) {
       lines.push("自動判定で直ちに阻害する項目はありません。", "");
     } else {
+      // 列を絞って読める幅に収め、推奨アクションは省略せず表の直下に全文を出す
       lines.push(
-        "| 優先度 | 観点 | 指標 | 判定 | 実績 | 基準 | 証跡種別 | 信頼度 | 主対象 | 推奨アクション | 要点 |",
-        "|--------|------|------|------|------|------|----------|--------|--------|----------------|------|",
+        "| 優先度 | 観点 | 指標 | 判定 | 実績 | 基準 | 主対象 |",
+        "|--------|------|------|------|------|------|--------|",
       );
       priorityMetrics.forEach((entry, index) => {
         const metricLabel = this.shouldRenderDetailedMetric(entry.metric)
           ? `[${entry.metric.label}](#${this.metricAnchor(entry.categoryLabel, entry.metric)})`
           : entry.metric.label;
-        lines.push(`| ${index + 1} | ${entry.categoryLabel} | ${metricLabel} | ${this.verdictLabel(entry.metric.verdict)} | ${this.escapePipe(entry.metric.actual)} | ${this.escapePipe(entry.metric.threshold)} | ${this.describeEvidenceType(entry.metric)} | ${this.describeConfidenceLevel(entry.metric)} | ${this.escapePipe(this.summarizeMetricTargets(entry.metric, 2))} | ${this.escapePipe(this.truncateText(this.recommendMetricAction(entry.metric), 45))} | ${this.escapePipe(this.truncateText(entry.metric.summary, 45))} |`);
+        lines.push(`| ${index + 1} | ${entry.categoryLabel} | ${metricLabel} | ${this.verdictLabel(entry.metric.verdict)} | ${this.escapePipe(entry.metric.actual)} | ${this.escapePipe(entry.metric.threshold)} | ${this.escapePipe(this.summarizeMetricTargets(entry.metric, 2))} |`);
+      });
+      lines.push("", "### 推奨アクション", "");
+      priorityMetrics.forEach((entry, index) => {
+        lines.push(`${index + 1}. **${entry.metric.label}** (${this.verdictLabel(entry.metric.verdict)} ${entry.metric.actual}) — ${this.recommendMetricAction(entry.metric)}`);
       });
       lines.push("");
     }
@@ -1423,12 +1430,13 @@ export class QualityReportGenerator {
         const sortedEvidence = this.sortEvidenceForDisplay(metric.evidence);
         lines.push(`<a id="${this.metricAnchor(category.label, metric)}"></a>`, `#### ${metric.label}`, "", `- 集計: ${metric.aggregation === "derived" ? "派生" : "親"}`, `- 判定: ${this.verdictLabel(metric.verdict)}`, `- 実績: ${metric.actual}`, `- 基準: ${metric.threshold}`, `- 証跡種別: ${this.describeEvidenceType(metric)}`, `- 信頼度: ${this.describeConfidenceLevel(metric)}`, `- 主対象: ${this.summarizeMetricTargets(metric, 3)}`, `- 推奨アクション: ${this.recommendMetricAction(metric)}`, `- 要点: ${metric.summary}`);
         if (metric.evidence.length > 0) {
-          lines.push("- 証跡:");
+          // 「他N件」だけだと実績値 (例: 108 件) との対応が読めないため、分母を明記する
+          lines.push(sortedEvidence.length > 3 ? `- 証跡（代表 3 件 / 収集 ${sortedEvidence.length} 件）:` : "- 証跡:");
           for (const evidence of sortedEvidence.slice(0, 3)) {
             lines.push(`  - ${evidence.label}: ${evidence.value}`);
           }
           if (sortedEvidence.length > 3) {
-            lines.push(`  - 他${sortedEvidence.length - 3}件`);
+            lines.push(`  - 残り ${sortedEvidence.length - 3} 件は JSON レポートを参照`);
           }
         }
         lines.push("");
@@ -3540,6 +3548,36 @@ export class QualityReportGenerator {
       filePath,
       value: value ? `${filePath}: ${value}` : filePath,
     };
+  }
+
+  private buildTypeCheckEvidence(typeCheckSummary: TypeCheckSummary): QualityEvidence[] {
+    if (typeCheckSummary.issues.length === 0) {
+      return [];
+    }
+
+    // 個別 issue の羅列より先にエラーコード別の内訳を出し、実態を掴めるようにする。
+    // モジュール解決系 (TS2307/TS2875 など) は依存未インストールの環境要因であることが
+    // 多いため、その可能性を注記する。
+    const MODULE_RESOLUTION_CODES = new Set([2307, 2792, 2875]);
+    const countsByCode = new Map<number, number>();
+    for (const issue of typeCheckSummary.issues) {
+      countsByCode.set(issue.code, (countsByCode.get(issue.code) ?? 0) + 1);
+    }
+    const breakdown = Array.from(countsByCode.entries())
+      .sort((left, right) => right[1] - left[1] || left[0] - right[0])
+      .map(([code, count]) => `TS${code}: ${count}件`)
+      .join(", ");
+    const evidence: QualityEvidence[] = [this.noteEvidence("エラーコード別内訳", breakdown)];
+    const moduleResolutionCount = typeCheckSummary.issues.filter((issue) => MODULE_RESOLUTION_CODES.has(issue.code)).length;
+    if (moduleResolutionCount > 0) {
+      evidence.push(this.noteEvidence(
+        "注記",
+        `モジュール解決エラー ${moduleResolutionCount} 件は依存パッケージ未インストールなど環境要因の可能性があります`,
+      ));
+    }
+    evidence.push(...typeCheckSummary.issues.slice(0, 10).map((issue) =>
+      this.fileEvidence(`TS${issue.code}`, issue.filePath, `${issue.line}:${issue.character} ${issue.message}`)));
+    return evidence;
   }
 
   private buildBaselineComparisonLine(report: QualityReport): string {

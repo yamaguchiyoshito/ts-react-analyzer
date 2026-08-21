@@ -345,7 +345,12 @@ export class QualityDiffGenerator {
   }
 
   private serializeEvidence(evidence: QualityMetricReport["evidence"]): string[] {
-    return evidence.map((item) => `${item.type}:${item.label}:${item.value}:${item.filePath ?? ""}`);
+    // この文字列は差分検出のキーであると同時にレポートへそのまま表示されるため、
+    // 内部形式の連結ではなく人が読める形にする
+    return evidence.map((item) => {
+      const location = item.filePath && item.filePath !== item.value ? ` (${item.filePath})` : "";
+      return `${item.label}: ${item.value}${location}`;
+    });
   }
 
   private diffStrings(current: string[], baseline: string[]): string[] {
@@ -399,7 +404,9 @@ export class QualityDiffGenerator {
     }
 
     for (const metric of changedMetrics) {
-      markdown += `- [${metric.status}/${metric.trend}] ${metric.categoryLabel} / ${metric.label}: ${metric.changes.join("; ") || "value changed"}\n`;
+      const visibleChanges = metric.changes.slice(0, 5);
+      const remainder = metric.changes.length - visibleChanges.length;
+      markdown += `- [${metric.status}/${metric.trend}] ${metric.categoryLabel} / ${metric.label}: ${visibleChanges.join("; ") || "value changed"}${remainder > 0 ? `; ほか${remainder}件 (JSON 参照)` : ""}\n`;
     }
 
     return markdown;

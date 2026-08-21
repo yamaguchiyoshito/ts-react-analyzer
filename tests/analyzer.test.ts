@@ -740,7 +740,8 @@ test("QualityReportGenerator writes quality outputs with automatic and manual me
   assert.match(markdownReport, /## 不足証跡/u);
   assert.match(markdownReport, /前回比: N\/A（ベースライン未設定）/u);
   assert.match(markdownReport, /\| 観点 \| 自動 \| FAIL \| WARN \| PARTIAL \| 手動 \| 判定 \|/u);
-  assert.match(markdownReport, /\| 優先度 \| 観点 \| 指標 \| 判定 \| 実績 \| 基準 \| 証跡種別 \| 信頼度 \| 主対象 \| 推奨アクション \| 要点 \|/u);
+  assert.match(markdownReport, /\| 優先度 \| 観点 \| 指標 \| 判定 \| 実績 \| 基準 \| 主対象 \|/u);
+  assert.match(markdownReport, /### 推奨アクション/u);
   assert.match(markdownReport, /\| 指標 \| 集計 \| 実績 \| 基準 \| 判定 \| 証跡種別 \| 信頼度 \| 主対象 \|/u);
   assert.match(markdownReport, /## セキュリティ品質/u);
   assert.match(csvReport, /^"Category","Metric","Aggregation","Automation","Actual","Threshold","Verdict","Summary"/mu);
