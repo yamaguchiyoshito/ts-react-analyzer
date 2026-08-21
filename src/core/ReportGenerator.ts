@@ -704,14 +704,22 @@ export class ReportGenerator {
 
     if (this.graphMetrics.cycles.length > 0) {
       markdown += "### 循環依存\n\n";
-      markdown += "循環依存の経路と、切断候補となる依存辺を示します。\n\n";
+      markdown += "循環の経路 (末尾は先頭に戻ります) と、どの import を外せば循環を断てるかを示します。\n\n";
       for (const cycle of cycleInsights) {
-        markdown += `- ${cycle.nodes.map((node) => this.toDisplayPath(node)).join(" -> ")}\n`;
-        markdown += `  切断候補: ${cycle.cutCandidate
-          ? `${this.toDisplayPath(cycle.cutCandidate.source)} -> ${this.toDisplayPath(cycle.cutCandidate.target)} (${cycle.cutCandidate.type})`
-          : "なし"}\n`;
-        markdown += `  barrel経由: ${cycle.barrelInvolved ? "あり" : "なし"}\n`;
-        markdown += `  shared化候補: ${cycle.sharedCandidate ? this.toDisplayPath(cycle.sharedCandidate) : "なし"}\n`;
+        const displayNodes = cycle.nodes.map((node) => this.toDisplayPath(node));
+        const loop = [...displayNodes, displayNodes[0]].join(" -> ");
+        markdown += `- ${loop}（${cycle.nodes.length} ファイル循環）\n`;
+        if (cycle.cutCandidate) {
+          markdown += `  切断候補: ${this.toDisplayPath(cycle.cutCandidate.source)} から ${this.toDisplayPath(cycle.cutCandidate.target)} への ${cycle.cutCandidate.type} を外すと循環が解消します\n`;
+        } else {
+          markdown += "  切断候補: なし\n";
+        }
+        if (cycle.barrelInvolved) {
+          markdown += "  補足: barrel (index) 経由の循環です。index からの再エクスポートを直接 import に変えると切断しやすくなります\n";
+        }
+        if (cycle.sharedCandidate) {
+          markdown += `  補足: 双方が使う部分を ${this.toDisplayPath(cycle.sharedCandidate)} から共通モジュールへ抽出する方法もあります\n`;
+        }
       }
       markdown += "\n";
     }

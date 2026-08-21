@@ -4704,9 +4704,9 @@ test("ReportGenerator adds cycle cut candidates to dependency analysis", async (
 
   const markdownReport = await fs.readFile(path.join(outputDir, "cycle_report.md"), "utf8");
   assert.match(markdownReport, /### 循環依存/u);
-  assert.match(markdownReport, /切断候補: /u);
-  assert.match(markdownReport, /barrel経由: /u);
-  assert.match(markdownReport, /shared化候補: /u);
+  // 経路は閉路 (末尾が先頭に戻る) として表示される
+  assert.match(markdownReport, /- src\/a\.ts -> src\/b\.ts -> src\/a\.ts（2 ファイル循環）/u);
+  assert.match(markdownReport, /切断候補: src\/[ab]\.ts から src\/[ab]\.ts への import を外すと循環が解消します/u);
 
   await fs.rm(outputDir, { recursive: true, force: true });
   await fs.rm(config.cacheDir, { recursive: true, force: true });

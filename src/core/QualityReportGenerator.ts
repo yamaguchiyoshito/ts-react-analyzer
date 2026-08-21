@@ -1014,7 +1014,8 @@ export class QualityReportGenerator {
 
     return [
       this.metric("dependencies", "external_package_count", "外部依存パッケージ数", String(externalPackageCount), this.externalPackageThresholdLabel(), externalVerdict, "import された外部 package 名のユニーク数です。", []),
-      this.metric("dependencies", "dependency_cycle_count", "循環依存件数", String(graphMetrics.cycles.length), "0", graphMetrics.cycles.length === 0 ? "pass" : "fail", "依存グラフ観点でのライブラリ品質監査です。", []),
+      // コード品質の「循環依存数」と同一事象のため、二重に FAIL 計上しない参照 (派生) 指標にする
+      this.metric("dependencies", "dependency_cycle_count", "循環依存件数（コード品質と同一事象）", String(graphMetrics.cycles.length), "0", graphMetrics.cycles.length === 0 ? "pass" : "fail", "コード品質カテゴリの「循環依存数」と同じ検出結果の参照表示です。対応はコード品質側で行ってください。", [], "derived"),
       this.manualMetric("dependencies", "unused_dependencies", "不要依存の有無", "0", "package.json と import 実績の完全照合が未実装です。"),
       this.manualMetric("dependencies", "license_compliance", "ライセンス適合性", "適合", "license scan の取込が未実装です。"),
       this.manualMetric("dependencies", "maintenance_health", "メンテナンス状態", "健全", "更新頻度や保守終了の監査が未実装です。"),
