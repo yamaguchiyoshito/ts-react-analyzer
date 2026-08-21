@@ -934,6 +934,56 @@ test("QualityReportGenerator avoids double-counting nested JUnit suites", async 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
 
+test("QualityReportGenerator counts self-closing JUnit testcases correctly", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-junit-selfclosing-"));
+  const outputDir = path.join(projectRoot, "out");
+  const testResultsDir = path.join(projectRoot, "test-results");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.mkdir(testResultsDir, { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "value.ts"), "export const value = 1;\n", "utf8");
+  await fs.writeFile(path.join(testResultsDir, "junit.xml"), [
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+    "<testsuites>",
+    "  <testsuite name=\"unit\" tests=\"3\" failures=\"0\" errors=\"0\" skipped=\"1\">",
+    "    <testcase classname=\"value\" name=\"ok1\" file=\"src/value.test.ts\"/>",
+    "    <testcase classname=\"value\" name=\"ok2\" file=\"src/value.test.ts\" />",
+    "    <testcase classname=\"value\" name=\"sk\" file=\"src/value.test.ts\"><skipped/></testcase>",
+    "  </testsuite>",
+    "</testsuites>",
+  ].join("\n"), "utf8");
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: [],
+    parsedFiles: [],
+    graphMetrics: createEmptyGraphMetrics(),
+    executionTimeMs: 10,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "selfclosing-junit",
+    formats: ["json"],
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const unitPassMetric = testCategory?.metrics.find((metric) => metric.id === "unit_pass_rate");
+
+  assert.ok(unitPassMetric?.evidence.some((item) => item.label === "総テスト数" && item.value === "3"));
+  assert.ok(unitPassMetric?.evidence.some((item) => item.label === "失敗数" && item.value === "0"));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
 test("QualityReportGenerator ignores non-executable helper files inside test directories", async () => {
   const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-test-helpers-"));
   const outputDir = path.join(projectRoot, "out");
