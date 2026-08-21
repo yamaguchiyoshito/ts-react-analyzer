@@ -1090,7 +1090,23 @@ export class ReportGenerator {
         return `<tr class="${risk}" data-file="${this.escapeHtml(result.filePath)}"><td><a href="${this.toFileHref(result.filePath)}">${this.escapeHtml(this.toDisplayPath(result.filePath))}</a></td><td>${result.complexity.totalLines}</td><td>${result.complexity.overallComplexity}</td><td>${result.complexity.components.length}</td><td>${risk}</td></tr>`;
       })
       .join("\n");
-    const graphData = options.graphJson ?? { nodes: [], edges: [] };
+    // 数千ノードを埋め込むと HTML が肥大しブラウザ描画も破綻するため、
+    // 次数上位のノードに絞って可視化する (全量は JSON レポートに保持)
+    const HTML_GRAPH_NODE_LIMIT = 300;
+    const fullGraph = options.graphJson ?? { nodes: [], edges: [] };
+    let graphData = fullGraph;
+    let graphTruncatedNote = "";
+    if (fullGraph.nodes.length > HTML_GRAPH_NODE_LIMIT) {
+      const keptNodes = [...fullGraph.nodes]
+        .sort((left, right) => (right.inDegree + right.outDegree) - (left.inDegree + left.outDegree) || left.id.localeCompare(right.id))
+        .slice(0, HTML_GRAPH_NODE_LIMIT);
+      const keptIds = new Set(keptNodes.map((node) => node.id));
+      graphData = {
+        nodes: keptNodes,
+        edges: fullGraph.edges.filter((edge) => keptIds.has(edge.source) && keptIds.has(edge.target)),
+      };
+      graphTruncatedNote = `<p>Showing top ${HTML_GRAPH_NODE_LIMIT} of ${fullGraph.nodes.length} nodes by degree. Full graph data is in the JSON report.</p>`;
+    }
 
     const html = `<!DOCTYPE html>
 <html lang="en">
@@ -1146,6 +1162,7 @@ export class ReportGenerator {
       <span class="high">High in-degree</span>
     </div>
   </div>
+  ${graphTruncatedNote}
   <div id="graph-shell">
     <div id="graph">
       <div id="graph-empty">Graph data is not available.</div>
