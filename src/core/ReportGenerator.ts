@@ -17,6 +17,7 @@ import type {
   HotSpotReportItem,
   IncrementalStats,
   ParseIssue,
+  PersistedAnalysisReport,
   RiskAxisBreakdown,
   SkippedFile,
 } from "../types/index.js";
@@ -75,7 +76,7 @@ export class ReportGenerator {
     analysisResults: AnalysisResult[],
     graphMetrics: GraphMetrics,
     options: GenerationOptions,
-  ): Promise<void> {
+  ): Promise<PersistedAnalysisReport> {
     this.analysisResults = analysisResults;
     this.projectRoot = options.projectRoot ? path.resolve(options.projectRoot) : undefined;
     this.graphMetrics = graphMetrics;
@@ -85,6 +86,7 @@ export class ReportGenerator {
     const formats = options.formats.includes("all")
       ? ["json", "markdown", "csv", "html"]
       : options.formats;
+    const persistedReport = this.buildPersistedReport(options);
 
     if (formats.includes("csv")) {
       await this.generateCSVReports(options.outputDir, options.prefix);
@@ -93,11 +95,18 @@ export class ReportGenerator {
       await this.generateMarkdownReport(options.outputDir, options.prefix, options);
     }
     if (formats.includes("json")) {
-      await this.generateJSONReport(options.outputDir, options.prefix, options);
+      // 大規模プロジェクトでは数十 MB になるため、インデントなしで書き出す
+      await fs.writeFile(
+        path.join(options.outputDir, `${options.prefix}_report.json`),
+        JSON.stringify(persistedReport),
+        "utf8",
+      );
     }
     if (formats.includes("html")) {
       await this.generateHTMLReport(options.outputDir, options.prefix, options);
     }
+
+    return persistedReport;
   }
 
   private async generateCSVReports(outputDir: string, prefix: string): Promise<void> {
@@ -964,9 +973,9 @@ export class ReportGenerator {
     return `${trimmed}\n\n`;
   }
 
-  private async generateJSONReport(outputDir: string, prefix: string, options: GenerationOptions): Promise<void> {
+  private buildPersistedReport(options: GenerationOptions): PersistedAnalysisReport {
     const decisionSummary = this.buildDecisionSummary(options.complexityThreshold);
-    const report = {
+    const report: PersistedAnalysisReport = {
       timestamp: new Date().toISOString(),
       executionTimeMs: this.executionTime,
       statistics: {
@@ -996,7 +1005,7 @@ export class ReportGenerator {
       directoryPurposeAudit: auditDirectoryPurposes(this.analysisResults, (filePath) => this.toDisplayPath(filePath)),
     };
 
-    await fs.writeFile(path.join(outputDir, `${prefix}_report.json`), JSON.stringify(report, null, 2), "utf8");
+    return report;
   }
 
   private async generateHTMLReport(outputDir: string, prefix: string, options: GenerationOptions): Promise<void> {

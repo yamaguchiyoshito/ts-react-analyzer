@@ -31,6 +31,7 @@ export class AnalysisCache {
   private readonly records = new Map<string, CachedAnalysisRecord>();
   private readonly nextRecords = new Map<string, CachedAnalysisRecord>();
   private readonly stats: CacheStats = { hits: 0, misses: 0 };
+  private dirty = false;
 
   constructor(cacheDir: string, projectRoot: string, compilerOptions: ts.CompilerOptions) {
     const projectKey = this.hash(projectRoot).slice(0, 16);
@@ -69,6 +70,7 @@ export class AnalysisCache {
   }
 
   set(filePath: string, sourceSha256: string, analysisContextHash: string, payload: CachedAnalysisPayload): void {
+    this.dirty = true;
     this.nextRecords.set(filePath, {
       filePath,
       sourceSha256,
@@ -84,9 +86,14 @@ export class AnalysisCache {
   }
 
   async persist(): Promise<void> {
+    // 全件ヒット (更新も削除もなし) なら内容が変わらないため書き込みを省略する
+    if (!this.dirty && this.nextRecords.size === this.records.size) {
+      return;
+    }
     await fs.mkdir(path.dirname(this.cacheFile), { recursive: true });
     const records = Array.from(this.nextRecords.values()).sort((left, right) => left.filePath.localeCompare(right.filePath));
-    await fs.writeFile(this.cacheFile, JSON.stringify(records, null, 2), "utf8");
+    // 数十 MB になり得るためインデントなしで直列化する
+    await fs.writeFile(this.cacheFile, JSON.stringify(records), "utf8");
   }
 
   private stableStringify(value: unknown): string {

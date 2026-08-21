@@ -291,7 +291,7 @@ async function diffProject(projectDir: string, config: AnalysisConfig, baselineP
     const artifacts = await buildArtifacts(projectDir, config, logger);
 
     const reportGenerator = new ReportGenerator();
-    await reportGenerator.generateReports(artifacts.results, artifacts.graphMetrics, {
+    const currentReport = await reportGenerator.generateReports(artifacts.results, artifacts.graphMetrics, {
       outputDir: config.outputDir,
       prefix: config.filePrefix,
       formats: config.outputFormats,
@@ -313,7 +313,6 @@ async function diffProject(projectDir: string, config: AnalysisConfig, baselineP
     });
 
     const currentReportPath = path.join(config.outputDir, `${config.filePrefix}_report.json`);
-    const currentReport = JSON.parse(await fs.readFile(currentReportPath, "utf8")) as PersistedAnalysisReport;
     const diffGenerator = new DiffGenerator();
     const diff = diffGenerator.compare(currentReport, baseline, baselinePath, currentReportPath);
     await diffGenerator.writeReports(diff, config.outputDir, config.filePrefix, {
