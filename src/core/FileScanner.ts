@@ -170,19 +170,22 @@ export class FileScanner {
       fileBuffer[1] === 0xbb &&
       fileBuffer[2] === 0xbf;
     const sourceCode = hasBom ? fileBuffer.subarray(3).toString("utf8") : fileBuffer.toString("utf8");
-    const sha256 = this.createHash(sourceCode);
     const cacheKey = filePath;
     const previous = this.cacheIndex.get(cacheKey);
 
+    // mtime とサイズが一致すれば記録済みハッシュを信頼し、再ハッシュを省略する
+    let sha256: string;
     if (
       this.enableCache &&
       previous &&
       previous.mtimeMs === stat.mtimeMs &&
-      previous.sha256 === sha256 &&
-      previous.byteSize === fileBuffer.byteLength
+      previous.byteSize === fileBuffer.byteLength &&
+      previous.sha256
     ) {
+      sha256 = previous.sha256;
       result.cacheStats.hits += 1;
     } else {
+      sha256 = this.createHash(sourceCode);
       result.cacheStats.misses += 1;
     }
 
