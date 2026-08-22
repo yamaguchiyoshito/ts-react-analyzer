@@ -61,16 +61,33 @@ export class ComplexityAnalyzer {
     const lines = sourceFile.text.split(/\r?\n/u);
     let codeLines = 0;
     let commentLines = 0;
+    let inBlockComment = false;
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) {
         continue;
       }
-      if (trimmed.startsWith("//") || trimmed.startsWith("/*") || trimmed.startsWith("*")) {
+      // ブロックコメントの開閉を追跡し、banner なしの複数行コメント内部も
+      // コメント行として数える (行内にコードが混在するケースは近似)
+      if (inBlockComment) {
         commentLines += 1;
-      } else {
-        codeLines += 1;
+        if (trimmed.includes("*/")) {
+          inBlockComment = false;
+        }
+        continue;
       }
+      if (trimmed.startsWith("//") || trimmed.startsWith("*")) {
+        commentLines += 1;
+        continue;
+      }
+      if (trimmed.startsWith("/*")) {
+        commentLines += 1;
+        if (!trimmed.includes("*/", 2)) {
+          inBlockComment = true;
+        }
+        continue;
+      }
+      codeLines += 1;
     }
 
     this.collectTypeScriptDirectives(sourceFile.text, typeMetrics);
@@ -174,10 +191,16 @@ export class ComplexityAnalyzer {
     let maxNestingDepth = 0;
 
     const visit = (child: ts.Node, depth: number): void => {
+      // ネストした関数は独立に解析されるため、その内部の分岐を親へ二重計上しない
+      if (this.isAnalyzableFunction(child)) {
+        return;
+      }
+
       maxNestingDepth = Math.max(maxNestingDepth, depth);
       const nestedDepth = this.isControlFlowNestingNode(child) ? depth + 1 : depth;
 
-      if (ts.isIfStatement(child) || ts.isCaseClause(child) || ts.isConditionalExpression(child) || ts.isSwitchStatement(child)) {
+      // switch 自体は数えず case 節のみ数える (標準的な cyclomatic complexity)
+      if (ts.isIfStatement(child) || ts.isCaseClause(child) || ts.isConditionalExpression(child)) {
         branchCount += 1;
         cyclomaticComplexity += 1;
       }

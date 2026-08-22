@@ -198,26 +198,35 @@ export class UiTestArtifactAnalyzer {
   }
 
   private normalizePlaywrightStatus(test: PlaywrightLikeTest): "passed" | "failed" | "skipped" {
-    const resultStatuses = (test.results ?? [])
-      .map((result) => (result.status ?? "").toLowerCase())
-      .filter(Boolean);
-
-    if (resultStatuses.some((status) => ["failed", "timedout", "interrupted"].includes(status))) {
-      return "failed";
-    }
-    if (resultStatuses.some((status) => status === "passed")) {
-      return "passed";
-    }
-    if (resultStatuses.length > 0 && resultStatuses.every((status) => status === "skipped")) {
-      return "skipped";
-    }
-
+    // Playwright の test.status は最終判定 (expected / unexpected / flaky / skipped)。
+    // results 配列を先に見るとリトライで成功した flaky が failed 扱いになるため、
+    // 最終判定を優先し、無い場合のみ results から推定する。
     const directStatus = (test.status ?? "").toLowerCase();
     if (["passed", "expected", "flaky"].includes(directStatus)) {
       return "passed";
     }
-    if (["skipped"].includes(directStatus) || (test.expectedStatus ?? "").toLowerCase() === "skipped") {
+    if (["failed", "unexpected", "timedout", "interrupted"].includes(directStatus)) {
+      return "failed";
+    }
+    if (directStatus === "skipped" || (test.expectedStatus ?? "").toLowerCase() === "skipped") {
       return "skipped";
+    }
+
+    const resultStatuses = (test.results ?? [])
+      .map((result) => (result.status ?? "").toLowerCase())
+      .filter(Boolean);
+    if (resultStatuses.length > 0) {
+      // 最後の実行結果が最終状態 (リトライは配列の後ろに積まれる)
+      const lastStatus = resultStatuses[resultStatuses.length - 1]!;
+      if (lastStatus === "passed") {
+        return "passed";
+      }
+      if (["failed", "timedout", "interrupted"].includes(lastStatus)) {
+        return "failed";
+      }
+      if (resultStatuses.every((status) => status === "skipped")) {
+        return "skipped";
+      }
     }
     return "failed";
   }

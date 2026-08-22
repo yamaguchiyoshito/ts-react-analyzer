@@ -4,7 +4,7 @@ import { parseArgs } from "node:util";
 
 import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, ManualQualityInputLoader, QualityDiffGenerator, QualityReportGenerator, ReportGenerator } from "./core/index.js";
 import { shouldIncludeInAnalysisScope } from "./core/FileConventions.js";
-import type { AnalysisConfig, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, PersistedAnalysisReport, QualityDiffReport, QualityMetricDiffEntry, QualityReport } from "./types/index.js";
+import type { AnalysisConfig, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, ParseIssue, PersistedAnalysisReport, QualityDiffReport, QualityMetricDiffEntry, QualityReport } from "./types/index.js";
 
 interface RunArtifacts {
   results: AnalysisResult[];
@@ -16,6 +16,7 @@ interface RunArtifacts {
   graphMetrics: GraphMetrics;
   analysisCacheStats: CacheStats;
   incrementalStats: IncrementalStats;
+  parseIssues: ParseIssue[];
 }
 
 function printHelp(): void {
@@ -90,10 +91,19 @@ async function buildArtifacts(
   const graphBuilder = new GraphBuilder();
   const results: AnalysisResult[] = [];
   const allResults: AnalysisResult[] = [];
+  const parseIssues: ParseIssue[] = [];
 
   for (const parsedFile of fullScanResult.parsed) {
     const analysisContextHash = dependencyAnalyzer.getAnalysisContextHash(parsedFile.filePath);
     const cached = analysisCache.get(parsedFile.filePath, parsedFile.metadata.sha256, analysisContextHash);
+    // parseDiagnosticCount へのアクセスは遅延パースを起動するため、キャッシュヒット時は
+    // キャッシュ済みの値を使い、AST を生成しない
+    const parseDiagnosticCount = cached
+      ? cached.parseDiagnosticCount ?? 0
+      : parsedFile.metadata.parseDiagnosticCount;
+    if (parseDiagnosticCount > 0 && scopedFilePaths.has(parsedFile.filePath)) {
+      parseIssues.push({ filePath: parsedFile.filePath, diagnosticCount: parseDiagnosticCount });
+    }
     const result = cached
       ? {
           filePath: parsedFile.filePath,
@@ -114,6 +124,7 @@ async function buildArtifacts(
             complexity,
             dependencies: dependencyResult.dependencies,
             dependencyErrors: dependencyResult.errors,
+            parseDiagnosticCount: parsedFile.metadata.parseDiagnosticCount,
           });
           return freshResult;
         })();
@@ -194,6 +205,7 @@ async function buildArtifacts(
       reusedFiles: analysisCache.getStats().hits,
       recomputedFiles: analysisCache.getStats().misses,
     },
+    parseIssues,
   };
 }
 
@@ -216,12 +228,7 @@ async function analyzeProject(projectDir: string, config: AnalysisConfig): Promi
       projectRoot: projectDir,
       skippedFiles: artifacts.scanResult.skipped,
       scanErrors: artifacts.scanResult.errors,
-      parseIssues: artifacts.scanResult.parsed
-        .filter((parsedFile) => parsedFile.metadata.parseDiagnosticCount > 0)
-        .map((parsedFile) => ({
-          filePath: parsedFile.filePath,
-          diagnosticCount: parsedFile.metadata.parseDiagnosticCount,
-        })),
+      parseIssues: artifacts.parseIssues,
       cacheStats: artifacts.scanResult.cacheStats,
       analysisCacheStats: artifacts.analysisCacheStats,
       incrementalStats: artifacts.incrementalStats,
@@ -291,7 +298,7 @@ async function diffProject(projectDir: string, config: AnalysisConfig, baselineP
     const artifacts = await buildArtifacts(projectDir, config, logger);
 
     const reportGenerator = new ReportGenerator();
-    await reportGenerator.generateReports(artifacts.results, artifacts.graphMetrics, {
+    const currentReport = await reportGenerator.generateReports(artifacts.results, artifacts.graphMetrics, {
       outputDir: config.outputDir,
       prefix: config.filePrefix,
       formats: config.outputFormats,
@@ -300,12 +307,7 @@ async function diffProject(projectDir: string, config: AnalysisConfig, baselineP
       projectRoot: projectDir,
       skippedFiles: artifacts.scanResult.skipped,
       scanErrors: artifacts.scanResult.errors,
-      parseIssues: artifacts.scanResult.parsed
-        .filter((parsedFile) => parsedFile.metadata.parseDiagnosticCount > 0)
-        .map((parsedFile) => ({
-          filePath: parsedFile.filePath,
-          diagnosticCount: parsedFile.metadata.parseDiagnosticCount,
-        })),
+      parseIssues: artifacts.parseIssues,
       cacheStats: artifacts.scanResult.cacheStats,
       analysisCacheStats: artifacts.analysisCacheStats,
       incrementalStats: artifacts.incrementalStats,
@@ -313,10 +315,12 @@ async function diffProject(projectDir: string, config: AnalysisConfig, baselineP
     });
 
     const currentReportPath = path.join(config.outputDir, `${config.filePrefix}_report.json`);
-    const currentReport = JSON.parse(await fs.readFile(currentReportPath, "utf8")) as PersistedAnalysisReport;
     const diffGenerator = new DiffGenerator();
-    const diff = diffGenerator.compare(currentReport, baseline, baselinePath, currentReportPath);
-    await diffGenerator.writeReports(diff, config.outputDir, config.filePrefix);
+    const diff = diffGenerator.compare(currentReport, baseline, baselinePath, currentReportPath, { projectRoot: projectDir });
+    await diffGenerator.writeReports(diff, config.outputDir, config.filePrefix, {
+      projectRoot: projectDir,
+      impactScoreThreshold: config.impactScoreThreshold,
+    });
 
     const thresholdViolations = config.impactScoreThreshold > 0
       ? diff.impact.prioritizedFiles.filter((item) => item.score >= config.impactScoreThreshold)
@@ -387,6 +391,12 @@ async function qualityProject(
     }
 
     const qualityReportGenerator = new QualityReportGenerator();
+    const currentReportPath = path.join(config.outputDir, `${config.filePrefix}_quality_report.json`);
+    const qualityDiffGenerator = new QualityDiffGenerator();
+    let failingAutomaticMetrics: Array<{ category: string; metric: QualityReport["categories"][number]["metrics"][number] }> = [];
+    let diff: QualityDiffReport | undefined;
+    let blockingRegressionMetrics: ReturnType<typeof selectBlockingRegressionMetrics> = [];
+
     const report = await qualityReportGenerator.generateReports({
       projectRoot: projectDir,
       analysisResults: artifacts.results,
@@ -399,6 +409,7 @@ async function qualityProject(
       qualityProfile: config.qualityProfile,
       testPresenceSettings: config.testPresenceSettings,
       maxTypeCheckRootNames: config.maxTypeCheckRootNames,
+      cacheDir: config.enableCache ? config.cacheDir : undefined,
       manualInputs,
     }, {
       outputDir: config.outputDir,
@@ -407,20 +418,45 @@ async function qualityProject(
         ? [...config.outputFormats, "json"]
         : config.outputFormats,
       onProgress: (message, metadata) => logger.info(message, metadata),
+      // レポート書き出し前に gate 判定とベースライン比較を確定させ、
+      // 「ゲート判定」「前回比」を md / html 本文へ反映する
+      gate: (builtReport) => {
+        failingAutomaticMetrics = builtReport.categories
+          .flatMap((category) => category.metrics.map((metric) => ({ category: category.label, metric })))
+          .filter(({ metric }) => metric.aggregation === "primary" && metric.automation === "automatic" && metric.verdict === "fail");
+        const shouldCompareWithBaseline = Boolean(baselineReport && baselinePath && (mode === "diff" || mode === "gate"));
+        diff = shouldCompareWithBaseline
+          ? qualityDiffGenerator.compare(builtReport, baselineReport!, baselinePath!, currentReportPath)
+          : undefined;
+        blockingRegressionMetrics = diff ? selectBlockingRegressionMetrics(diff, config) : [];
+
+        if (mode !== "gate" && !diff) {
+          return undefined;
+        }
+        return {
+          mode,
+          baselinePath: diff ? baselinePath : undefined,
+          baselineOverallVerdict: baselineReport?.summary.overallVerdict,
+          regressedCount: diff?.summary.regressedMetrics,
+          improvedCount: diff?.summary.improvedMetrics,
+          gateVerdict: failingAutomaticMetrics.length > 0 || blockingRegressionMetrics.length > 0 ? "fail" : "pass",
+          failingAutomaticMetrics: failingAutomaticMetrics.map(({ category, metric }) => ({
+            category,
+            label: metric.label,
+            actual: metric.actual,
+            threshold: metric.threshold,
+          })),
+          blockingRegressions: blockingRegressionMetrics.map((metric) => ({
+            category: metric.categoryLabel,
+            label: metric.label,
+            baselineVerdict: metric.baselineVerdict ?? "不明",
+            currentVerdict: metric.currentVerdict ?? "不明",
+          })),
+        };
+      },
     });
 
-    const failingAutomaticMetrics = report.categories
-      .flatMap((category) => category.metrics.map((metric) => ({ category: category.label, metric })))
-      .filter(({ metric }) => metric.aggregation === "primary" && metric.automation === "automatic" && metric.verdict === "fail");
-    const shouldCompareWithBaseline = Boolean(baselineReport && baselinePath && (mode === "diff" || mode === "gate"));
-    const qualityDiffGenerator = shouldCompareWithBaseline ? new QualityDiffGenerator() : undefined;
-    const currentReportPath = path.join(config.outputDir, `${config.filePrefix}_quality_report.json`);
-    const diff = shouldCompareWithBaseline && qualityDiffGenerator
-      ? qualityDiffGenerator.compare(report, baselineReport!, baselinePath!, currentReportPath)
-      : undefined;
-    const blockingRegressionMetrics = diff ? selectBlockingRegressionMetrics(diff, config) : [];
-
-    if (diff && qualityDiffGenerator) {
+    if (diff) {
       await qualityDiffGenerator.writeReports(diff, config.outputDir, config.filePrefix, config.outputFormats);
     }
 
@@ -554,6 +590,11 @@ function selectBlockingRegressionMetrics(
       return false;
     }
     if (metric.trend !== "regressed" || metric.currentAutomation !== "automatic") {
+      return false;
+    }
+    // 同一判定内の数値悪化 (fail のまま件数増など) は差分レポートで可視化する
+    // のみとし、gate はドキュメントどおり判定の悪化 (pass->warn 等) だけで落とす
+    if (metric.baselineVerdict === metric.currentVerdict) {
       return false;
     }
     if (monitoringMetricIds.has(metric.id)) {

@@ -38,41 +38,49 @@ export class GraphBuilder {
       return this.stronglyConnected;
     }
 
+    // 数万ノードの深い依存連鎖でも落ちないよう、DFS は反復実装にする
     const visited = new Set<string>();
     const finished: string[] = [];
-    const dfs1 = (node: string): void => {
-      visited.add(node);
-      for (const target of this.edges.get(node) ?? []) {
-        if (!visited.has(target)) {
-          dfs1(target);
+    const iterativeDfs = (
+      start: string,
+      neighbors: (node: string) => Iterable<string>,
+      onFinish?: (node: string) => void,
+      onVisit?: (node: string) => void,
+    ): void => {
+      const stack: Array<{ node: string; iterator: Iterator<string> }> = [];
+      visited.add(start);
+      onVisit?.(start);
+      stack.push({ node: start, iterator: neighbors(start)[Symbol.iterator]() });
+      while (stack.length > 0) {
+        const frame = stack[stack.length - 1]!;
+        const next = frame.iterator.next();
+        if (next.done) {
+          stack.pop();
+          onFinish?.(frame.node);
+          continue;
+        }
+        const neighbor = next.value;
+        if (!visited.has(neighbor)) {
+          visited.add(neighbor);
+          onVisit?.(neighbor);
+          stack.push({ node: neighbor, iterator: neighbors(neighbor)[Symbol.iterator]() });
         }
       }
-      finished.push(node);
     };
 
     for (const node of this.nodes.keys()) {
       if (!visited.has(node)) {
-        dfs1(node);
+        iterativeDfs(node, (id) => this.edges.get(id) ?? [], (id) => finished.push(id));
       }
     }
 
     visited.clear();
     const components: string[][] = [];
-    const dfs2 = (node: string, component: string[]): void => {
-      visited.add(node);
-      component.push(node);
-      for (const source of this.reverseEdges.get(node) ?? []) {
-        if (!visited.has(source)) {
-          dfs2(source, component);
-        }
-      }
-    };
-
     for (let index = finished.length - 1; index >= 0; index -= 1) {
       const node = finished[index];
       if (node && !visited.has(node)) {
         const component: string[] = [];
-        dfs2(node, component);
+        iterativeDfs(node, (id) => this.reverseEdges.get(id) ?? [], undefined, (id) => component.push(id));
         components.push(component.sort());
       }
     }
@@ -100,22 +108,24 @@ export class GraphBuilder {
     }
 
     const components: string[][] = [];
-    const dfs = (node: string, component: string[]): void => {
+    for (const node of this.nodes.keys()) {
+      if (visited.has(node)) {
+        continue;
+      }
+      const component: string[] = [];
+      const stack = [node];
       visited.add(node);
-      component.push(node);
-      for (const neighbor of undirected.get(node) ?? []) {
-        if (!visited.has(neighbor)) {
-          dfs(neighbor, component);
+      while (stack.length > 0) {
+        const currentNode = stack.pop()!;
+        component.push(currentNode);
+        for (const neighbor of undirected.get(currentNode) ?? []) {
+          if (!visited.has(neighbor)) {
+            visited.add(neighbor);
+            stack.push(neighbor);
+          }
         }
       }
-    };
-
-    for (const node of this.nodes.keys()) {
-      if (!visited.has(node)) {
-        const component: string[] = [];
-        dfs(node, component);
-        components.push(component.sort());
-      }
+      components.push(component.sort());
     }
 
     this.weaklyConnected = components.sort((left, right) => right.length - left.length);
@@ -157,10 +167,13 @@ export class GraphBuilder {
     const initialRank = nodeCount === 0 ? 0 : 1 / nodeCount;
     let current = new Map<string, number>(nodeIds.map((id) => [id, initialRank]));
 
+    const sinkNodes = nodeIds.filter((id) => (this.edges.get(id)?.size ?? 0) === 0);
+    const convergenceThreshold = 1e-6 * Math.max(nodeCount, 1);
+
     for (let iteration = 0; iteration < iterations; iteration += 1) {
       const next = new Map<string, number>();
-      const sinkNodes = nodeIds.filter((id) => (this.edges.get(id)?.size ?? 0) === 0);
       const sinkContribution = sinkNodes.reduce((sum, id) => sum + (current.get(id) ?? 0), 0);
+      let delta = 0;
 
       for (const node of nodeIds) {
         let rank = (1 - dampingFactor) / Math.max(nodeCount, 1);
@@ -174,10 +187,15 @@ export class GraphBuilder {
         }
 
         next.set(node, rank);
+        delta += Math.abs(rank - (current.get(node) ?? 0));
         this.nodes.get(node)!.pageRank = rank;
       }
 
       current = next;
+      // 収束したら以降のイテレーションを打ち切る
+      if (delta < convergenceThreshold) {
+        break;
+      }
     }
 
     return current;
@@ -204,14 +222,17 @@ export class GraphBuilder {
       }
       result.push(node);
 
+      const readyTargets: string[] = [];
       for (const target of this.edges.get(node) ?? []) {
         const nextDegree = (inDegree.get(target) ?? 0) - 1;
         inDegree.set(target, nextDegree);
         if (nextDegree === 0) {
-          queue.push(target);
-          queue.sort();
+          readyTargets.push(target);
         }
       }
+      // 追加分だけ整列して末尾へ (毎回の全体 sort による O(V^2 log V) を回避)
+      readyTargets.sort();
+      queue.push(...readyTargets);
     }
 
     return result.length === this.nodes.size ? result : null;

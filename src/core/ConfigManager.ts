@@ -389,7 +389,32 @@ export class ConfigManager {
       return [...defaults];
     }
 
-    return [...new Set([...defaults, ...custom.filter((value): value is string => typeof value === "string")])];
+    // tsconfig の exclude は glob なので、正規表現へ変換してから合流する。
+    // 素通しすると "out" が "checkout.ts" に部分一致するなど無関係なファイルを除外してしまう。
+    const converted = custom
+      .filter((value): value is string => typeof value === "string" && value.length > 0)
+      .map((value) => this.tsconfigGlobToRegexPattern(value));
+    return [...new Set([...defaults, ...converted])];
+  }
+
+  private tsconfigGlobToRegexPattern(glob: string): string {
+    const anyDeep = "\u0000";
+    const anySegmentChars = "\u0001";
+    const anySegmentChar = "\u0002";
+    const separator = "[/\\\\]";
+    const segmentChar = "[^/\\\\]";
+
+    const normalized = glob.replace(/\\/gu, "/").replace(/^\.\//u, "").replace(/\/+$/u, "");
+    const body = normalized
+      .replace(/[.+^${}()|[\]]/gu, "\\$&")
+      .replace(/\*\*/gu, anyDeep)
+      .replace(/\*/gu, anySegmentChars)
+      .replace(/\?/gu, anySegmentChar)
+      .replace(/\//gu, separator)
+      .replaceAll(anyDeep, ".*")
+      .replaceAll(anySegmentChars, `${segmentChar}*`)
+      .replaceAll(anySegmentChar, segmentChar);
+    return `(?:^|${separator})${body}(?:$|${separator})`;
   }
 
   private withResolvedExcludePatterns(config: AnalysisConfig): AnalysisConfig {

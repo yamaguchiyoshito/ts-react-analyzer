@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
 import type {
@@ -9,17 +11,32 @@ import type {
   CachedAnalysisRecord,
 } from "../types/index.js";
 
+// アナライザ自身の版をキャッシュキーへ混ぜ、解析ロジック更新後に
+// 旧バージョンの解析結果を再利用しないようにする。
+const ANALYZER_VERSION = readAnalyzerVersion();
+
+function readAnalyzerVersion(): string {
+  try {
+    const packagePath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "package.json");
+    const parsed = JSON.parse(readFileSync(packagePath, "utf8")) as { version?: string };
+    return parsed.version ?? "0";
+  } catch {
+    return "0";
+  }
+}
+
 export class AnalysisCache {
   private readonly cacheFile: string;
   private readonly baseConfigHash: string;
   private readonly records = new Map<string, CachedAnalysisRecord>();
   private readonly nextRecords = new Map<string, CachedAnalysisRecord>();
   private readonly stats: CacheStats = { hits: 0, misses: 0 };
+  private dirty = false;
 
   constructor(cacheDir: string, projectRoot: string, compilerOptions: ts.CompilerOptions) {
     const projectKey = this.hash(projectRoot).slice(0, 16);
     this.cacheFile = path.join(cacheDir, "analysis", `${projectKey}.json`);
-    this.baseConfigHash = this.hash(this.stableStringify(compilerOptions));
+    this.baseConfigHash = this.hash(`${ANALYZER_VERSION}::${this.stableStringify(compilerOptions)}`);
   }
 
   async initialize(): Promise<void> {
@@ -53,6 +70,7 @@ export class AnalysisCache {
   }
 
   set(filePath: string, sourceSha256: string, analysisContextHash: string, payload: CachedAnalysisPayload): void {
+    this.dirty = true;
     this.nextRecords.set(filePath, {
       filePath,
       sourceSha256,
@@ -68,9 +86,14 @@ export class AnalysisCache {
   }
 
   async persist(): Promise<void> {
+    // 全件ヒット (更新も削除もなし) なら内容が変わらないため書き込みを省略する
+    if (!this.dirty && this.nextRecords.size === this.records.size) {
+      return;
+    }
     await fs.mkdir(path.dirname(this.cacheFile), { recursive: true });
     const records = Array.from(this.nextRecords.values()).sort((left, right) => left.filePath.localeCompare(right.filePath));
-    await fs.writeFile(this.cacheFile, JSON.stringify(records, null, 2), "utf8");
+    // 数十 MB になり得るためインデントなしで直列化する
+    await fs.writeFile(this.cacheFile, JSON.stringify(records), "utf8");
   }
 
   private stableStringify(value: unknown): string {

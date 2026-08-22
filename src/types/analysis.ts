@@ -121,6 +121,7 @@ export interface CachedAnalysisPayload {
   dependencies: Dependency[];
   dependencyErrors: ExtractionError[];
   complexity: FileComplexityAnalysis;
+  parseDiagnosticCount?: number;
 }
 
 export interface CachedAnalysisRecord {
@@ -403,9 +404,31 @@ export interface DecisionSummaryReport {
   };
 }
 
+export type PurposeAlignmentSeverity = "high" | "medium" | "low";
+
+export interface PurposeAlignmentFinding {
+  filePath: string;
+  fileType: string;
+  purpose: string;
+  rule: string;
+  severity: PurposeAlignmentSeverity;
+  issue: string;
+  suggestion: string;
+}
+
+export interface DirectoryPurposeAuditReport {
+  findings: PurposeAlignmentFinding[];
+  summary: {
+    high: number;
+    medium: number;
+    low: number;
+  };
+}
+
 export interface PersistedAnalysisReport {
   timestamp: string;
   executionTimeMs: number;
+  projectRoot?: string;
   statistics: {
     fileCount: number;
     totalLines: number;
@@ -422,6 +445,7 @@ export interface PersistedAnalysisReport {
   incrementalStats?: IncrementalStats;
   graphJson?: GraphJSON;
   decisionSummary?: DecisionSummaryReport;
+  directoryPurposeAudit?: DirectoryPurposeAuditReport;
 }
 
 export interface FileDiffEntry {
@@ -447,6 +471,7 @@ export interface AnalysisDiffReport {
   graphDelta: {
     cycleDelta: number;
     dependencyDelta: number;
+    externalDependencyDelta?: number;
     warningDelta: string[];
   };
   hotSpotDelta: {
@@ -597,6 +622,31 @@ export interface FeatureSummary {
   matchedTestFiles: number;
   weightedTestRate: number;
   productTextCount: number;
+}
+
+export interface QualityGateOffender {
+  category: string;
+  label: string;
+  actual: string;
+  threshold: string;
+}
+
+export interface QualityGateRegression {
+  category: string;
+  label: string;
+  baselineVerdict: string;
+  currentVerdict: string;
+}
+
+export interface QualityGateRenderContext {
+  mode: "collect" | "report" | "gate" | "diff";
+  baselinePath?: string;
+  baselineOverallVerdict?: QualityVerdict;
+  regressedCount?: number;
+  improvedCount?: number;
+  gateVerdict?: "pass" | "fail";
+  failingAutomaticMetrics: QualityGateOffender[];
+  blockingRegressions: QualityGateRegression[];
 }
 
 export interface QualityReport {

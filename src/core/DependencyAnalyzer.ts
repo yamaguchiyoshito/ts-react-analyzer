@@ -28,6 +28,9 @@ export class DependencyAnalyzer {
   private readonly compilerOptionsHash: string;
   private readonly projectRoot: string;
   private readonly host: ts.ModuleResolutionHost;
+  // node_modules 探索を全ファイルで共有する TypeScript 標準の解決キャッシュ。
+  // これが無いと N ファイルが import する同じパッケージを N 回探索する。
+  private readonly moduleResolutionCache: ts.ModuleResolutionCache;
   private readonly externalLibraries = new Set<string>();
   private readonly reExportChains = new Map<string, Set<string>>();
   private readonly resolutionCache = new Map<string, ResolveResult>();
@@ -39,6 +42,10 @@ export class DependencyAnalyzer {
     this.compilerOptions = compilerOptions;
     this.compilerOptionsHash = this.hash(this.stableStringify(compilerOptions));
     this.host = ts.sys;
+    this.moduleResolutionCache = ts.createModuleResolutionCache(
+      this.projectRoot,
+      (fileName) => (ts.sys.useCaseSensitiveFileNames ? fileName : fileName.toLowerCase()),
+    );
   }
 
   extractDependencies(sourceFile: ts.SourceFile, filePath: string): ExtractionResult {
@@ -265,6 +272,7 @@ export class DependencyAnalyzer {
       fromFile,
       context.compilerOptions,
       this.host,
+      this.moduleResolutionCache,
     );
     const resolvedFileName = resolution.resolvedModule?.resolvedFileName
       ? path.resolve(resolution.resolvedModule.resolvedFileName)

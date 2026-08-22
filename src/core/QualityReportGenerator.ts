@@ -6,7 +6,7 @@ import { ApiArtifactAnalyzer } from "./ApiArtifactAnalyzer.js";
 import { BrowserAuditAnalyzer } from "./BrowserAuditAnalyzer.js";
 import { classifyFileType } from "./FileConventions.js";
 import { TestArtifactAnalyzer } from "./TestArtifactAnalyzer.js";
-import { TypeCheckAnalyzer } from "./TypeCheckAnalyzer.js";
+import { TypeCheckAnalyzer, type TypeCheckSummary } from "./TypeCheckAnalyzer.js";
 import { UiTestArtifactAnalyzer } from "./UiTestArtifactAnalyzer.js";
 import { SecurityArtifactAnalyzer } from "./SecurityArtifactAnalyzer.js";
 import type {
@@ -22,6 +22,7 @@ import type {
   QualityMetricAggregation,
   QualityMetricReport,
   QualityProfile,
+  QualityGateRenderContext,
   QualityReport,
   QualitySummary,
   TestPresenceSettings,
@@ -41,6 +42,7 @@ interface QualityGenerationInput {
   testPresenceSettings?: TestPresenceSettings;
   maxTypeCheckRootNames?: number;
   tsConfigPath?: string;
+  cacheDir?: string;
   manualInputs?: ManualQualityMetricInput[];
 }
 
@@ -49,6 +51,9 @@ interface QualityGenerationOptions {
   prefix: string;
   formats: Array<"json" | "markdown" | "csv" | "html" | "all">;
   onProgress?: (message: string, metadata?: Record<string, unknown>) => void;
+  // レポート構築後・書き出し前に呼ばれ、gate 判定やベースライン比較の結果を
+  // レポート本文 (要点の「ゲート判定」「前回比」) に反映するためのフック
+  gate?: (report: QualityReport) => QualityGateRenderContext | undefined;
 }
 
 interface AuditFinding {
@@ -177,6 +182,8 @@ const DEFAULT_TEST_PRESENCE_SETTINGS: TestPresenceSettings = {
 
 export class QualityReportGenerator {
   private projectRoot?: string;
+  private gateContext?: QualityGateRenderContext;
+  private readonly displayPathCache = new Map<string, string>();
   private qualityProfile: QualityProfile = "application";
   private testPresenceSettings: TestPresenceSettings = {
     thresholds: {
@@ -196,6 +203,7 @@ export class QualityReportGenerator {
 
     const report = await this.buildReport(input, options.onProgress);
     report.executionTimeMs = Math.max(report.executionTimeMs, input.executionTimeMs + (Date.now() - startedAt));
+    this.gateContext = options.gate?.(report);
     const formats = options.formats.includes("all")
       ? ["json", "markdown", "csv", "html"]
       : options.formats;
@@ -221,6 +229,7 @@ export class QualityReportGenerator {
     onProgress?: (message: string, metadata?: Record<string, unknown>) => void,
   ): Promise<QualityReport> {
     this.projectRoot = path.resolve(input.projectRoot);
+    this.displayPathCache.clear();
     this.qualityProfile = input.qualityProfile ?? "application";
     this.testPresenceSettings = this.cloneTestPresenceSettings(input.testPresenceSettings ?? DEFAULT_TEST_PRESENCE_SETTINGS);
     const strictQualityAnalysisResults = input.analysisResults.filter((result) => this.isStrictQualityCheckTargetFile(result.filePath));
@@ -239,8 +248,9 @@ export class QualityReportGenerator {
       });
       return result;
     };
+    // 型検査は同期実行でイベントループを塞ぐため配列の最後に置き、
+    // アーティファクト走査などの非同期 I/O を先に発行させる
     const [
-      rawTypeCheckSummary,
       browserAuditSummary,
       testArtifactSummary,
       uiTestArtifactSummary,
@@ -255,16 +265,8 @@ export class QualityReportGenerator {
       ciPresence,
       docsPresence,
       externalPackageCount,
+      rawTypeCheckSummary,
     ] = await Promise.all([
-      runPhase(
-        "Quality phase: type check",
-        () => new TypeCheckAnalyzer().analyzeProject(input.projectRoot, input.tsConfigPath, {
-          includedFilePaths: strictQualityParsedFiles.map((parsedFile) => parsedFile.filePath),
-          maxRootNames: input.maxTypeCheckRootNames ?? 5000,
-          onProgress,
-        }),
-        { files: strictQualityParsedFiles.length },
-      ),
       runPhase("Quality phase: browser audits", () => new BrowserAuditAnalyzer().analyzeProject(input.projectRoot)),
       runPhase("Quality phase: test artifacts", () => new TestArtifactAnalyzer().analyzeProject(input.projectRoot)),
       runPhase("Quality phase: UI test artifacts", () => new UiTestArtifactAnalyzer().analyzeProject(input.projectRoot)),
@@ -279,6 +281,16 @@ export class QualityReportGenerator {
       runPhase("Quality phase: CI detection", () => this.collectCiPresence(input.projectRoot)),
       runPhase("Quality phase: documentation detection", () => this.collectDocumentationPresence(input.projectRoot)),
       runPhase("Quality phase: dependency summary", () => this.collectExternalPackageCount(input.analysisResults), { files: input.analysisResults.length }),
+      runPhase(
+        "Quality phase: type check",
+        () => new TypeCheckAnalyzer().analyzeProject(input.projectRoot, input.tsConfigPath, {
+          includedFilePaths: strictQualityParsedFiles.map((parsedFile) => parsedFile.filePath),
+          maxRootNames: input.maxTypeCheckRootNames ?? 5000,
+          cacheDir: input.cacheDir,
+          onProgress,
+        }),
+        { files: strictQualityParsedFiles.length },
+      ),
     ]);
     const typeCheckSummary = this.filterTypeCheckSummary(rawTypeCheckSummary);
     const typeEscapeStats = this.collectTypeEscapeStats(strictQualityAnalysisResults);
@@ -567,7 +579,7 @@ export class QualityReportGenerator {
     ));
 
     return [
-      this.metric("code", "typescript_errors", "TypeScript型エラー数", String(typeCheckSummary.totalErrors), "0", typeCheckVerdict, typeCheckSummary.skippedReason ?? "tsconfig ベースの pre-emit diagnostics を集計しています。", typeCheckSummary.issues.slice(0, 10).map((issue) => this.fileEvidence(`TS${issue.code}`, issue.filePath, `${issue.line}:${issue.character} ${issue.message}`))),
+      this.metric("code", "typescript_errors", "TypeScript型エラー数", String(typeCheckSummary.totalErrors), "0", typeCheckVerdict, typeCheckSummary.skippedReason ?? "tsconfig ベースの pre-emit diagnostics を集計しています。", this.buildTypeCheckEvidence(typeCheckSummary)),
       this.metric("code", "tsconfig_type_safety", "tsconfig型安全設定", strictnessActual, "strict=all configs", strictnessVerdict, strictnessSummary
         ? "strict を主判定とし、noImplicitAny / strictNullChecks / noUncheckedIndexedAccess / exactOptionalPropertyTypes / useUnknownInCatchVariables の補強設定を証跡として集計しています。"
         : "tsconfig 情報が無いため手動確認扱いです。", strictnessEvidence),
@@ -702,23 +714,27 @@ export class QualityReportGenerator {
     const vitest = testArtifactSummary.vitest;
     const playwright = uiTestArtifactSummary.playwright;
     const storybook = uiTestArtifactSummary.storybook;
-    const junitRate = junit && junit.totalTests > 0 ? (junit.passedTests / junit.totalTests) * 100 : null;
+    // 通過率の分母はスキップを除いた実行件数。skip 混じりでも失敗 0 なら 100% になる。
+    const junitExecuted = junit ? Math.max(0, junit.totalTests - junit.skippedTests) : 0;
+    const junitRate = junit && junitExecuted > 0 ? (junit.passedTests / junitExecuted) * 100 : null;
     const coverageRate = coverage?.lineCoverage ?? null;
-    const playwrightRate = playwright && playwright.totalTests > 0 ? (playwright.passedTests / playwright.totalTests) * 100 : null;
-    const storybookRate = storybook && storybook.totalTests > 0 ? (storybook.passedTests / storybook.totalTests) * 100 : null;
+    const playwrightExecuted = playwright ? Math.max(0, playwright.totalTests - playwright.skippedTests) : 0;
+    const playwrightRate = playwright && playwrightExecuted > 0 ? (playwright.passedTests / playwrightExecuted) * 100 : null;
+    const storybookExecuted = storybook ? Math.max(0, storybook.totalTests - storybook.skippedTests) : 0;
+    const storybookRate = storybook && storybookExecuted > 0 ? (storybook.passedTests / storybookExecuted) * 100 : null;
     const unitPassMetric = junit
       ? this.metric(
         "test",
         "unit_pass_rate",
         "Unitテスト通過率",
-        junit.totalTests > 0 ? `${junitRate?.toFixed(1)}%` : "0件",
+        junit.totalTests === 0 ? "0件" : junitExecuted === 0 ? "実行0件（全てスキップ）" : `${junitRate?.toFixed(1)}%`,
         "100%",
-        junit.totalTests === 0
+        junit.totalTests === 0 || junitExecuted === 0
           ? "warn"
           : junit.failedTests === 0 && junitRate === 100
             ? "pass"
             : "fail",
-        "JUnit XML から tests / failures / errors / skipped を集計しています。",
+        "JUnit XML から tests / failures / errors / skipped を集計しています。通過率はスキップを分母から除外して算出します。",
         [
           this.noteEvidence("総テスト数", String(junit.totalTests)),
           this.noteEvidence("失敗数", String(junit.failedTests)),
@@ -767,14 +783,14 @@ export class QualityReportGenerator {
         "test",
         "storybook_pass_rate",
         "Storybook Interactionテスト通過率",
-        storybook.totalTests > 0 ? `${storybookRate?.toFixed(1)}%` : "0件",
+        storybook.totalTests === 0 ? "0件" : storybookExecuted === 0 ? "実行0件（全てスキップ）" : `${storybookRate?.toFixed(1)}%`,
         "100%",
-        storybook.totalTests === 0
+        storybook.totalTests === 0 || storybookExecuted === 0
           ? "warn"
           : storybook.failedTests === 0 && storybookRate === 100
             ? "pass"
             : "fail",
-        "Storybook 結果 JSON から通過率を集計しています。",
+        "Storybook 結果 JSON から通過率を集計しています。通過率はスキップを分母から除外して算出します。",
         [
           this.noteEvidence("総テスト数", String(storybook.totalTests)),
           this.noteEvidence("失敗数", String(storybook.failedTests)),
@@ -788,14 +804,14 @@ export class QualityReportGenerator {
         "test",
         "e2e_pass_rate",
         "E2Eテスト通過率",
-        playwright.totalTests > 0 ? `${playwrightRate?.toFixed(1)}%` : "0件",
+        playwright.totalTests === 0 ? "0件" : playwrightExecuted === 0 ? "実行0件（全てスキップ）" : `${playwrightRate?.toFixed(1)}%`,
         "100%",
-        playwright.totalTests === 0
+        playwright.totalTests === 0 || playwrightExecuted === 0
           ? "warn"
           : playwright.failedTests === 0 && playwrightRate === 100
             ? "pass"
             : "fail",
-        "Playwright 結果 JSON から通過率を集計しています。",
+        "Playwright 結果 JSON から通過率を集計しています。通過率はスキップを分母から除外して算出します。",
         [
           this.noteEvidence("総テスト数", String(playwright.totalTests)),
           this.noteEvidence("失敗数", String(playwright.failedTests)),
@@ -998,7 +1014,8 @@ export class QualityReportGenerator {
 
     return [
       this.metric("dependencies", "external_package_count", "外部依存パッケージ数", String(externalPackageCount), this.externalPackageThresholdLabel(), externalVerdict, "import された外部 package 名のユニーク数です。", []),
-      this.metric("dependencies", "dependency_cycle_count", "循環依存件数", String(graphMetrics.cycles.length), "0", graphMetrics.cycles.length === 0 ? "pass" : "fail", "依存グラフ観点でのライブラリ品質監査です。", []),
+      // コード品質の「循環依存数」と同一事象のため、二重に FAIL 計上しない参照 (派生) 指標にする
+      this.metric("dependencies", "dependency_cycle_count", "循環依存件数（コード品質と同一事象）", String(graphMetrics.cycles.length), "0", graphMetrics.cycles.length === 0 ? "pass" : "fail", "コード品質カテゴリの「循環依存数」と同じ検出結果の参照表示です。対応はコード品質側で行ってください。", [], "derived"),
       this.manualMetric("dependencies", "unused_dependencies", "不要依存の有無", "0", "package.json と import 実績の完全照合が未実装です。"),
       this.manualMetric("dependencies", "license_compliance", "ライセンス適合性", "適合", "license scan の取込が未実装です。"),
       this.manualMetric("dependencies", "maintenance_health", "メンテナンス状態", "健全", "更新頻度や保守終了の監査が未実装です。"),
@@ -1206,18 +1223,8 @@ export class QualityReportGenerator {
     const blockingMetrics = this.collectBlockingAutomaticMetrics(report, 3);
     const lines: string[] = ["# React 出荷審査 品質レポート", ""];
 
-    const tocItems = ["判定凡例", "要点", "優先対応", "不足証跡", "集計"];
-    if (showWorkspaceSegments) {
-      tocItems.push("ワークスペース内訳");
-    }
-    if (showFeatureSummaries) {
-      tocItems.push("フィーチャー内訳");
-    }
-    tocItems.push("観点別詳細");
-    if (manualOnlyCategories.length > 0) {
-      tocItems.push("付録: 手動確認カテゴリ");
-    }
-    lines.push("## 目次", "", ...tocItems.map((item, index) => `${index + 1}. ${item}`), "");
+    // 目次は本文確定後に実際の h2 見出しから生成する (プレースホルダを後で置換)
+    lines.push("{{QUALITY_TOC}}", "");
 
     lines.push(
       "## 判定凡例",
@@ -1232,14 +1239,17 @@ export class QualityReportGenerator {
       "",
       `- 総合判定ルール: ${this.describeOverallVerdictRule()}`,
       "- 信頼度: 高=実測/集計, 中=静的推定, 低=手動入力または未収集",
+      "- 集計「親」= カテゴリ判定と件数集計に使う主指標 / 「派生」= 親の内訳や参照 (総合判定には使わない診断情報)",
+      "- カテゴリの PARTIAL は、指標単体の PARTIAL が無くても手動確認待ちが残っている場合に付きます",
       "",
     );
 
     lines.push(
       "## 要点",
       "",
+      ...this.buildGateVerdictLines(),
       `- 総合判定: ${this.verdictLabel(report.summary.overallVerdict)}`,
-      `- 前回比: N/A（ベースライン未設定）`,
+      this.buildBaselineComparisonLine(report),
       `- 自動判定カバレッジ: ${automaticCoverage.automaticCount}/${automaticCoverage.totalCount} 指標 (${automaticCoverage.coverageRate.toFixed(1)}%)`,
       `- 実測ベーススコア: PASS率 ${measuredSignalStats.passRate.toFixed(1)}%（PASS ${measuredSignalStats.pass} / WARN ${measuredSignalStats.warn} / FAIL ${measuredSignalStats.fail} / PARTIAL ${measuredSignalStats.partial}）`,
       `- 推定込みスコア: PASS率 ${modeledSignalStats.passRate.toFixed(1)}%（PASS ${modeledSignalStats.pass} / WARN ${modeledSignalStats.warn} / FAIL ${modeledSignalStats.fail} / PARTIAL ${modeledSignalStats.partial}）`,
@@ -1257,15 +1267,20 @@ export class QualityReportGenerator {
     if (priorityMetrics.length === 0) {
       lines.push("自動判定で直ちに阻害する項目はありません。", "");
     } else {
+      // 列を絞って読める幅に収め、推奨アクションは省略せず表の直下に全文を出す
       lines.push(
-        "| 優先度 | 観点 | 指標 | 判定 | 実績 | 基準 | 証跡種別 | 信頼度 | 主対象 | 推奨アクション | 要点 |",
-        "|--------|------|------|------|------|------|----------|--------|--------|----------------|------|",
+        "| 優先度 | 観点 | 指標 | 判定 | 実績 | 基準 | 主対象 |",
+        "|--------|------|------|------|------|------|--------|",
       );
       priorityMetrics.forEach((entry, index) => {
         const metricLabel = this.shouldRenderDetailedMetric(entry.metric)
           ? `[${entry.metric.label}](#${this.metricAnchor(entry.categoryLabel, entry.metric)})`
           : entry.metric.label;
-        lines.push(`| ${index + 1} | ${entry.categoryLabel} | ${metricLabel} | ${this.verdictLabel(entry.metric.verdict)} | ${this.escapePipe(entry.metric.actual)} | ${this.escapePipe(entry.metric.threshold)} | ${this.describeEvidenceType(entry.metric)} | ${this.describeConfidenceLevel(entry.metric)} | ${this.escapePipe(this.summarizeMetricTargets(entry.metric, 2))} | ${this.escapePipe(this.truncateText(this.recommendMetricAction(entry.metric), 45))} | ${this.escapePipe(this.truncateText(entry.metric.summary, 45))} |`);
+        lines.push(`| ${index + 1} | ${entry.categoryLabel} | ${metricLabel} | ${this.verdictLabel(entry.metric.verdict)} | ${this.escapePipe(entry.metric.actual)} | ${this.escapePipe(entry.metric.threshold)} | ${this.escapePipe(this.summarizeMetricTargets(entry.metric, 2))} |`);
+      });
+      lines.push("", "### 推奨アクション", "");
+      priorityMetrics.forEach((entry, index) => {
+        lines.push(`${index + 1}. **${entry.metric.label}** (${this.verdictLabel(entry.metric.verdict)} ${entry.metric.actual}) — ${this.recommendMetricAction(entry.metric)}`);
       });
       lines.push("");
     }
@@ -1415,12 +1430,13 @@ export class QualityReportGenerator {
         const sortedEvidence = this.sortEvidenceForDisplay(metric.evidence);
         lines.push(`<a id="${this.metricAnchor(category.label, metric)}"></a>`, `#### ${metric.label}`, "", `- 集計: ${metric.aggregation === "derived" ? "派生" : "親"}`, `- 判定: ${this.verdictLabel(metric.verdict)}`, `- 実績: ${metric.actual}`, `- 基準: ${metric.threshold}`, `- 証跡種別: ${this.describeEvidenceType(metric)}`, `- 信頼度: ${this.describeConfidenceLevel(metric)}`, `- 主対象: ${this.summarizeMetricTargets(metric, 3)}`, `- 推奨アクション: ${this.recommendMetricAction(metric)}`, `- 要点: ${metric.summary}`);
         if (metric.evidence.length > 0) {
-          lines.push("- 証跡:");
+          // 「他N件」だけだと実績値 (例: 108 件) との対応が読めないため、分母を明記する
+          lines.push(sortedEvidence.length > 3 ? `- 証跡（代表 3 件 / 収集 ${sortedEvidence.length} 件）:` : "- 証跡:");
           for (const evidence of sortedEvidence.slice(0, 3)) {
             lines.push(`  - ${evidence.label}: ${evidence.value}`);
           }
           if (sortedEvidence.length > 3) {
-            lines.push(`  - 他${sortedEvidence.length - 3}件`);
+            lines.push(`  - 残り ${sortedEvidence.length - 3} 件は JSON レポートを参照`);
           }
         }
         lines.push("");
@@ -1437,7 +1453,22 @@ export class QualityReportGenerator {
     }
 
     lines.push("## メタデータ", "", `- 生成時刻: ${report.timestamp}`, `- 実行時間: ${report.executionTimeMs}ms`, `- プロジェクト: ${report.projectRoot}`, `- 品質プロファイル: ${qualityProfile}`, "");
-    return lines.join("\n");
+    const body = lines.join("\n");
+    const headings = Array.from(body.matchAll(/^## (.+)$/gmu)).map((match) => match[1]!);
+    const toc = [
+      "## 目次",
+      "",
+      ...headings.map((heading, index) => `${index + 1}. [${heading}](#${this.toMarkdownAnchor(heading)})`),
+    ].join("\n");
+    return body.replace("{{QUALITY_TOC}}", toc);
+  }
+
+  private toMarkdownAnchor(title: string): string {
+    return title
+      .toLowerCase()
+      .replace(/[^\p{Letter}\p{Number}\s-]/gu, "")
+      .trim()
+      .replace(/\s+/gu, "-");
   }
 
   private collectBlockingAutomaticMetrics(
@@ -1931,7 +1962,8 @@ export class QualityReportGenerator {
     <h2>要点</h2>
     <ul class="bullet-list">
       <li>総合判定: ${this.escapeHtml(this.verdictLabel(report.summary.overallVerdict))}</li>
-      <li>前回比: N/A（ベースライン未設定）</li>
+      ${this.buildGateVerdictLines().map((line) => `<li>${this.escapeHtml(line.replace(/^[-\s]*/u, "").replace(/\*\*/gu, ""))}</li>`).join("\n      ")}
+      <li>${this.escapeHtml(this.buildBaselineComparisonLine(report).replace(/^[-\s]*/u, ""))}</li>
       <li>自動阻害指標: ${this.escapeHtml(blockingMetrics.length > 0 ? blockingMetrics.map((entry) => `${entry.categoryLabel}/${entry.metric.label}`).join("、") : "なし")}</li>
       <li>注目下位指標: ${this.escapeHtml(derivedInsights.length > 0 ? derivedInsights.map((entry) => `${entry.categoryLabel}/${entry.metric.label} ${entry.metric.actual} (${this.verdictLabel(entry.metric.verdict)})`).join("、") : "なし")}</li>
       <li>FAILカテゴリ: ${this.escapeHtml(failCategories.length > 0 ? failCategories.join("、") : "なし")}</li>
@@ -2270,7 +2302,7 @@ export class QualityReportGenerator {
 
   private collectZodAdoption(parsedFiles: ParsedFile[]): { totalFiles: number; adoptedFiles: number; rate: number } {
     const candidates = parsedFiles.filter((parsedFile) => {
-      const normalized = parsedFile.filePath.replace(/\\/gu, "/").toLowerCase();
+      const normalized = this.toDisplayPath(parsedFile.filePath).replace(/\\/gu, "/").toLowerCase();
       return /(^|\/)(api|infra|service|services|client|clients|repository|repositories|schema|schemas|validation|validations)(\/|$)/u.test(normalized)
         && !this.isTestFile(parsedFile.filePath)
         && !/stories?\./u.test(normalized);
@@ -2914,7 +2946,9 @@ export class QualityReportGenerator {
   }
 
   private classifyFileType(filePath: string): string {
-    return classifyFileType(filePath);
+    // 分類パターンはパス全体に照合されるため、プロジェクトより上位のディレクトリ名
+    // (例: CI の /home/runner/work/app/app) が判定へ混入しないよう相対化してから渡す。
+    return classifyFileType(this.toDisplayPath(filePath));
   }
 
   private isStoryFile(filePath: string): boolean {
@@ -2943,7 +2977,7 @@ export class QualityReportGenerator {
   }
 
   private isTestFile(filePath: string): boolean {
-    const normalized = filePath.replace(/\\/gu, "/").toLowerCase();
+    const normalized = this.toDisplayPath(filePath).replace(/\\/gu, "/").toLowerCase();
     return /(?:^|\/)(?:tests?|__tests__|e2e|playwright|cypress)(?:\/|$)/u.test(normalized)
       || /\.(?:test|spec|e2e|cy|ct)\.[jt]sx?$/u.test(normalized);
   }
@@ -3117,7 +3151,7 @@ export class QualityReportGenerator {
       return "library";
     }
 
-    const normalized = filePath.replace(/\\/gu, "/").toLowerCase();
+    const normalized = this.toDisplayPath(filePath).replace(/\\/gu, "/").toLowerCase();
     if (normalized.includes("/components/ui/")
       || normalized.includes("/shared/ui/")
       || normalized.includes("/components/commons/")) {
@@ -3516,18 +3550,89 @@ export class QualityReportGenerator {
     };
   }
 
+  private buildTypeCheckEvidence(typeCheckSummary: TypeCheckSummary): QualityEvidence[] {
+    if (typeCheckSummary.issues.length === 0) {
+      return [];
+    }
+
+    // 個別 issue の羅列より先にエラーコード別の内訳を出し、実態を掴めるようにする。
+    // モジュール解決系 (TS2307/TS2875 など) は依存未インストールの環境要因であることが
+    // 多いため、その可能性を注記する。
+    const MODULE_RESOLUTION_CODES = new Set([2307, 2792, 2875]);
+    const countsByCode = new Map<number, number>();
+    for (const issue of typeCheckSummary.issues) {
+      countsByCode.set(issue.code, (countsByCode.get(issue.code) ?? 0) + 1);
+    }
+    const breakdown = Array.from(countsByCode.entries())
+      .sort((left, right) => right[1] - left[1] || left[0] - right[0])
+      .map(([code, count]) => `TS${code}: ${count}件`)
+      .join(", ");
+    const evidence: QualityEvidence[] = [this.noteEvidence("エラーコード別内訳", breakdown)];
+    const moduleResolutionCount = typeCheckSummary.issues.filter((issue) => MODULE_RESOLUTION_CODES.has(issue.code)).length;
+    if (moduleResolutionCount > 0) {
+      evidence.push(this.noteEvidence(
+        "注記",
+        `モジュール解決エラー ${moduleResolutionCount} 件は依存パッケージ未インストールなど環境要因の可能性があります`,
+      ));
+    }
+    evidence.push(...typeCheckSummary.issues.slice(0, 10).map((issue) =>
+      this.fileEvidence(`TS${issue.code}`, issue.filePath, `${issue.line}:${issue.character} ${issue.message}`)));
+    return evidence;
+  }
+
+  private buildBaselineComparisonLine(report: QualityReport): string {
+    const context = this.gateContext;
+    if (!context?.baselinePath) {
+      return "- 前回比: N/A（ベースライン未設定）";
+    }
+    const baselineLabel = context.baselineOverallVerdict ? this.verdictLabel(context.baselineOverallVerdict) : "不明";
+    const currentLabel = this.verdictLabel(report.summary.overallVerdict);
+    return `- 前回比: ${baselineLabel} -> ${currentLabel}（悪化 ${context.regressedCount ?? 0} 件 / 改善 ${context.improvedCount ?? 0} 件、ベースライン: ${this.toDisplayPath(context.baselinePath)}）`;
+  }
+
+  private buildGateVerdictLines(): string[] {
+    const context = this.gateContext;
+    if (!context || context.mode !== "gate") {
+      return [];
+    }
+    if (context.gateVerdict !== "fail") {
+      return ["- **ゲート判定: PASS**（自動FAILなし、ベースライン悪化なし）"];
+    }
+
+    const lines = [
+      `- **ゲート判定: FAIL**（自動FAIL ${context.failingAutomaticMetrics.length} 件 / ベースライン悪化 ${context.blockingRegressions.length} 件、終了コード 2）`,
+    ];
+    for (const offender of context.failingAutomaticMetrics.slice(0, 5)) {
+      lines.push(`  - 阻害: ${offender.category} / ${offender.label} — 実績 ${offender.actual}（基準 ${offender.threshold}）`);
+    }
+    for (const regression of context.blockingRegressions.slice(0, 5)) {
+      lines.push(`  - 悪化: ${regression.category} / ${regression.label} — ${regression.baselineVerdict} -> ${regression.currentVerdict}`);
+    }
+    const hiddenCount = Math.max(0, context.failingAutomaticMetrics.length - 5) + Math.max(0, context.blockingRegressions.length - 5);
+    if (hiddenCount > 0) {
+      lines.push(`  - ほか ${hiddenCount} 件は観点別詳細を参照`);
+    }
+    return lines;
+  }
+
   private toDisplayPath(filePath: string): string {
+    // 分類・照合ヘルパーから同じパスに対して繰り返し呼ばれるためメモ化する
+    const cached = this.displayPathCache.get(filePath);
+    if (cached !== undefined) {
+      return cached;
+    }
+
     const normalized = filePath.split(path.sep).join("/");
-    if (!this.projectRoot || !path.isAbsolute(filePath)) {
-      return normalized;
+    let displayPath = normalized;
+    if (this.projectRoot && path.isAbsolute(filePath)) {
+      const relativePath = path.relative(this.projectRoot, filePath);
+      if (relativePath && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)) {
+        displayPath = relativePath.split(path.sep).join("/");
+      }
     }
 
-    const relativePath = path.relative(this.projectRoot, filePath);
-    if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
-      return normalized;
-    }
-
-    return relativePath.split(path.sep).join("/");
+    this.displayPathCache.set(filePath, displayPath);
+    return displayPath;
   }
 
   private cloneTestPresenceSettings(settings: TestPresenceSettings): TestPresenceSettings {

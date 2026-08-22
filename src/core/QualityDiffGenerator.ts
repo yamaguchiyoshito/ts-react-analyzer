@@ -161,7 +161,7 @@ export class QualityDiffGenerator {
       baselineAggregation: baseline?.aggregation,
       currentAggregation: current?.aggregation,
       status,
-      trend: this.calculateTrend(current?.verdict, baseline?.verdict),
+      trend: this.calculateTrend(current, baseline),
       baselineActual: baseline?.actual,
       currentActual: current?.actual,
       baselineThreshold: baseline?.threshold,
@@ -206,13 +206,19 @@ export class QualityDiffGenerator {
     };
   }
 
-  private calculateTrend(current?: QualityVerdict, baseline?: QualityVerdict): QualityDiffTrend {
+  private calculateTrend(current?: QualityMetricReport, baseline?: QualityMetricReport): QualityDiffTrend {
     if (!current || !baseline) {
       return "neutral";
     }
 
-    const currentScore = this.verdictScore(current);
-    const baselineScore = this.verdictScore(baseline);
+    // 実測できていた指標が manual (証跡待ち) に落ちるのは証跡の喪失であり、
+    // verdictScore 上は良化に見えても悪化として扱う
+    if (baseline.verdict !== "manual" && current.verdict === "manual") {
+      return "regressed";
+    }
+
+    const currentScore = this.verdictScore(current.verdict);
+    const baselineScore = this.verdictScore(baseline.verdict);
 
     if (currentScore < baselineScore) {
       return "improved";
@@ -220,7 +226,64 @@ export class QualityDiffGenerator {
     if (currentScore > baselineScore) {
       return "regressed";
     }
+
+    // 判定が同じでも warn / fail に留まったままの数値変化は方向で判定する。
+    // 「FAIL のまま少しずつ腐る」リグレッションを neutral にしない。
+    if (current.verdict === "warn" || current.verdict === "fail") {
+      const direction = this.compareActualDirection(current, baseline);
+      if (direction === "worse") {
+        return "regressed";
+      }
+      if (direction === "better") {
+        return "improved";
+      }
+    }
     return "neutral";
+  }
+
+  private compareActualDirection(
+    current: QualityMetricReport,
+    baseline: QualityMetricReport,
+  ): "worse" | "better" | "same" | "unknown" {
+    const currentValue = this.parseLeadingNumber(current.actual);
+    const baselineValue = this.parseLeadingNumber(baseline.actual);
+    if (currentValue === null || baselineValue === null) {
+      return "unknown";
+    }
+    if (currentValue === baselineValue) {
+      return "same";
+    }
+
+    const higherIsBetter = this.isHigherBetterThreshold(current.threshold || baseline.threshold || "");
+    if (higherIsBetter === null) {
+      return "unknown";
+    }
+    const improved = higherIsBetter ? currentValue > baselineValue : currentValue < baselineValue;
+    return improved ? "better" : "worse";
+  }
+
+  private parseLeadingNumber(value: string | undefined): number | null {
+    if (!value) {
+      return null;
+    }
+    const match = /^\s*(-?\d+(?:\.\d+)?)/u.exec(value);
+    return match?.[1] !== undefined ? Number.parseFloat(match[1]) : null;
+  }
+
+  private isHigherBetterThreshold(threshold: string): boolean | null {
+    if (/>=?/u.test(threshold)) {
+      return true;
+    }
+    if (/<=?/u.test(threshold)) {
+      return false;
+    }
+    if (/^\s*100%/u.test(threshold)) {
+      return true;
+    }
+    if (/^\s*\d+(?:\.\d+)?\s*$/u.test(threshold)) {
+      return false;
+    }
+    return null;
   }
 
   private verdictScore(verdict: QualityVerdict): number {
@@ -282,7 +345,12 @@ export class QualityDiffGenerator {
   }
 
   private serializeEvidence(evidence: QualityMetricReport["evidence"]): string[] {
-    return evidence.map((item) => `${item.type}:${item.label}:${item.value}:${item.filePath ?? ""}`);
+    // この文字列は差分検出のキーであると同時にレポートへそのまま表示されるため、
+    // 内部形式の連結ではなく人が読める形にする
+    return evidence.map((item) => {
+      const location = item.filePath && item.filePath !== item.value ? ` (${item.filePath})` : "";
+      return `${item.label}: ${item.value}${location}`;
+    });
   }
 
   private diffStrings(current: string[], baseline: string[]): string[] {
@@ -336,7 +404,9 @@ export class QualityDiffGenerator {
     }
 
     for (const metric of changedMetrics) {
-      markdown += `- [${metric.status}/${metric.trend}] ${metric.categoryLabel} / ${metric.label}: ${metric.changes.join("; ") || "value changed"}\n`;
+      const visibleChanges = metric.changes.slice(0, 5);
+      const remainder = metric.changes.length - visibleChanges.length;
+      markdown += `- [${metric.status}/${metric.trend}] ${metric.categoryLabel} / ${metric.label}: ${visibleChanges.join("; ") || "value changed"}${remainder > 0 ? `; ほか${remainder}件 (JSON 参照)` : ""}\n`;
     }
 
     return markdown;

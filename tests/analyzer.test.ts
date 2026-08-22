@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 import ts from "typescript";
 
-import { ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, FileScanner, GraphBuilder, QualityDiffGenerator, QualityReportGenerator, ReportGenerator, TypeCheckAnalyzer } from "../src/core/index.js";
+import { ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, QualityDiffGenerator, QualityReportGenerator, ReportGenerator, TypeCheckAnalyzer } from "../src/core/index.js";
 import type { AnalysisResult, Dependency, GraphMetrics, PersistedAnalysisReport, QualityDiffReport, QualityReport } from "../src/types/index.js";
 
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -269,6 +269,41 @@ test("DependencyAnalyzer keeps side-effect imports in the dependency graph", () 
   ));
 });
 
+test("ConfigManager converts tsconfig exclude globs into anchored patterns", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-exclude-glob-"));
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.mkdir(path.join(projectRoot, "out"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "src", "checkout.ts"), "export const checkout = 1;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "buildHelpers.ts"), "export const helper = 1;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "out", "generated.ts"), "export const generated = 1;\n", "utf8");
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+    },
+    include: ["src"],
+    exclude: ["node_modules", "build", "out"],
+  }, null, 2), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    { cacheDir: path.join(projectRoot, ".cache"), enableCache: false },
+  );
+
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const parsedPaths = scanResult.parsed.map((file) => file.filePath);
+
+  assert.ok(parsedPaths.some((filePath) => filePath.endsWith(path.join("src", "checkout.ts"))));
+  assert.ok(parsedPaths.some((filePath) => filePath.endsWith(path.join("src", "buildHelpers.ts"))));
+  assert.ok(!parsedPaths.some((filePath) => filePath.includes(`${path.sep}out${path.sep}`)));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
 test("ComplexityAnalyzer detects hooks, JSX, and explicit any usage", async () => {
   const configManager = new ConfigManager();
   const config = configManager.mergeConfigs(
@@ -316,6 +351,49 @@ test("ComplexityAnalyzer classifies ts directives and unsafe assertion patterns"
   assert.ok(metrics.typeMetrics.uncheckedPatterns.includes("@ts-expect-error"));
   assert.ok(metrics.typeMetrics.uncheckedPatterns.includes("@ts-nocheck"));
   assert.ok(metrics.typeMetrics.uncheckedPatterns.includes("double-assertion"));
+});
+
+test("ComplexityAnalyzer does not double-count nested function branches into the parent", () => {
+  const source = `
+    export function Parent() {
+      const onClick = () => {
+        if (Math.random() > 0.5) {
+          return 1;
+        }
+        return 0;
+      };
+      return onClick;
+    }
+  `;
+  const sourceFile = ts.createSourceFile("nested.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const metrics = new ComplexityAnalyzer().analyzeFile(sourceFile, "/virtual/nested.ts");
+
+  const parent = metrics.functions.find((fn) => fn.name === "Parent");
+  const handler = metrics.functions.find((fn) => fn.name !== "Parent");
+
+  // onClick 内の if は onClick 側 (cc=2) にのみ計上され、Parent は cc=1 のまま
+  assert.equal(parent?.cyclomaticComplexity, 1);
+  assert.equal(handler?.cyclomaticComplexity, 2);
+});
+
+test("ComplexityAnalyzer counts switch case clauses without counting the switch itself", () => {
+  const source = `
+    export function pick(kind: string) {
+      switch (kind) {
+        case "a":
+          return 1;
+        case "b":
+          return 2;
+        default:
+          return 0;
+      }
+    }
+  `;
+  const sourceFile = ts.createSourceFile("switch.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const metrics = new ComplexityAnalyzer().analyzeFile(sourceFile, "/virtual/switch.ts");
+
+  // 標準的な cyclomatic complexity: 1 + case 2 個 = 3 (default と switch 自体は数えない)
+  assert.equal(metrics.functions[0]?.cyclomaticComplexity, 3);
 });
 
 test("ComplexityAnalyzer weights peak complexity, nesting, and hook pressure into file score", () => {
@@ -477,9 +555,13 @@ test("ReportGenerator writes json, markdown, csv, and html outputs", async () =>
   assert.match(htmlReport, /Incremental/u);
   assert.match(htmlReport, /file:\/\//u);
   assert.match(htmlReport, /Dependency Graph/u);
+  // HTML も日本語化し、md の中核である優先対応 Top 5 を先頭に持つ
+  assert.match(htmlReport, /優先対応 Top 5/u);
+  assert.match(htmlReport, /推奨対応/u);
+  assert.match(htmlReport, /円の大きさ = 依存グラフ上の中心性/u);
   assert.match(markdownReport, /## 目次/u);
   assert.match(markdownReport, /## 要点/u);
-  assert.match(markdownReport, /最初の 30 秒で読むべき情報だけを先頭に集約しています。/u);
+  assert.match(markdownReport, /ここだけ読めば、いま対応すべきものが分かります。/u);
   assert.match(markdownReport, /## 優先対応 Top 5/u);
   assert.match(markdownReport, /## 3x3 マトリクス要約/u);
   assert.match(markdownReport, /コード行数と複雑度の 3x3 マトリクスで、設計負債の位置を俯瞰します。/u);
@@ -662,7 +744,8 @@ test("QualityReportGenerator writes quality outputs with automatic and manual me
   assert.match(markdownReport, /## 不足証跡/u);
   assert.match(markdownReport, /前回比: N\/A（ベースライン未設定）/u);
   assert.match(markdownReport, /\| 観点 \| 自動 \| FAIL \| WARN \| PARTIAL \| 手動 \| 判定 \|/u);
-  assert.match(markdownReport, /\| 優先度 \| 観点 \| 指標 \| 判定 \| 実績 \| 基準 \| 証跡種別 \| 信頼度 \| 主対象 \| 推奨アクション \| 要点 \|/u);
+  assert.match(markdownReport, /\| 優先度 \| 観点 \| 指標 \| 判定 \| 実績 \| 基準 \| 主対象 \|/u);
+  assert.match(markdownReport, /### 推奨アクション/u);
   assert.match(markdownReport, /\| 指標 \| 集計 \| 実績 \| 基準 \| 判定 \| 証跡種別 \| 信頼度 \| 主対象 \|/u);
   assert.match(markdownReport, /## セキュリティ品質/u);
   assert.match(csvReport, /^"Category","Metric","Aggregation","Automation","Actual","Threshold","Verdict","Summary"/mu);
@@ -744,6 +827,50 @@ test("CLI quality collect auto-loads quality.manual.json and merges manual metri
   assert.equal(bugMetric?.verdict, "pass");
   assert.equal(bugMetric?.actual, "High=0, Medium=1, Low=2");
   assert.equal(functionalCategory?.verdict, "partial");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("CLI quality gate writes gate verdict and baseline comparison into the report", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-gate-verdict-"));
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.tsx"), [
+    "export const App = () => <main dangerouslySetInnerHTML={{ __html: \"<b>x</b>\" }} />;",
+  ].join("\n"), "utf8");
+
+  await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality", "collect", projectRoot,
+    "--output", outputDir, "--prefix", "base", "--format", "json",
+  ]);
+
+  const gateResult = await execFileAsync("node", [
+    path.join(workspaceRoot, "dist", "src", "cli.js"),
+    "quality", "gate", projectRoot,
+    "--output", outputDir, "--prefix", "rel", "--format", "json,markdown",
+    "--baseline", path.join(outputDir, "base_quality_report.json"),
+  ]).then(() => ({ code: 0 })).catch((error: { code?: number }) => ({ code: error.code ?? -1 }));
+
+  assert.equal(gateResult.code, 2);
+
+  const markdownReport = await fs.readFile(path.join(outputDir, "rel_quality_report.md"), "utf8");
+  assert.match(markdownReport, /- \*\*ゲート判定: FAIL\*\*（自動FAIL \d+ 件 \/ ベースライン悪化 \d+ 件、終了コード 2）/u);
+  assert.match(markdownReport, /  - 阻害: セキュリティ品質 \/ dangerouslySetInnerHTML使用件数 — 実績 1（基準 0）/u);
+  assert.match(markdownReport, /- 前回比: FAIL -> FAIL（悪化 \d+ 件 \/ 改善 \d+ 件、ベースライン: /u);
+  assert.doesNotMatch(markdownReport, /前回比: N\/A（ベースライン未設定）/u);
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
@@ -934,6 +1061,60 @@ test("QualityReportGenerator avoids double-counting nested JUnit suites", async 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
 
+test("QualityReportGenerator counts self-closing JUnit testcases correctly", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-junit-selfclosing-"));
+  const outputDir = path.join(projectRoot, "out");
+  const testResultsDir = path.join(projectRoot, "test-results");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.mkdir(testResultsDir, { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "value.ts"), "export const value = 1;\n", "utf8");
+  await fs.writeFile(path.join(testResultsDir, "junit.xml"), [
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+    "<testsuites>",
+    "  <testsuite name=\"unit\" tests=\"3\" failures=\"0\" errors=\"0\" skipped=\"1\">",
+    "    <testcase classname=\"value\" name=\"ok1\" file=\"src/value.test.ts\"/>",
+    "    <testcase classname=\"value\" name=\"ok2\" file=\"src/value.test.ts\" />",
+    "    <testcase classname=\"value\" name=\"sk\" file=\"src/value.test.ts\"><skipped/></testcase>",
+    "  </testsuite>",
+    "</testsuites>",
+  ].join("\n"), "utf8");
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: [],
+    parsedFiles: [],
+    graphMetrics: createEmptyGraphMetrics(),
+    executionTimeMs: 10,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "selfclosing-junit",
+    formats: ["json"],
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const unitPassMetric = testCategory?.metrics.find((metric) => metric.id === "unit_pass_rate");
+
+  assert.ok(unitPassMetric?.evidence.some((item) => item.label === "総テスト数" && item.value === "3"));
+  assert.ok(unitPassMetric?.evidence.some((item) => item.label === "失敗数" && item.value === "0"));
+  assert.ok(unitPassMetric?.evidence.some((item) => item.label === "スキップ数" && item.value === "1"));
+  // スキップは分母から除外されるため、失敗 0 件なら通過率 100% で pass になる
+  assert.equal(unitPassMetric?.actual, "100.0%");
+  assert.equal(unitPassMetric?.verdict, "pass");
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
 test("QualityReportGenerator ignores non-executable helper files inside test directories", async () => {
   const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-quality-test-helpers-"));
   const outputDir = path.join(projectRoot, "out");
@@ -1017,6 +1198,81 @@ test("QualityReportGenerator ignores non-executable helper files inside test dir
   assert.equal(overallMetric?.evidence.find((item) => item.label === "static一致数")?.value, "0");
 
   await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator classifies files relative to projectRoot even under test-like parent directories", async () => {
+  const baseRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-abs-path-"));
+  const projectRoot = path.join(baseRoot, "test", "app");
+  const outputDir = path.join(projectRoot, "out");
+
+  await fs.mkdir(path.join(projectRoot, "src", "features"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "features", "UserCard.tsx"), [
+    "export function UserCard() {",
+    "  return <section>User</section>;",
+    "}",
+  ].join("\n"), "utf8");
+
+  const configManager = new ConfigManager();
+  const config = configManager.mergeConfigs(
+    configManager.getDefaults(),
+    configManager.loadFromTSConfig(path.join(projectRoot, "tsconfig.json")),
+    {
+      outputDir,
+      filePrefix: "abs-path",
+      outputFormats: ["json"],
+      cacheDir: path.join(projectRoot, ".cache"),
+      enableCache: false,
+    },
+  );
+  const scanner = new FileScanner(config);
+  const scanResult = await scanner.scanProject(projectRoot);
+  const depAnalyzer = new DependencyAnalyzer(projectRoot, config.tsCompilerOptions);
+  const complexityAnalyzer = new ComplexityAnalyzer();
+  const graph = new GraphBuilder();
+  const results = scanResult.parsed.map((parsed) => {
+    const deps = depAnalyzer.extractDependencies(parsed.sourceFile, parsed.filePath);
+    return {
+      filePath: parsed.filePath,
+      complexity: complexityAnalyzer.analyzeFile(parsed.sourceFile, parsed.filePath),
+      dependencies: deps.dependencies,
+      dependencyErrors: deps.errors,
+    };
+  });
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: results,
+    parsedFiles: scanResult.parsed,
+    graphMetrics: buildGraphMetrics(graph, results),
+    executionTimeMs: 10,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "abs-path",
+    formats: ["json"],
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const overallMetric = testCategory?.metrics.find((metric) => metric.id === "matching_test_file_presence");
+
+  // 上位ディレクトリ名 "test" の影響で UserCard.tsx がテストファイル扱いになると
+  // 対象ソースが 0 件になり actual が N/A になる。プロジェクト相対で分類されていれば
+  // Feature としてテスト対象に数えられ、テスト未整備 (0.0% / fail) と判定される。
+  assert.equal(overallMetric?.actual, "0.0%");
+  assert.equal(overallMetric?.verdict, "fail");
+
+  await fs.rm(baseRoot, { recursive: true, force: true });
 });
 
 test("QualityReportGenerator uses JUnit executed test files as runtime evidence", async () => {
@@ -1114,6 +1370,61 @@ test("QualityReportGenerator uses JUnit executed test files as runtime evidence"
   assert.ok(overallMetric?.evidence.some((item) =>
     item.label === "runtime-test-link" && /junit:src\/__tests__\/page\.test\.tsx depth=0/u.test(item.value)
   ));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});
+
+test("QualityReportGenerator counts retried flaky Playwright tests as passed", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-playwright-flaky-"));
+  const outputDir = path.join(projectRoot, "out");
+  const reportDir = path.join(projectRoot, "playwright-report");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.mkdir(reportDir, { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "value.ts"), "export const value = 1;\n", "utf8");
+  await fs.writeFile(path.join(reportDir, "results.json"), JSON.stringify({
+    tests: [
+      {
+        location: { file: "tests/e2e/a.spec.ts" },
+        status: "flaky",
+        results: [{ status: "failed" }, { status: "passed" }],
+      },
+      {
+        location: { file: "tests/e2e/b.spec.ts" },
+        status: "expected",
+        results: [{ status: "passed" }],
+      },
+    ],
+  }, null, 2), "utf8");
+
+  const report = await new QualityReportGenerator().generateReports({
+    projectRoot,
+    analysisResults: [],
+    parsedFiles: [],
+    graphMetrics: createEmptyGraphMetrics(),
+    executionTimeMs: 10,
+    tsConfigPath: path.join(projectRoot, "tsconfig.json"),
+  }, {
+    outputDir,
+    prefix: "flaky",
+    formats: ["json"],
+  });
+
+  const testCategory = report.categories.find((category) => category.id === "test");
+  const e2eMetric = testCategory?.metrics.find((metric) => metric.id === "e2e_pass_rate");
+
+  // リトライで最終的に成功した flaky は failed に数えない
+  assert.equal(e2eMetric?.actual, "100.0%");
+  assert.equal(e2eMetric?.verdict, "pass");
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
@@ -3173,6 +3484,75 @@ test("CLI quality collect keeps test evidence under source-only and matches __te
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
 
+test("QualityDiffGenerator detects value-direction changes and lost evidence as regressions", () => {
+  const generator = new QualityDiffGenerator();
+  const buildReport = (metrics: Array<{ id: string; actual: string; threshold: string; verdict: QualityReport["categories"][number]["metrics"][number]["verdict"]; automation?: "automatic" | "manual" }>): QualityReport => ({
+    timestamp: "2026-03-20T00:00:00.000Z",
+    executionTimeMs: 1,
+    projectRoot: "/proj",
+    summary: {
+      totalMetrics: metrics.length,
+      derivedMetricCount: 0,
+      passCount: 0,
+      partialCount: 0,
+      partialCategoryCount: 0,
+      warnCount: 0,
+      failCount: 0,
+      manualCount: 0,
+      notApplicableCount: 0,
+      overallVerdict: "fail",
+    },
+    categories: [
+      {
+        id: "code",
+        label: "コード品質",
+        verdict: "fail",
+        summary: "",
+        metrics: metrics.map((metric) => ({
+          id: metric.id,
+          category: "code" as const,
+          label: metric.id,
+          aggregation: "primary" as const,
+          actual: metric.actual,
+          threshold: metric.threshold,
+          verdict: metric.verdict,
+          automation: metric.automation ?? "automatic",
+          summary: "",
+          evidence: [],
+        })),
+      },
+    ],
+  });
+
+  const baseline = buildReport([
+    { id: "typescript_errors", actual: "108", threshold: "0", verdict: "fail" },
+    { id: "unit_pass_rate", actual: "80.0%", threshold: "100%", verdict: "fail" },
+    { id: "coverage_rate", actual: "95.0%", threshold: ">= 80%", verdict: "pass" },
+    { id: "cycles", actual: "3", threshold: "0", verdict: "warn" },
+  ]);
+  const current = buildReport([
+    { id: "typescript_errors", actual: "110", threshold: "0", verdict: "fail" },
+    { id: "unit_pass_rate", actual: "手動証跡待ち", threshold: "100%", verdict: "manual", automation: "manual" },
+    { id: "coverage_rate", actual: "90.0%", threshold: ">= 80%", verdict: "pass" },
+    { id: "cycles", actual: "2", threshold: "0", verdict: "warn" },
+  ]);
+
+  const diff = generator.compare(current, baseline, "/proj/base.json", "/proj/current.json");
+  const byId = new Map(diff.metrics.map((metric) => [metric.id, metric]));
+
+  // fail のまま件数が増えた → 悪化
+  assert.equal(byId.get("typescript_errors")?.trend, "regressed");
+  // 実測 (fail) から manual への遷移 = 証跡喪失 → 改善ではなく悪化
+  assert.equal(byId.get("unit_pass_rate")?.trend, "regressed");
+  // pass のままの数値変動は基準内なので neutral
+  assert.equal(byId.get("coverage_rate")?.trend, "neutral");
+  // warn のまま件数が減った → 改善
+  assert.equal(byId.get("cycles")?.trend, "improved");
+
+  assert.equal(diff.summary.regressedMetrics, 2);
+  assert.equal(diff.summary.improvedMetrics, 1);
+});
+
 test("QualityDiffGenerator excludes derived regressions from primary summary counts", () => {
   const generator = new QualityDiffGenerator();
   const baseline: QualityReport = {
@@ -4273,8 +4653,10 @@ test("ReportGenerator separates expected and unexpected scan notes and formats a
   assert.match(markdownReport, /\| 1 \| src\/features\/order\/OrderPage\.tsx \| Critical \| 構造 \| 141 \|/u);
   assert.match(markdownReport, /- \*\*対象\*\*: src\/features\/order\/OrderPage\.tsx/u);
   assert.match(markdownReport, /- \*\*score帯\*\*: Critical/u);
-  assert.match(markdownReport, /- \*\*複雑度内訳\*\*: weighted=17, peakFn=7, top3avg=6, nesting=3, hookPressure=2/u);
-  assert.match(markdownReport, /- \*\*推奨対応\*\*: explicit anyの除去 \+ unsafe castの局所化/u);
+  assert.match(markdownReport, /- \*\*複雑度内訳\*\*: weighted=17, peakFn=7 \(c, 21行目\), top3avg=6, nesting=3, hookPressure=2/u);
+  // 主因が「構造」(依存 12 件) なので、推奨対応も構造側の処方が出る
+  assert.match(markdownReport, /- \*\*推奨対応\*\*: 依存境界の分割 \+ fan-out削減/u);
+  assert.match(markdownReport, /- \*\*内訳の見方\*\*: weighted=ファイル代表値/u);
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
@@ -4327,9 +4709,9 @@ test("ReportGenerator adds cycle cut candidates to dependency analysis", async (
 
   const markdownReport = await fs.readFile(path.join(outputDir, "cycle_report.md"), "utf8");
   assert.match(markdownReport, /### 循環依存/u);
-  assert.match(markdownReport, /切断候補: /u);
-  assert.match(markdownReport, /barrel経由: /u);
-  assert.match(markdownReport, /shared化候補: /u);
+  // 経路は閉路 (末尾が先頭に戻る) として表示される
+  assert.match(markdownReport, /- src\/a\.ts -> src\/b\.ts -> src\/a\.ts（2 ファイル循環）/u);
+  assert.match(markdownReport, /切断候補: src\/[ab]\.ts から src\/[ab]\.ts への import を外すと循環が解消します/u);
 
   await fs.rm(outputDir, { recursive: true, force: true });
   await fs.rm(config.cacheDir, { recursive: true, force: true });
@@ -4532,13 +4914,55 @@ test("CLI diff command writes diff reports against a baseline report", async () 
   assert.match(diffHtml, /Added Hot Spots/u);
   assert.match(diffHtml, /Removed Hot Spots/u);
   assert.match(diffHtml, /weighted=\+/u);
-  assert.match(diffMarkdown, /## Hot Spot Delta/u);
-  assert.match(diffMarkdown, /src\/App\.tsx scoreDelta=/u);
+  assert.match(diffMarkdown, /# 差分レポート（baseline 比較）/u);
+  assert.match(diffMarkdown, /- \*\*影響判定/u);
+  assert.match(diffMarkdown, /## Hot Spot 差分/u);
+  assert.match(diffMarkdown, /\| src\/App\.tsx \| \+?-?\d+ \|/u);
   assert.match(diffMarkdown, /drivers=weighted=/u);
-  assert.match(diffMarkdown, /complexityPressure=/u);
+  assert.match(diffMarkdown, /### 優先対応（影響度スコア順）/u);
+  assert.match(diffMarkdown, /\| ファイル \| score \| 距離 \| 被依存 \| 依存 \| 複雑度圧 \| 理由 \|/u);
   assert.match(diffMarkdown, /weighted=\+/u);
+  // 絶対パスの生出力と、見出しなしの波及先一覧の重複出力が無いこと
+  assert.doesNotMatch(diffMarkdown, /^- \/(?:tmp|home|var)\//mu);
 
   await fs.rm(tempProject, { recursive: true, force: true });
+});
+
+test("DiffGenerator matches files across different workspace roots via relative paths", async () => {
+  const rootA = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-diff-root-a-"));
+  const rootB = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-diff-root-b-"));
+
+  const buildReport = async (projectRoot: string, complexityValue: number) => {
+    const filePath = path.join(projectRoot, "src", "App.tsx");
+    const results: AnalysisResult[] = [
+      createAnalysisResult(filePath, { name: "App" }, { overallComplexity: complexityValue }),
+    ];
+    const outputDir = path.join(projectRoot, "out");
+    return new ReportGenerator().generateReports(results, createEmptyGraphMetrics(), {
+      outputDir,
+      prefix: "portable",
+      formats: ["json"],
+      complexityThreshold: 10,
+      projectRoot,
+    });
+  };
+
+  // 別々のワークスペース (CI の別実行を想定) で生成したレポート同士を比較する
+  const baseline = await buildReport(rootA, 1);
+  const current = await buildReport(rootB, 5);
+
+  assert.equal(baseline.files[0]?.path, "src/App.tsx");
+
+  const diff = new DiffGenerator().compare(current, baseline, "baseline.json", "current.json", { projectRoot: rootB });
+  // パスが相対で永続化されるため、ルートが違っても added/removed にならず changed として突合できる
+  assert.equal(diff.summary.addedFiles, 0);
+  assert.equal(diff.summary.removedFiles, 0);
+  assert.equal(diff.summary.changedFiles, 1);
+  assert.equal(diff.files[0]?.path, "src/App.tsx");
+  assert.equal(diff.files[0]?.complexityDelta, 4);
+
+  await fs.rm(rootA, { recursive: true, force: true });
+  await fs.rm(rootB, { recursive: true, force: true });
 });
 
 test("CLI diff can fail on impact threshold for CI usage", async () => {

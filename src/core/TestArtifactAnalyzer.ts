@@ -157,10 +157,27 @@ export class TestArtifactAnalyzer {
   }
 
   private extractJUnitTestCases(xml: string): Array<{ raw: string; body: string }> {
-    return Array.from(xml.matchAll(/<testcase\b[^>]*(?:\/>|>([\s\S]*?)<\/testcase>)/gu)).map((match) => ({
-      raw: match[0],
-      body: match[1] ?? "",
-    }));
+    // 開始タグを属性の引用符を考慮して取り、自己終了 (<testcase ... />) かどうかで
+    // 本文の有無を判定する。単純な [^>]* だと自己終了タグの "/" を飲み込み、後続の
+    // </testcase> まで 1 マッチに統合されてテスト数を過少集計する。
+    const cases: Array<{ raw: string; body: string }> = [];
+    const openTag = /<testcase\b((?:[^>"'/]|"[^"]*"|'[^']*')*)(\/?)>/gu;
+    const closeTag = "</testcase>";
+    let match: RegExpExecArray | null;
+    while ((match = openTag.exec(xml)) !== null) {
+      if (match[2] === "/") {
+        cases.push({ raw: match[0], body: "" });
+        continue;
+      }
+      const closeIndex = xml.indexOf(closeTag, openTag.lastIndex);
+      if (closeIndex === -1) {
+        cases.push({ raw: match[0], body: "" });
+        continue;
+      }
+      cases.push({ raw: match[0], body: xml.slice(openTag.lastIndex, closeIndex) });
+      openTag.lastIndex = closeIndex + closeTag.length;
+    }
+    return cases;
   }
 
   private async parseCoverageFiles(projectRoot: string, files: string[]): Promise<CoverageSummary> {
