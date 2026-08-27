@@ -40,7 +40,7 @@ node dist/src/cli.js graph <projectDir> --output ./reports --prefix deps
 ```
 
 出力は `deps_graph.json` と `deps_graph.dot` です。  
-**`graph` は `--format` を見ません。** JSON と DOT を必ず出します。HTML で見たい場合は `analyze` を使ってください。
+**`graph` は `--format` を見ません。** JSON と DOT を必ず出します。HTML で見たい場合は `analyze` を使ってください (`--format` を付けて実行した場合は、その旨の警告を表示します)。
 
 ## diff — 前回からの変化を確認する
 
@@ -109,6 +109,7 @@ node dist/src/cli.js quality gate ./my-app --output ./reports --prefix release \
 | `--manual-input <path>` | 手動品質証跡 JSON のパス |
 | `--quality-gate-blocking-metrics <ids>` | baseline 悪化で gate を落とす指標 ID (カンマ区切り) |
 | `--quality-gate-monitoring-metrics <ids>` | baseline 悪化を監視だけに留める指標 ID (カンマ区切り) |
+| `--version` | バージョンを表示 |
 | `--help` | ヘルプを表示 |
 
 ### diff 専用
