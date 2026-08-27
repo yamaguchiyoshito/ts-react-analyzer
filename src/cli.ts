@@ -4,7 +4,7 @@ import { parseArgs } from "node:util";
 
 import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, ManualQualityInputLoader, QualityDiffGenerator, QualityReportGenerator, ReportGenerator } from "./core/index.js";
 import { shouldIncludeInAnalysisScope } from "./core/FileConventions.js";
-import type { AnalysisConfig, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, ParseIssue, PersistedAnalysisReport, QualityDiffReport, QualityMetricDiffEntry, QualityReport } from "./types/index.js";
+import type { AnalysisConfig, AnalysisDiffReport, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, OutputFormat, ParseIssue, PersistedAnalysisReport, QualityDiffReport, QualityMetricDiffEntry, QualityReport } from "./types/index.js";
 
 interface RunArtifacts {
   results: AnalysisResult[];
@@ -51,8 +51,257 @@ Options:
                                 comma-separated metric ids excluded from regression gate
   --max-typecheck-root-names <n> skip TS program creation above this root count
   --baseline <path>              baseline report json path for diff/gate
+  --version                      show version
   --help                         show help
 `);
+}
+
+// ユーザー操作起因の失敗 (パス誤りなど)。message はそのまま画面に出す前提で書く
+class CliUserError extends Error {}
+
+const CLI_OPTIONS = {
+  output: { type: "string" },
+  format: { type: "string" },
+  config: { type: "string" },
+  prefix: { type: "string" },
+  verbose: { type: "boolean" },
+  "max-file-size": { type: "string" },
+  "analysis-scope": { type: "string" },
+  "quality-profile": { type: "string" },
+  "complexity-threshold": { type: "string" },
+  "impact-threshold": { type: "string" },
+  "fail-on-impact": { type: "boolean" },
+  "exclude-groups": { type: "string" },
+  "exclude-patterns": { type: "string" },
+  "cache-dir": { type: "string" },
+  "log-file": { type: "string" },
+  "manual-input": { type: "string" },
+  "quality-gate-blocking-metrics": { type: "string" },
+  "quality-gate-monitoring-metrics": { type: "string" },
+  "max-typecheck-root-names": { type: "string" },
+  baseline: { type: "string" },
+  version: { type: "boolean" },
+  help: { type: "boolean" },
+} as const;
+
+function parseCliArgs() {
+  return parseArgs({
+    allowPositionals: true,
+    options: CLI_OPTIONS,
+  });
+}
+
+function editDistance(left: string, right: string): number {
+  let previousRow: number[] = Array.from({ length: right.length + 1 }, (_, col) => col);
+  for (let row = 1; row <= left.length; row += 1) {
+    const currentRow: number[] = [row];
+    for (let col = 1; col <= right.length; col += 1) {
+      const substitutionCost = left.charAt(row - 1) === right.charAt(col - 1) ? 0 : 1;
+      currentRow.push(Math.min(
+        (previousRow[col] ?? 0) + 1,
+        (currentRow[col - 1] ?? 0) + 1,
+        (previousRow[col - 1] ?? 0) + substitutionCost,
+      ));
+    }
+    previousRow = currentRow;
+  }
+  return previousRow[right.length] ?? 0;
+}
+
+function suggestOption(unknownOption: string): string | undefined {
+  const name = unknownOption.replace(/^--?/u, "");
+  if (!name) {
+    return undefined;
+  }
+  let best: string | undefined;
+  let bestDistance = 3;
+  for (const candidate of Object.keys(CLI_OPTIONS)) {
+    const distance = editDistance(name, candidate);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = candidate;
+    }
+  }
+  return best ? `--${best}` : undefined;
+}
+
+function reportArgumentError(error: unknown): number {
+  const err = error as { code?: string; message?: string };
+  if (err.code === "ERR_PARSE_ARGS_UNKNOWN_OPTION") {
+    const unknownOption = /'(--?[^']*)'/u.exec(err.message ?? "")?.[1] ?? "";
+    const suggestion = suggestOption(unknownOption);
+    console.error(`エラー: 不明なオプション '${unknownOption}' です。${suggestion ? `もしかして: ${suggestion}` : ""}`);
+  } else if (err.code === "ERR_PARSE_ARGS_INVALID_OPTION_VALUE") {
+    console.error(`エラー: オプションの値が正しくありません。${err.message ?? ""}`);
+  } else if (typeof err.code === "string" && err.code.startsWith("ERR_PARSE_ARGS")) {
+    console.error(`エラー: 引数を解釈できませんでした。${err.message ?? ""}`);
+  } else {
+    throw error;
+  }
+  console.error("--help でオプション一覧を確認できます。");
+  return 1;
+}
+
+async function printVersion(): Promise<void> {
+  try {
+    const packageJson = JSON.parse(
+      await fs.readFile(new URL("../../package.json", import.meta.url), "utf8"),
+    ) as { version?: string };
+    console.log(packageJson.version ?? "unknown");
+  } catch {
+    console.log("unknown");
+  }
+}
+
+async function loadBaselineReport<T>(baselinePath: string, createHint: string): Promise<T> {
+  let content: string;
+  try {
+    content = await fs.readFile(baselinePath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new CliUserError(`baseline が見つかりません: ${baselinePath}\n${createHint}`);
+    }
+    throw error;
+  }
+  try {
+    return JSON.parse(content) as T;
+  } catch {
+    throw new CliUserError(
+      `baseline を JSON として読み込めませんでした: ${baselinePath}\nこのツールが出力したレポート JSON を指定してください。`,
+    );
+  }
+}
+
+async function handleCommandError(error: unknown, logger: Logger, logMessage: string): Promise<number> {
+  if (error instanceof CliUserError) {
+    console.error(`エラー: ${error.message}`);
+    logger.error(logMessage, { error: error.message.split("\n")[0] });
+  } else {
+    logger.error(logMessage, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  await logger.close();
+  return 1;
+}
+
+function listReportFiles(prefix: string, formats: OutputFormat[], kind: "analyze" | "quality"): string[] {
+  const resolved = formats.includes("all") ? ["json", "markdown", "csv", "html"] : formats;
+  const files: string[] = [];
+  if (kind === "analyze") {
+    if (resolved.includes("markdown")) {
+      files.push(`${prefix}_report.md`);
+    }
+    if (resolved.includes("html")) {
+      files.push(`${prefix}_report.html`);
+    }
+    if (resolved.includes("json")) {
+      files.push(`${prefix}_report.json`);
+    }
+    if (resolved.includes("csv")) {
+      files.push(`${prefix}_files.csv`, `${prefix}_dependencies.csv`, `${prefix}_components.csv`, `${prefix}_hooks.csv`);
+    }
+  } else {
+    if (resolved.includes("markdown")) {
+      files.push(`${prefix}_quality_report.md`);
+    }
+    if (resolved.includes("html")) {
+      files.push(`${prefix}_quality_report.html`);
+    }
+    if (resolved.includes("json")) {
+      files.push(`${prefix}_quality_report.json`);
+    }
+    if (resolved.includes("csv")) {
+      files.push(`${prefix}_quality_summary.csv`);
+    }
+  }
+  return files;
+}
+
+function printOutputFiles(lines: string[], outputDir: string, files: string[], firstFileNote: string): void {
+  lines.push(`  出力先: ${outputDir}`);
+  files.forEach((file, index) => {
+    lines.push(`    ${file}${index === 0 ? `  ← ${firstFileNote}` : ""}`);
+  });
+}
+
+function printAnalyzeSummary(report: PersistedAnalysisReport, config: AnalysisConfig): void {
+  const lines: string[] = [""];
+  if (report.statistics.fileCount === 0) {
+    lines.push("⚠ 解析対象が 0 件でした。projectDir の指定、tsconfig の include、除外設定 (exclude) を確認してください。");
+  }
+  lines.push(`✔ 解析が完了しました: ${report.statistics.fileCount} ファイル / ${report.executionTimeMs}ms`);
+  const summary = report.decisionSummary;
+  if (summary) {
+    const primary = summary.topHotSpots[0];
+    lines.push(`  最優先ファイル: ${primary ? primary.displayPath ?? primary.path : "なし"}`);
+    lines.push(`  優先改修候補: ${summary.topHotSpots.length} 件 / ${summary.cycleStatus}`);
+  }
+  printOutputFiles(lines, config.outputDir, listReportFiles(config.filePrefix, config.outputFormats, "analyze"), "まずこのファイルから読み始めてください");
+  console.log(lines.join("\n"));
+}
+
+function printDiffSummary(diff: AnalysisDiffReport, config: AnalysisConfig): void {
+  const lines: string[] = [""];
+  lines.push(`✔ 差分解析が完了しました: 変更 ${diff.summary.changedFiles} / 追加 ${diff.summary.addedFiles} / 削除 ${diff.summary.removedFiles}`);
+  printOutputFiles(lines, config.outputDir, [
+    `${config.filePrefix}_diff.md`,
+    `${config.filePrefix}_diff.html`,
+    `${config.filePrefix}_diff.json`,
+  ], "まずこのファイルから読み始めてください");
+  console.log(lines.join("\n"));
+}
+
+function printQualitySummary(report: QualityReport, config: AnalysisConfig, mode: "collect" | "report" | "gate"): void {
+  const lines: string[] = [""];
+  lines.push(`✔ 品質レポートを生成しました: 総合判定 ${report.summary.overallVerdict.toUpperCase()} (自動FAIL ${report.summary.failCount} 件 / 手動証跡待ち ${report.summary.manualCount} 件)`);
+  if (mode === "gate") {
+    lines.push("  quality gate: PASS");
+  }
+  printOutputFiles(lines, config.outputDir, listReportFiles(config.filePrefix, config.outputFormats, "quality"), "まずこのファイルから読み始めてください");
+  console.log(lines.join("\n"));
+}
+
+// excludeGroups / excludePatterns は上書きではなく合流 (union) されるため対象外
+const ENV_OVERRIDABLE_OPTIONS: Array<{ key: keyof AnalysisConfig; cliFlag: string; envVar: string }> = [
+  { key: "outputDir", cliFlag: "--output", envVar: "ANALYZER_OUTPUT_DIR" },
+  { key: "outputFormats", cliFlag: "--format", envVar: "ANALYZER_FORMATS" },
+  { key: "filePrefix", cliFlag: "--prefix", envVar: "ANALYZER_PREFIX" },
+  { key: "verbose", cliFlag: "--verbose", envVar: "ANALYZER_VERBOSE" },
+  { key: "maxFileSizeBytes", cliFlag: "--max-file-size", envVar: "ANALYZER_MAX_FILE_SIZE" },
+  { key: "analysisScope", cliFlag: "--analysis-scope", envVar: "ANALYZER_ANALYSIS_SCOPE" },
+  { key: "qualityProfile", cliFlag: "--quality-profile", envVar: "ANALYZER_QUALITY_PROFILE" },
+  { key: "complexityThreshold", cliFlag: "--complexity-threshold", envVar: "ANALYZER_COMPLEXITY_THRESHOLD" },
+  { key: "impactScoreThreshold", cliFlag: "--impact-threshold", envVar: "ANALYZER_IMPACT_SCORE_THRESHOLD" },
+  { key: "failOnImpactThreshold", cliFlag: "--fail-on-impact", envVar: "ANALYZER_FAIL_ON_IMPACT_THRESHOLD" },
+  { key: "cacheDir", cliFlag: "--cache-dir", envVar: "ANALYZER_CACHE_DIR" },
+  { key: "logFile", cliFlag: "--log-file", envVar: "ANALYZER_LOG_FILE" },
+  { key: "manualInputPath", cliFlag: "--manual-input", envVar: "ANALYZER_MANUAL_INPUT" },
+  { key: "qualityGateBlockingMetricIds", cliFlag: "--quality-gate-blocking-metrics", envVar: "ANALYZER_QUALITY_GATE_BLOCKING_METRICS" },
+  { key: "qualityGateMonitoringMetricIds", cliFlag: "--quality-gate-monitoring-metrics", envVar: "ANALYZER_QUALITY_GATE_MONITORING_METRICS" },
+  { key: "maxTypeCheckRootNames", cliFlag: "--max-typecheck-root-names", envVar: "ANALYZER_MAX_TYPECHECK_ROOT_NAMES" },
+];
+
+function warnEnvironmentOverrides(
+  cliConfig: Partial<AnalysisConfig>,
+  dotEnvConfig: Partial<AnalysisConfig>,
+  environmentConfig: Partial<AnalysisConfig>,
+): void {
+  for (const { key, cliFlag, envVar } of ENV_OVERRIDABLE_OPTIONS) {
+    const cliValue = cliConfig[key];
+    if (cliValue === undefined) {
+      continue;
+    }
+    const overrideValue = environmentConfig[key] !== undefined ? environmentConfig[key] : dotEnvConfig[key];
+    if (overrideValue === undefined) {
+      continue;
+    }
+    if (JSON.stringify(overrideValue) === JSON.stringify(cliValue)) {
+      continue;
+    }
+    const source = environmentConfig[key] !== undefined ? "環境変数" : ".env";
+    console.warn(`警告: ${source} ${envVar} が CLI 引数 ${cliFlag} を上書きしています (設定の優先順位: 環境変数 > CLI 引数)。`);
+  }
 }
 
 async function buildArtifacts(
@@ -219,7 +468,7 @@ async function analyzeProject(projectDir: string, config: AnalysisConfig): Promi
     const artifacts = await buildArtifacts(projectDir, config, logger);
 
     const reportGenerator = new ReportGenerator();
-    await reportGenerator.generateReports(artifacts.results, artifacts.graphMetrics, {
+    const report = await reportGenerator.generateReports(artifacts.results, artifacts.graphMetrics, {
       outputDir: config.outputDir,
       prefix: config.filePrefix,
       formats: config.outputFormats,
@@ -242,13 +491,10 @@ async function analyzeProject(projectDir: string, config: AnalysisConfig): Promi
       analysisCacheMisses: artifacts.analysisCacheStats.misses,
     });
     await logger.close();
+    printAnalyzeSummary(report, config);
     return 0;
   } catch (error) {
-    logger.error("Analysis failed", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    await logger.close();
-    return 1;
+    return handleCommandError(error, logger, "Analysis failed");
   }
 }
 
@@ -277,13 +523,16 @@ async function graphProject(projectDir: string, config: AnalysisConfig): Promise
       analysisCacheMisses: artifacts.analysisCacheStats.misses,
     });
     await logger.close();
+    console.log([
+      "",
+      `✔ 依存グラフを出力しました: ${artifacts.graphJson.nodes.length} ノード / ${artifacts.graphJson.edges.length} エッジ / 循環依存 ${artifacts.graphMetrics.cycles.length} 件`,
+      `  出力先: ${config.outputDir}`,
+      `    ${config.filePrefix}_graph.json`,
+      `    ${config.filePrefix}_graph.dot  ← Graphviz などの可視化ツールに渡せます`,
+    ].join("\n"));
     return 0;
   } catch (error) {
-    logger.error("Graph export failed", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    await logger.close();
-    return 1;
+    return handleCommandError(error, logger, "Graph export failed");
   }
 }
 
@@ -294,7 +543,10 @@ async function diffProject(projectDir: string, config: AnalysisConfig, baselineP
 
   try {
     logger.info("Diff started", { projectDir, baselinePath });
-    const baseline = JSON.parse(await fs.readFile(baselinePath, "utf8")) as PersistedAnalysisReport;
+    const baseline = await loadBaselineReport<PersistedAnalysisReport>(
+      baselinePath,
+      "先に analyze を実行して baseline を作成するか、--baseline で既存の *_report.json を指定してください。",
+    );
     const artifacts = await buildArtifacts(projectDir, config, logger);
 
     const reportGenerator = new ReportGenerator();
@@ -344,17 +596,24 @@ async function diffProject(projectDir: string, config: AnalysisConfig, baselineP
         })),
       });
       await logger.close();
+      const offenders = thresholdViolations
+        .slice(0, 3)
+        .map((item) => `${item.path} (score ${item.score})`)
+        .join(", ");
+      console.error([
+        "",
+        `✖ 影響度しきい値 (${config.impactScoreThreshold}) を超過したファイルが ${thresholdViolations.length} 件あります (終了コード 2)`,
+        `  上位: ${offenders}`,
+        `  詳細: ${path.join(config.outputDir, `${config.filePrefix}_diff.md`)}`,
+      ].join("\n"));
       return 2;
     }
 
     await logger.close();
+    printDiffSummary(diff, config);
     return 0;
   } catch (error) {
-    logger.error("Diff failed", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    await logger.close();
-    return 1;
+    return handleCommandError(error, logger, "Diff failed");
   }
 }
 
@@ -371,7 +630,10 @@ async function qualityProject(
   try {
     logger.info("Quality analysis started", { projectDir, mode });
     const baselineReport = (mode === "diff" || mode === "gate") && baselinePath
-      ? JSON.parse(await fs.readFile(baselinePath, "utf8")) as QualityReport
+      ? await loadBaselineReport<QualityReport>(
+          baselinePath,
+          "先に quality collect を実行して baseline を作成するか、--baseline で既存の *_quality_report.json を指定してください。",
+        )
       : undefined;
     const artifacts = await buildArtifacts(projectDir, config, logger, { includeUnscopedScan: true });
     const manualInputPath = config.manualInputPath
@@ -478,6 +740,20 @@ async function qualityProject(
       });
 
       await logger.close();
+      const diffLines: string[] = [""];
+      diffLines.push(`✔ 品質差分を生成しました: 悪化 ${diff.summary.regressedMetrics} / 改善 ${diff.summary.improvedMetrics}`);
+      // QualityDiffGenerator.resolveFormats と同じ規則で、実際に書き出されたファイルだけを列挙する
+      const requestedDiffFormats = config.outputFormats.filter((format) => format !== "all" && format !== "csv");
+      const diffFormats = config.outputFormats.includes("all") || requestedDiffFormats.length === 0
+        ? ["json", "markdown", "html"]
+        : requestedDiffFormats;
+      const diffFiles = [
+        ...(diffFormats.includes("markdown") ? [`${config.filePrefix}_quality_diff.md`] : []),
+        ...(diffFormats.includes("html") ? [`${config.filePrefix}_quality_diff.html`] : []),
+        ...(diffFormats.includes("json") ? [`${config.filePrefix}_quality_diff.json`] : []),
+      ];
+      printOutputFiles(diffLines, config.outputDir, diffFiles, "まずこのファイルから読み始めてください");
+      console.log(diffLines.join("\n"));
       return 0;
     }
 
@@ -499,6 +775,16 @@ async function qualityProject(
         })),
       });
       await logger.close();
+      const offenders = failingAutomaticMetrics
+        .slice(0, 3)
+        .map(({ category, metric }) => `${category}/${metric.label} (実績 ${metric.actual} / 基準 ${metric.threshold})`)
+        .join(", ");
+      console.error([
+        "",
+        `✖ quality gate: FAIL (終了コード 2) — 自動判定 FAIL の親指標が ${failingAutomaticMetrics.length} 件あります`,
+        `  上位: ${offenders}`,
+        `  詳細: ${path.join(config.outputDir, `${config.filePrefix}_quality_report.md`)} の「要点」`,
+      ].join("\n"));
       return 2;
     }
 
@@ -519,17 +805,24 @@ async function qualityProject(
           })),
       });
       await logger.close();
+      const offenders = blockingRegressionMetrics
+        .slice(0, 3)
+        .map((metric) => `${metric.categoryLabel}/${metric.label} (${metric.baselineVerdict ?? "不明"} -> ${metric.currentVerdict ?? "不明"})`)
+        .join(", ");
+      console.error([
+        "",
+        `✖ quality gate: FAIL (終了コード 2) — baseline から判定が悪化した自動指標が ${blockingRegressionMetrics.length} 件あります`,
+        `  上位: ${offenders}`,
+        `  詳細: ${path.join(config.outputDir, `${config.filePrefix}_quality_diff.md`)}`,
+      ].join("\n"));
       return 2;
     }
 
     await logger.close();
+    printQualitySummary(report, config, mode);
     return 0;
   } catch (error) {
-    logger.error("Quality analysis failed", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    await logger.close();
-    return 1;
+    return handleCommandError(error, logger, "Quality analysis failed");
   }
 }
 
@@ -608,32 +901,17 @@ function selectBlockingRegressionMetrics(
 }
 
 async function main(): Promise<number> {
-  const parsed = parseArgs({
-    allowPositionals: true,
-    options: {
-      output: { type: "string" },
-      format: { type: "string" },
-      config: { type: "string" },
-      prefix: { type: "string" },
-      verbose: { type: "boolean" },
-      "max-file-size": { type: "string" },
-      "analysis-scope": { type: "string" },
-      "quality-profile": { type: "string" },
-      "complexity-threshold": { type: "string" },
-      "impact-threshold": { type: "string" },
-      "fail-on-impact": { type: "boolean" },
-      "exclude-groups": { type: "string" },
-      "exclude-patterns": { type: "string" },
-      "cache-dir": { type: "string" },
-      "log-file": { type: "string" },
-      "manual-input": { type: "string" },
-      "quality-gate-blocking-metrics": { type: "string" },
-      "quality-gate-monitoring-metrics": { type: "string" },
-      "max-typecheck-root-names": { type: "string" },
-      baseline: { type: "string" },
-      help: { type: "boolean" },
-    },
-  });
+  let parsed: ReturnType<typeof parseCliArgs>;
+  try {
+    parsed = parseCliArgs();
+  } catch (error) {
+    return reportArgumentError(error);
+  }
+
+  if (parsed.values.version) {
+    await printVersion();
+    return 0;
+  }
 
   const [command, maybeSubcommand, maybeProjectDir] = parsed.positionals;
   const projectDir = command === "quality" ? maybeProjectDir : maybeSubcommand;
@@ -658,8 +936,20 @@ async function main(): Promise<number> {
 
   const validCommands = ["analyze", "graph", "diff", "quality"];
   if (!validCommands.includes(command) || !projectDir || (command === "quality" && !qualityMode)) {
+    if (!validCommands.includes(command)) {
+      console.error(`エラー: 不明なコマンド '${command}' です。使用できるコマンド: analyze, graph, diff, quality\n`);
+    } else if (command === "quality" && !qualityMode) {
+      console.error(`エラー: quality にはサブコマンド (collect | report | gate | diff) が必要です。例: quality collect ${maybeSubcommand ?? "./my-app"}\n`);
+    } else {
+      const commandExample = command === "quality" ? `quality ${qualityMode}` : command;
+      console.error(`エラー: 解析対象の <projectDir> を指定してください。例: ${commandExample} ./my-app\n`);
+    }
     printHelp();
     return 1;
+  }
+
+  if (command === "graph" && typeof parsed.values.format === "string") {
+    console.warn("警告: graph は --format を無視し、常に JSON と DOT を出力します。HTML レポートが必要な場合は analyze を使ってください。");
   }
 
   const projectRoot = path.resolve(projectDir);
@@ -701,13 +991,17 @@ async function main(): Promise<number> {
       : undefined,
   });
 
+  const dotEnvConfig = configManager.loadFromDotEnv(dotEnvPath);
+  const environmentConfig = configManager.loadFromEnvironment();
+  warnEnvironmentOverrides(cliConfig, dotEnvConfig, environmentConfig);
+
   const config = configManager.mergeConfigs(
     configManager.getDefaults(),
     configManager.loadFromFile(configPath),
     configManager.loadFromTSConfig(tsConfigPath),
     cliConfig,
-    configManager.loadFromDotEnv(dotEnvPath),
-    configManager.loadFromEnvironment(),
+    dotEnvConfig,
+    environmentConfig,
     {
       projectRoot,
       tsConfigPath,
