@@ -27,6 +27,9 @@ npm run build
 解析したいプロジェクトが `./my-app` にある場合:
 
 ```bash
+# 0. (任意) 対話形式で設定ファイルを作る
+node dist/src/cli.js init ./my-app
+
 # 1. 現状を解析して基準点 (baseline) を作る
 node dist/src/cli.js analyze ./my-app
 
@@ -39,7 +42,7 @@ node dist/src/cli.js quality gate ./my-app
 ```
 
 レポートは既定で `<my-app>/analysis-reports/` に出力されます。  
-まず `analysis_report.md` を開くと、優先対応 Top 5 と改善提案から読み始められます。
+まず `analysis_report.md` を開くと、優先対応 Top 5 と改善提案から読み始められます。`--open` を付けると HTML レポートがブラウザで開きます。
 
 ## ドキュメント
 

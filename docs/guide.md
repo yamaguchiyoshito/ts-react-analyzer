@@ -12,11 +12,17 @@
 - `graph` は `--format` の指定に関係なく、常に JSON と DOT を出力します
 - `diff` で `--baseline` を省略すると `<outputDir>/<prefix>_report.json` を読みます
 - CI の判定は終了コード `2` (判定による失敗) を明示的に拾ってください (→ [終了コード](commands.md#終了コード))
-- 環境変数は CLI 引数より優先されます (→ [設定の優先順位](configuration.md#設定の優先順位))
+- v0.2.0 から CLI 引数が環境変数より優先されます (→ [設定の優先順位](configuration.md#設定の優先順位))
 
-## 導入初日にやること — 基準点を作る
+## 導入初日にやること — 設定と基準点を作る
 
-まず現状を解析して、以後の比較に使う baseline を作ります。
+まず `init` で設定ファイルを対話形式で作ると、以後のコマンドからオプション指定を省けます。
+
+```bash
+node dist/src/cli.js init ./target-app
+```
+
+続いて現状を解析して、以後の比較に使う baseline を作ります。
 
 ```bash
 node dist/src/cli.js analyze ./target-app --output ./analysis --prefix baseline
@@ -44,10 +50,16 @@ node dist/src/cli.js diff ./target-app \
 
 差分を先に見るのは、単に絶対値が大きいだけのファイルと、今回の変更で危険になったファイルを混ぜないためです。
 
-その場で深掘りしたいときは、詳細ログ付きで単発解析するのが手早いです。
+その場で深掘りしたいときは、詳細ログ付きで単発解析するのが手早いです。`--open` を付けると生成した HTML レポートがそのままブラウザで開きます。
 
 ```bash
-node dist/src/cli.js analyze ../frontend --output ./analysis --prefix local --verbose
+node dist/src/cli.js analyze ../frontend --output ./analysis --prefix local --verbose --open
+```
+
+リファクタリング中に「悪化していないか」を確認し続けたいときは、`diff --watch` が便利です。ファイルを保存するたびに diff が自動で再実行されます。
+
+```bash
+node dist/src/cli.js diff ../frontend --baseline ./analysis/baseline_report.json --watch
 ```
 
 依存構造だけを棚卸ししたいときは `graph` を使います。
