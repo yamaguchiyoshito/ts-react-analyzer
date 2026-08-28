@@ -4,13 +4,26 @@
 
 | やりたいこと | コマンド |
 |---|---|
+| 対話形式で設定ファイルを作りたい | `init` |
 | プロジェクトの現状を把握したい | `analyze` |
 | 依存関係だけを図にしたい | `graph` |
 | 前回からの悪化だけを確認したい / CI で危険な変更を止めたい | `diff` |
+| リファクタリング中に悪化を監視し続けたい | `diff --watch` |
 | 出荷前の品質を審査したい | `quality collect` / `quality gate` / `quality diff` |
 
 すべての実行例は、このリポジトリ直下で打つ前提です。  
 `--output` などの相対パスは、このツールのディレクトリではなく **解析対象の `<projectDir>` を基準** に解決されます。
+
+## init — 対話形式で設定ファイルを作る
+
+出力先・フォーマット・閾値・quality プロファイルを数問で答えると、`<projectDir>/analyzer.config.json` を生成します。GitLab CI への組み込み例の表示も選べます。
+
+```bash
+node dist/src/cli.js init ./my-app
+```
+
+- Enter だけ押すと `[既定値]` が採用されます
+- CI などの非対話環境では `--yes` を付けると既定値のまま生成します (既存ファイルは上書きしません)
 
 ## analyze — 現状を把握する
 
@@ -77,7 +90,7 @@ node dist/src/cli.js quality gate <projectDir>      # 出荷可否を機械判�
 node dist/src/cli.js quality diff <projectDir> --baseline <quality_report.json>  # 前回リリースと比較する
 ```
 
-- `collect` と `report` は同じ動作です (どちらも品質レポート生成)
+- `quality report` は `collect` の別名です (非推奨。実行すると collect への移行案内を表示します)
 - `gate` は自動判定 `FAIL` の親指標が 1 件でもあると終了コード `2` で失敗します
 - `gate --baseline <path>` は前回からの悪化 (例: `pass → warn`) も検知して失敗します
 - 判定の仕組みと手動証跡は [品質レポート](quality.md) を参照してください
@@ -100,6 +113,7 @@ node dist/src/cli.js quality gate ./my-app --output ./reports --prefix release \
 | `--format <formats>` | `csv,markdown,json,html,all` |
 | `--config <path>` | 設定ファイルのパス |
 | `--prefix <name>` | 出力ファイルの接頭辞 |
+| `--open` | 生成した HTML レポートをブラウザで開く (`--format` に html が必要。`diff` は常に開けます) |
 | `--verbose` | 詳細ログを有効化 |
 | `--max-file-size <bytes>` | 指定サイズ超のファイルを解析から除外 |
 | `--complexity-threshold <n>` | 複雑度の警告閾値 |
@@ -119,6 +133,13 @@ node dist/src/cli.js quality gate ./my-app --output ./reports --prefix release \
 | `--baseline <path>` | 比較元の `*_report.json` |
 | `--impact-threshold <n>` | 影響度スコアの閾値 |
 | `--fail-on-impact` | 閾値超過で終了コード `2` |
+| `--watch` | ファイル変更を監視して diff を自動再実行 (Ctrl+C で終了) |
+
+### init 専用
+
+| オプション | 意味 |
+|---|---|
+| `--yes` | 質問せず既定値で `analyzer.config.json` を生成 (既存ファイルは上書きしない) |
 
 ### quality 専用
 

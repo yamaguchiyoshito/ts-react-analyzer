@@ -5027,3 +5027,51 @@ test("CLI diff can fail on impact threshold for CI usage", async () => {
 
   await fs.rm(tempProject, { recursive: true, force: true });
 });
+
+test("CLI init --yes writes analyzer.config.json and CLI args take precedence over environment", async () => {
+  const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "analyzer-init-"));
+  const cliPath = path.join(workspaceRoot, "dist", "src", "cli.js");
+
+  await fs.mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      jsx: "react-jsx",
+      strict: true,
+      noEmit: true,
+    },
+    include: ["src"],
+  }, null, 2), "utf8");
+  await fs.writeFile(path.join(projectRoot, "src", "App.tsx"), "export const App = () => <main>app</main>;\n", "utf8");
+
+  await execFileAsync(process.execPath, [cliPath, "init", projectRoot, "--yes"]);
+  const initConfig = JSON.parse(await fs.readFile(path.join(projectRoot, "analyzer.config.json"), "utf8")) as {
+    complexityThreshold: number;
+    qualityProfile: string;
+    outputDir: string;
+  };
+  assert.equal(initConfig.complexityThreshold, 12);
+  assert.equal(initConfig.qualityProfile, "application");
+  assert.equal(initConfig.outputDir, "./analysis-reports");
+
+  // --yes は既存の設定ファイルを上書きしない
+  let rerunExitCode = 0;
+  try {
+    await execFileAsync(process.execPath, [cliPath, "init", projectRoot, "--yes"]);
+  } catch (error) {
+    rerunExitCode = (error as { code?: number }).code ?? 0;
+  }
+  assert.equal(rerunExitCode, 1);
+
+  // v0.2.0 から CLI 引数が環境変数より優先される
+  await execFileAsync(process.execPath, [cliPath, "analyze", projectRoot, "--prefix", "cliprefix", "--format", "json"], {
+    env: { ...process.env, ANALYZER_PREFIX: "envprefix" },
+  });
+  const outputFiles = await fs.readdir(path.join(projectRoot, "analysis-reports"));
+  assert.ok(outputFiles.includes("cliprefix_report.json"));
+  assert.ok(!outputFiles.includes("envprefix_report.json"));
+
+  await fs.rm(projectRoot, { recursive: true, force: true });
+});

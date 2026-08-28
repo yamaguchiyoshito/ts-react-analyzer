@@ -1,5 +1,8 @@
 import path from "node:path";
 import fs from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { watch as watchFileSystem } from "node:fs";
+import readline from "node:readline/promises";
 import { parseArgs } from "node:util";
 
 import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, ManualQualityInputLoader, QualityDiffGenerator, QualityReportGenerator, ReportGenerator } from "./core/index.js";
@@ -19,41 +22,100 @@ interface RunArtifacts {
   parseIssues: ParseIssue[];
 }
 
-function printHelp(): void {
-  console.log(`ts-react-analyzer
+const COMMAND_USAGE: Record<string, { usage: string; description: string }> = {
+  analyze: {
+    usage: "ts-react-analyzer analyze <projectDir> [オプション]",
+    description: "複雑度・依存関係・hot spot・ディレクトリ目的の整合をまとめて解析し、レポートを出力します。",
+  },
+  graph: {
+    usage: "ts-react-analyzer graph <projectDir> [オプション]",
+    description: "依存グラフを JSON と DOT で出力します (--format は使いません)。",
+  },
+  diff: {
+    usage: "ts-react-analyzer diff <projectDir> --baseline <report.json> [オプション]",
+    description: "baseline (analyze が出力した *_report.json) と現在を比較し、悪化した箇所を影響度スコア付きで出力します。",
+  },
+  quality: {
+    usage: "ts-react-analyzer quality <collect|gate|diff> <projectDir> [オプション]",
+    description: "出荷審査の品質レポートを生成し (collect)、出荷可否を機械判定し (gate)、前回リリースと比較します (diff)。report は collect の別名です。",
+  },
+  init: {
+    usage: "ts-react-analyzer init <projectDir> [--yes]",
+    description: "対話形式で analyzer.config.json を生成します (--yes で質問を省略して既定値で生成)。",
+  },
+};
 
-Usage:
-  ts-react-analyzer analyze <projectDir> [options]
-  ts-react-analyzer graph <projectDir> [options]
-  ts-react-analyzer diff <projectDir> [options]
-  ts-react-analyzer quality <collect|report|gate|diff> <projectDir> [options]
+const COMMON_OPTIONS_HELP = `共通オプション:
+  --output <dir>                 レポート出力先 (<projectDir> 基準。既定: ./analysis-reports)
+  --format <formats>             csv,markdown,json,html,all (カンマ区切り)
+  --config <path>                設定ファイルのパス (既定: <projectDir>/analyzer.config.json)
+  --prefix <name>                出力ファイル名の接頭辞 (既定: analysis)
+  --open                         生成した HTML レポートをブラウザで開く
+  --verbose                      詳細ログを有効化
+  --max-file-size <bytes>        指定サイズ超のファイルを解析から除外
+  --analysis-scope <scope>       all | source-only
+  --complexity-threshold <n>     複雑度の警告閾値
+  --exclude-groups <groups>      除外グループ (カンマ区切り)
+  --exclude-patterns <patterns>  除外パターン (カンマ区切り正規表現)
+  --cache-dir <dir>              キャッシュディレクトリ
+  --log-file <path>              ログファイルのパス
+  --version                      バージョンを表示
+  --help                         ヘルプを表示 (例: analyze --help でコマンド別ヘルプ)`;
 
-Options:
-  --output <dir>                 report output directory
-  --format <formats>             csv,markdown,json,html,all
-  --config <path>                custom config file path
-  --prefix <name>                report file prefix
-  --verbose                      enable debug logging
-  --max-file-size <bytes>        skip files larger than the threshold
-  --analysis-scope <scope>       all,source-only
-  --quality-profile <profile>    application,library-repo
-  --complexity-threshold <n>     warning threshold
-  --impact-threshold <n>         diff impact score threshold
-  --fail-on-impact               exit non-zero when impact threshold is exceeded
-  --exclude-groups <groups>      comma-separated exclusion groups
-  --exclude-patterns <patterns>  comma-separated regex patterns
-  --cache-dir <dir>              cache directory
-  --log-file <path>              log file path
-  --manual-input <path>          manual quality input json path
+const COMMAND_OPTIONS_HELP = {
+  diff: `diff のオプション:
+  --baseline <path>              比較元の *_report.json (省略時: <outputDir>/<prefix>_report.json)
+  --impact-threshold <n>         影響度スコアの閾値
+  --fail-on-impact               閾値超過で終了コード 2 にする
+  --watch                        ファイル変更を監視して diff を自動再実行する (Ctrl+C で終了)`,
+  quality: `quality のオプション:
+  --quality-profile <profile>    application | library-repo
+  --manual-input <path>          手動品質証跡 JSON (既定: <projectDir>/quality.manual.json)
+  --baseline <path>              gate / diff の比較元 *_quality_report.json
   --quality-gate-blocking-metrics <ids>
-                                comma-separated metric ids that must fail gate on regression
+                                 baseline 悪化で gate を落とす指標 ID (カンマ区切り)
   --quality-gate-monitoring-metrics <ids>
-                                comma-separated metric ids excluded from regression gate
-  --max-typecheck-root-names <n> skip TS program creation above this root count
-  --baseline <path>              baseline report json path for diff/gate
-  --version                      show version
-  --help                         show help
-`);
+                                 baseline 悪化を監視だけに留める指標 ID (カンマ区切り)
+  --max-typecheck-root-names <n> この数を超えたら TS 型検査をスキップ`,
+  init: `init のオプション:
+  --yes                          質問せず既定値で analyzer.config.json を生成する`,
+};
+
+function printHelp(command?: string): void {
+  const lines: string[] = ["ts-react-analyzer — React / TypeScript プロジェクトの静的解析 CLI", ""];
+
+  const entry = command ? COMMAND_USAGE[command] : undefined;
+  if (command && entry) {
+    lines.push("使い方:", `  ${entry.usage}`, "", entry.description, "");
+    const commandOptions = (COMMAND_OPTIONS_HELP as Partial<Record<string, string>>)[command];
+    if (commandOptions) {
+      lines.push(commandOptions, "");
+    }
+    if (command !== "init") {
+      lines.push(COMMON_OPTIONS_HELP, "");
+    }
+  } else {
+    lines.push("使い方:");
+    for (const entry of Object.values(COMMAND_USAGE)) {
+      lines.push(`  ${entry.usage}`);
+    }
+    lines.push(
+      "",
+      "各コマンドの詳細は `<コマンド名> --help` で確認できます。",
+      "",
+      COMMON_OPTIONS_HELP,
+      "",
+      COMMAND_OPTIONS_HELP.diff,
+      "",
+      COMMAND_OPTIONS_HELP.quality,
+      "",
+      COMMAND_OPTIONS_HELP.init,
+      "",
+    );
+  }
+
+  lines.push("終了コード: 0=成功 / 1=実行失敗 / 2=判定による失敗 (diff の閾値超過、quality gate の FAIL)");
+  console.log(lines.join("\n"));
 }
 
 // ユーザー操作起因の失敗 (パス誤りなど)。message はそのまま画面に出す前提で書く
@@ -80,6 +142,9 @@ const CLI_OPTIONS = {
   "quality-gate-monitoring-metrics": { type: "string" },
   "max-typecheck-root-names": { type: "string" },
   baseline: { type: "string" },
+  open: { type: "boolean" },
+  watch: { type: "boolean" },
+  yes: { type: "boolean" },
   version: { type: "boolean" },
   help: { type: "boolean" },
 } as const;
@@ -282,7 +347,9 @@ const ENV_OVERRIDABLE_OPTIONS: Array<{ key: keyof AnalysisConfig; cliFlag: strin
   { key: "maxTypeCheckRootNames", cliFlag: "--max-typecheck-root-names", envVar: "ANALYZER_MAX_TYPECHECK_ROOT_NAMES" },
 ];
 
-function warnEnvironmentOverrides(
+// v0.2.0 で優先順位を CLI 最優先へ変更した。旧仕様 (環境変数 > CLI) を前提に
+// している CI が気づけるよう、食い違いがあるときは注意を表示する
+function notifyConfigPrecedence(
   cliConfig: Partial<AnalysisConfig>,
   dotEnvConfig: Partial<AnalysisConfig>,
   environmentConfig: Partial<AnalysisConfig>,
@@ -300,8 +367,291 @@ function warnEnvironmentOverrides(
       continue;
     }
     const source = environmentConfig[key] !== undefined ? "環境変数" : ".env";
-    console.warn(`警告: ${source} ${envVar} が CLI 引数 ${cliFlag} を上書きしています (設定の優先順位: 環境変数 > CLI 引数)。`);
+    console.warn(`注意: CLI 引数 ${cliFlag} が ${source} ${envVar} より優先されます (v0.2.0 で優先順位を CLI 最優先へ変更)。`);
   }
+}
+
+function openInBrowser(filePath: string): void {
+  const [command, args]: [string, string[]] = process.platform === "darwin"
+    ? ["open", [filePath]]
+    : process.platform === "win32"
+      ? ["cmd", ["/c", "start", "", filePath]]
+      : ["xdg-open", [filePath]];
+  // CLI は結果表示直後に終了するため、起動失敗を確実に伝えられる同期実行にする
+  const result = spawnSync(command, args, { stdio: "ignore" });
+  if (result.error || result.status !== 0) {
+    console.warn(`--open: ブラウザを起動できませんでした。手動で開いてください: ${filePath}`);
+  }
+}
+
+function openHtmlReportIfRequested(
+  openReport: boolean | undefined,
+  config: AnalysisConfig,
+  htmlFileName: string,
+  requiresHtmlFormat: boolean,
+): void {
+  if (!openReport) {
+    return;
+  }
+  if (requiresHtmlFormat && !config.outputFormats.includes("all") && !config.outputFormats.includes("html")) {
+    console.warn("--open: --format に html が含まれていないため、HTML レポートを開けません。");
+    return;
+  }
+  const target = path.join(config.outputDir, htmlFileName);
+  console.log(`--open: ${target} を開きます`);
+  openInBrowser(target);
+}
+
+const INIT_OUTPUT_FORMATS = ["csv", "markdown", "json", "html", "all"];
+
+interface InitAnswers {
+  outputDir: string;
+  outputFormats: string[];
+  complexityThreshold: number;
+  impactScoreThreshold: number;
+  qualityProfile: "application" | "library-repo";
+}
+
+async function askText(rl: readline.Interface, label: string, defaultValue: string): Promise<string> {
+  const answer = (await rl.question(`${label} [${defaultValue}]: `)).trim();
+  return answer || defaultValue;
+}
+
+async function askNumber(rl: readline.Interface, label: string, defaultValue: number): Promise<number> {
+  for (;;) {
+    const answer = (await rl.question(`${label} [${defaultValue}]: `)).trim();
+    if (!answer) {
+      return defaultValue;
+    }
+    const value = Number.parseInt(answer, 10);
+    if (Number.isFinite(value) && value >= 0) {
+      return value;
+    }
+    console.log("  0 以上の整数を入力してください。");
+  }
+}
+
+async function askYesNo(rl: readline.Interface, label: string, defaultValue: boolean): Promise<boolean> {
+  const suffix = defaultValue ? "[Y/n]" : "[y/N]";
+  const answer = (await rl.question(`${label} ${suffix}: `)).trim().toLowerCase();
+  if (!answer) {
+    return defaultValue;
+  }
+  return answer === "y" || answer === "yes";
+}
+
+async function askChoice<T extends string>(
+  rl: readline.Interface,
+  label: string,
+  choices: readonly T[],
+  defaultValue: T,
+): Promise<T> {
+  for (;;) {
+    const answer = (await rl.question(`${label} (${choices.join(" / ")}) [${defaultValue}]: `)).trim();
+    if (!answer) {
+      return defaultValue;
+    }
+    if ((choices as readonly string[]).includes(answer)) {
+      return answer as T;
+    }
+    console.log(`  ${choices.join(" か ")} を入力してください。`);
+  }
+}
+
+async function askFormats(rl: readline.Interface, defaultFormats: string[]): Promise<string[]> {
+  for (;;) {
+    const answer = (await rl.question(`出力フォーマット (${INIT_OUTPUT_FORMATS.join(",")} をカンマ区切り) [${defaultFormats.join(",")}]: `)).trim();
+    if (!answer) {
+      return [...defaultFormats];
+    }
+    const formats = answer.split(",").map((value) => value.trim()).filter(Boolean);
+    const invalid = formats.filter((format) => !INIT_OUTPUT_FORMATS.includes(format));
+    if (formats.length > 0 && invalid.length === 0) {
+      return formats;
+    }
+    console.log(`  使用できない値があります: ${invalid.join(", ") || "(空)"}。${INIT_OUTPUT_FORMATS.join(",")} から選んでください。`);
+  }
+}
+
+async function runInit(projectRoot: string, assumeYes: boolean): Promise<number> {
+  try {
+    const stat = await fs.stat(projectRoot);
+    if (!stat.isDirectory()) {
+      console.error(`エラー: ${projectRoot} はディレクトリではありません。`);
+      return 1;
+    }
+  } catch {
+    console.error(`エラー: ディレクトリが見つかりません: ${projectRoot}`);
+    return 1;
+  }
+
+  const configPath = path.join(projectRoot, "analyzer.config.json");
+  const configExists = await fs.access(configPath).then(() => true, () => false);
+  const defaults: InitAnswers = {
+    outputDir: "./analysis-reports",
+    outputFormats: ["json", "markdown", "html", "csv"],
+    complexityThreshold: 12,
+    impactScoreThreshold: 60,
+    qualityProfile: "application",
+  };
+  const interactive = !assumeYes && process.stdin.isTTY === true && process.stdout.isTTY === true;
+
+  if (!interactive && !assumeYes) {
+    console.error("エラー: 対話できない環境です。--yes を付けると既定値で生成できます。");
+    return 1;
+  }
+
+  const answers: InitAnswers = { ...defaults, outputFormats: [...defaults.outputFormats] };
+  let showGitlabSnippet = false;
+
+  if (!interactive) {
+    if (configExists) {
+      console.error(`エラー: 既に ${configPath} があります。--yes では上書きしません。対話モードで実行するか、既存ファイルを削除してください。`);
+      return 1;
+    }
+  } else {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      console.log("analyzer.config.json を対話形式で生成します。Enter で [既定値] を採用します。\n");
+      if (configExists) {
+        const overwrite = await askYesNo(rl, `既に ${configPath} があります。上書きしますか?`, false);
+        if (!overwrite) {
+          console.log("中止しました。既存の設定はそのままです。");
+          return 0;
+        }
+      }
+      answers.outputDir = await askText(rl, "レポートの出力先 (projectDir 基準)", defaults.outputDir);
+      answers.outputFormats = await askFormats(rl, defaults.outputFormats);
+      answers.complexityThreshold = await askNumber(rl, "複雑度の警告閾値", defaults.complexityThreshold);
+      answers.impactScoreThreshold = await askNumber(rl, "diff の影響度スコア閾値 (CI で危険な変更を止める基準。0 で無効)", defaults.impactScoreThreshold);
+      answers.qualityProfile = await askChoice(rl, "quality プロファイル", ["application", "library-repo"] as const, defaults.qualityProfile);
+      showGitlabSnippet = await askYesNo(rl, "GitLab CI への組み込み例を表示しますか?", false);
+    } catch (error) {
+      // Ctrl+D / Ctrl+C による入力中断
+      if ((error as { code?: string }).code === "ABORT_ERR") {
+        console.log("\n中止しました。設定は生成していません。");
+        return 1;
+      }
+      throw error;
+    } finally {
+      rl.close();
+    }
+  }
+
+  const configJson = {
+    outputDir: answers.outputDir,
+    outputFormats: answers.outputFormats,
+    complexityThreshold: answers.complexityThreshold,
+    impactScoreThreshold: answers.impactScoreThreshold,
+    failOnImpactThreshold: false,
+    qualityProfile: answers.qualityProfile,
+  };
+  await fs.writeFile(configPath, `${JSON.stringify(configJson, null, 2)}\n`, "utf8");
+
+  console.log([
+    "",
+    `✔ 生成しました: ${configPath}`,
+    "",
+    "次の一歩:",
+    `  ts-react-analyzer analyze ${projectRoot}`,
+    "    ← まず現状を解析して baseline を作ります",
+    `  ts-react-analyzer quality collect ${projectRoot}`,
+    "    ← 出荷審査の品質レポートを生成します",
+    "",
+    "設定項目の意味は docs/configuration.md を参照してください。",
+  ].join("\n"));
+
+  if (showGitlabSnippet) {
+    console.log([
+      "",
+      "GitLab CI への組み込み例 (.gitlab-ci.yml):",
+      "",
+      "  include:",
+      '    - remote: "https://raw.githubusercontent.com/yamaguchiyoshito/ts-react-analyzer/master/ci-templates/gitlab/ts-react-analyzer.gitlab-ci.yml"',
+      "",
+      "ジョブ構成と変数の上書き方法は ci-templates/gitlab/README.md を参照してください。",
+    ].join("\n"));
+  }
+  return 0;
+}
+
+const WATCH_IGNORED_SEGMENTS = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage", ".ts-analyzer-cache", ".nyc_output"]);
+const WATCH_TARGET_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx"]);
+
+async function watchDiff(
+  projectRoot: string,
+  config: AnalysisConfig,
+  baselinePath: string,
+  openReport: boolean,
+): Promise<number> {
+  const initialCode = await diffProject(projectRoot, config, baselinePath, { openReport });
+  if (initialCode === 1) {
+    // baseline 不在などの実行失敗は監視を始めても回復しないため終了する
+    return 1;
+  }
+
+  console.log("\nwatch モード: ソースの変更を監視して diff を自動再実行します (Ctrl+C で終了)");
+
+  let debounceTimer: NodeJS.Timeout | undefined;
+  let running = false;
+  let pendingRerun = false;
+
+  const runDiffOnce = async (): Promise<void> => {
+    if (running) {
+      pendingRerun = true;
+      return;
+    }
+    running = true;
+    try {
+      console.log(`\n―― ${new Date().toISOString()} 変更を検知したため diff を再実行します ――`);
+      await diffProject(projectRoot, config, baselinePath, {});
+    } finally {
+      running = false;
+      if (pendingRerun) {
+        pendingRerun = false;
+        void runDiffOnce();
+      }
+    }
+  };
+
+  const shouldHandleChange = (fileName: string | null): boolean => {
+    if (!fileName) {
+      return false;
+    }
+    const normalized = fileName.split(path.sep).join("/");
+    if (normalized.split("/").some((segment) => WATCH_IGNORED_SEGMENTS.has(segment))) {
+      return false;
+    }
+    const absolutePath = path.resolve(projectRoot, fileName);
+    if (absolutePath.startsWith(config.outputDir + path.sep) || absolutePath.startsWith(config.cacheDir + path.sep)) {
+      return false;
+    }
+    return WATCH_TARGET_EXTENSIONS.has(path.extname(normalized));
+  };
+
+  try {
+    const watcher = watchFileSystem(projectRoot, { recursive: true }, (_eventType, fileName) => {
+      if (!shouldHandleChange(typeof fileName === "string" ? fileName : null)) {
+        return;
+      }
+      if (debounceTimer) {
+        clearTimeout(debounceTimer);
+      }
+      debounceTimer = setTimeout(() => {
+        void runDiffOnce();
+      }, 400);
+    });
+    watcher.on("error", (error) => {
+      console.error(`エラー: ファイル監視に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(1);
+    });
+  } catch (error) {
+    console.error(`エラー: この環境では --watch を利用できません (${error instanceof Error ? error.message : String(error)})`);
+    return 1;
+  }
+
+  // Ctrl+C (SIGINT) で終了するまで待ち続ける
+  return new Promise<number>(() => {});
 }
 
 async function buildArtifacts(
@@ -458,7 +808,11 @@ async function buildArtifacts(
   };
 }
 
-async function analyzeProject(projectDir: string, config: AnalysisConfig): Promise<number> {
+async function analyzeProject(
+  projectDir: string,
+  config: AnalysisConfig,
+  options: { openReport?: boolean } = {},
+): Promise<number> {
   const logger = new Logger(config.verbose ? "DEBUG" : "INFO", config.logFile);
   await logger.initialize();
   const startTime = Date.now();
@@ -492,6 +846,7 @@ async function analyzeProject(projectDir: string, config: AnalysisConfig): Promi
     });
     await logger.close();
     printAnalyzeSummary(report, config);
+    openHtmlReportIfRequested(options.openReport, config, `${config.filePrefix}_report.html`, true);
     return 0;
   } catch (error) {
     return handleCommandError(error, logger, "Analysis failed");
@@ -536,7 +891,12 @@ async function graphProject(projectDir: string, config: AnalysisConfig): Promise
   }
 }
 
-async function diffProject(projectDir: string, config: AnalysisConfig, baselinePath: string): Promise<number> {
+async function diffProject(
+  projectDir: string,
+  config: AnalysisConfig,
+  baselinePath: string,
+  options: { openReport?: boolean } = {},
+): Promise<number> {
   const logger = new Logger(config.verbose ? "DEBUG" : "INFO", config.logFile);
   await logger.initialize();
   const startTime = Date.now();
@@ -573,6 +933,7 @@ async function diffProject(projectDir: string, config: AnalysisConfig, baselineP
       projectRoot: projectDir,
       impactScoreThreshold: config.impactScoreThreshold,
     });
+    openHtmlReportIfRequested(options.openReport, config, `${config.filePrefix}_diff.html`, false);
 
     const thresholdViolations = config.impactScoreThreshold > 0
       ? diff.impact.prioritizedFiles.filter((item) => item.score >= config.impactScoreThreshold)
@@ -620,8 +981,9 @@ async function diffProject(projectDir: string, config: AnalysisConfig, baselineP
 async function qualityProject(
   projectDir: string,
   config: AnalysisConfig,
-  mode: "collect" | "report" | "gate" | "diff",
+  mode: "collect" | "gate" | "diff",
   baselinePath?: string,
+  options: { openReport?: boolean } = {},
 ): Promise<number> {
   const logger = new Logger(config.verbose ? "DEBUG" : "INFO", config.logFile);
   await logger.initialize();
@@ -754,6 +1116,11 @@ async function qualityProject(
       ];
       printOutputFiles(diffLines, config.outputDir, diffFiles, "まずこのファイルから読み始めてください");
       console.log(diffLines.join("\n"));
+      if (diffFormats.includes("html")) {
+        openHtmlReportIfRequested(options.openReport, config, `${config.filePrefix}_quality_diff.html`, false);
+      } else if (options.openReport) {
+        console.warn("--open: --format に html が含まれていないため、HTML レポートを開けません。");
+      }
       return 0;
     }
 
@@ -764,6 +1131,7 @@ async function qualityProject(
       automaticRegressionCount: blockingRegressionMetrics.length,
       durationMs: Date.now() - startTime,
     });
+    openHtmlReportIfRequested(options.openReport, config, `${config.filePrefix}_quality_report.html`, true);
 
     if (mode === "gate" && failingAutomaticMetrics.length > 0) {
       logger.error("Quality gate failed", {
@@ -930,26 +1298,40 @@ async function main(): Promise<number> {
     : undefined;
 
   if (parsed.values.help || !command) {
-    printHelp();
+    printHelp(command && command in COMMAND_USAGE ? command : undefined);
     return 0;
   }
 
-  const validCommands = ["analyze", "graph", "diff", "quality"];
+  const validCommands = ["analyze", "graph", "diff", "quality", "init"];
   if (!validCommands.includes(command) || !projectDir || (command === "quality" && !qualityMode)) {
     if (!validCommands.includes(command)) {
-      console.error(`エラー: 不明なコマンド '${command}' です。使用できるコマンド: analyze, graph, diff, quality\n`);
+      console.error(`エラー: 不明なコマンド '${command}' です。使用できるコマンド: analyze, graph, diff, quality, init\n`);
     } else if (command === "quality" && !qualityMode) {
-      console.error(`エラー: quality にはサブコマンド (collect | report | gate | diff) が必要です。例: quality collect ${maybeSubcommand ?? "./my-app"}\n`);
+      console.error(`エラー: quality にはサブコマンド (collect | gate | diff) が必要です。例: quality collect ${maybeSubcommand ?? "./my-app"}\n`);
     } else {
       const commandExample = command === "quality" ? `quality ${qualityMode}` : command;
       console.error(`エラー: 解析対象の <projectDir> を指定してください。例: ${commandExample} ./my-app\n`);
     }
-    printHelp();
+    printHelp(validCommands.includes(command) ? command : undefined);
     return 1;
+  }
+
+  if (command === "init") {
+    return runInit(path.resolve(projectDir), Boolean(parsed.values.yes));
   }
 
   if (command === "graph" && typeof parsed.values.format === "string") {
     console.warn("警告: graph は --format を無視し、常に JSON と DOT を出力します。HTML レポートが必要な場合は analyze を使ってください。");
+  }
+  if (parsed.values.watch && command !== "diff") {
+    console.warn("警告: --watch は diff でのみ使用できます。無視して通常実行します。");
+  }
+  const openReport = Boolean(parsed.values.open);
+  if (openReport && command === "graph") {
+    console.warn("警告: graph は HTML を出力しないため --open は使えません。analyze を使ってください。");
+  }
+  if (command === "quality" && qualityMode === "report") {
+    console.warn("quality report は quality collect の別名です。今後は collect を使ってください。");
   }
 
   const projectRoot = path.resolve(projectDir);
@@ -993,15 +1375,16 @@ async function main(): Promise<number> {
 
   const dotEnvConfig = configManager.loadFromDotEnv(dotEnvPath);
   const environmentConfig = configManager.loadFromEnvironment();
-  warnEnvironmentOverrides(cliConfig, dotEnvConfig, environmentConfig);
+  notifyConfigPrecedence(cliConfig, dotEnvConfig, environmentConfig);
 
+  // v0.2.0 から CLI 引数が最優先 (デフォルト < 設定ファイル < tsconfig < .env < 環境変数 < CLI)
   const config = configManager.mergeConfigs(
     configManager.getDefaults(),
     configManager.loadFromFile(configPath),
     configManager.loadFromTSConfig(tsConfigPath),
-    cliConfig,
     dotEnvConfig,
     environmentConfig,
+    cliConfig,
     {
       projectRoot,
       tsConfigPath,
@@ -1026,24 +1409,29 @@ async function main(): Promise<number> {
     const baselinePath = typeof parsed.values.baseline === "string"
       ? path.resolve(parsed.values.baseline)
       : path.join(config.outputDir, `${config.filePrefix}_report.json`);
-    return diffProject(projectRoot, config, baselinePath);
+    if (parsed.values.watch) {
+      return watchDiff(projectRoot, config, baselinePath, openReport);
+    }
+    return diffProject(projectRoot, config, baselinePath, { openReport });
   }
   if (command === "quality") {
     if (!qualityMode) {
-      printHelp();
+      printHelp("quality");
       return 1;
     }
-    const baselinePath = qualityMode === "diff"
+    // report は collect の別名 (非推奨)。上で告知済み
+    const qualityCommandMode = qualityMode === "report" ? "collect" : qualityMode;
+    const baselinePath = qualityCommandMode === "diff"
       ? typeof parsed.values.baseline === "string"
         ? path.resolve(parsed.values.baseline)
         : path.join(config.outputDir, `${config.filePrefix}_quality_report.json`)
-      : qualityMode === "gate" && typeof parsed.values.baseline === "string"
+      : qualityCommandMode === "gate" && typeof parsed.values.baseline === "string"
         ? path.resolve(parsed.values.baseline)
       : undefined;
-    return qualityProject(projectRoot, config, qualityMode, baselinePath);
+    return qualityProject(projectRoot, config, qualityCommandMode, baselinePath, { openReport });
   }
 
-  return analyzeProject(projectRoot, config);
+  return analyzeProject(projectRoot, config, { openReport });
 }
 
 const exitCode = await main();
