@@ -44,10 +44,10 @@ JUnit XML がなく Vitest だけが検出された場合、Unit テスト通過
 
 ## quality gate が失敗する条件
 
-`quality gate` は次のとき終了コード `2` で失敗します。判定結果と阻害指標は `*_quality_report.md` の「要点」先頭に「ゲート判定: FAIL（阻害指標一覧）」として出力されるため、ログを見なくてもレポートだけで原因が分かります。
+`quality gate` は次のとき終了コード `2` で失敗します。判定結果と阻害指標は `*_quality_report.md` の「要点」先頭に「ゲート判定: × FAIL（阻害指標一覧）」として出力されるため、ログを見なくてもレポートだけで原因が分かります。
 
 1. 自動判定 `FAIL` の親指標が 1 件でもある
-2. `--baseline` 指定時、親指標の自動判定が前回より悪化した (`pass -> warn` や `warn -> fail`)
+2. `--baseline` 指定時、親指標の自動判定が前回より悪化した (`pass → warn` や `warn → fail`)
 
 ### baseline 悪化の扱いを指標ごとに変える
 
@@ -70,12 +70,88 @@ node dist/src/cli.js quality gate ./my-app \
 `quality diff` は baseline の `*_quality_report.json` と比較し、悪化・改善・追加・削除された観点を差分化します。  
 件数集計に使われるのは親指標だけで、派生指標は診断情報として保持されます。
 
-「悪化」には判定の悪化 (`pass -> warn` など) に加えて、次も含まれます。
+「悪化」には判定の悪化 (`pass → warn` など) に加えて、次も含まれます。
 
 - **判定が warn / fail のままの数値悪化** — 例: 型エラー 108 件 → 110 件。「FAIL のまま少しずつ腐る」変化も悪化として数えます
 - **証跡の喪失** — 実測できていた指標が manual (証跡待ち) に落ちた場合。改善扱いにはなりません
 
 なお `quality gate --baseline` が終了コード `2` で落とすのは判定の悪化だけです。同一判定内の数値悪化は差分レポートでの可視化に留まります。
+
+## 指標 ID 一覧
+
+`--quality-gate-blocking-metrics` / `--quality-gate-monitoring-metrics` に渡す指標 ID の一覧です。  
+レポート側では、md の「要確認項目」の各指標と CSV の `Metric ID` 列にも同じ ID が出力されます。派生指標は gate の対象外です。
+
+| 観点 | 指標 | 指標 ID | 集計 | 自動/手動 |
+|------|------|---------|------|-----------|
+| 機能品質 | 要件適合率 | `requirements_traceability` | 親 | 手動 |
+| 機能品質 | 正常系シナリオ通過率 | `happy_path_pass_rate` | 親 | 手動 |
+| 機能品質 | 異常系・エッジケース網羅率 | `edge_case_coverage` | 親 | 手動 |
+| 機能品質 | バグ残存数（Severity別） | `residual_bug_count` | 親 | 手動 |
+| 機能品質 | ビジネスロジックの正当性 | `logic_correctness` | 親 | 手動 |
+| UI/UX品質 | デザインシステム準拠率（静的推定） | `design_system_usage_rate` | 親 | 自動 |
+| UI/UX品質 | 独自UI実装ファイル件数（静的推定） | `bespoke_ui_file_count` | 親 | 自動 |
+| UI/UX品質 | デザイン一致率 | `figma_delta` | 親 | 手動 |
+| UI/UX品質 | レイアウト崩れ件数 | `breakpoint_layout` | 親 | 手動 |
+| UI/UX品質 | 操作フローの一貫性 | `flow_consistency` | 親 | 手動 |
+| アクセシビリティ品質 | WCAG 2.2 AA準拠率 | `wcag_aa` | 親 | 手動 |
+| アクセシビリティ品質 | aria属性の適正利用率 | `aria_usage` | 親 | 手動 |
+| アクセシビリティ品質 | キーボード操作完結率 | `keyboard_completion` | 親 | 手動 |
+| アクセシビリティ品質 | コントラスト比適合率 | `contrast_ratio` | 親 | 手動 |
+| アクセシビリティ品質 | スクリーンリーダー動作確認 | `screen_reader` | 親 | 手動 |
+| パフォーマンス品質 | Lighthouse Performance | `lighthouse_performance` | 親 | 手動 |
+| パフォーマンス品質 | 初期表示時間（LCP） | `lcp` | 親 | 手動 |
+| パフォーマンス品質 | インタラクティブ時間（TTI） | `tti` | 親 | 手動 |
+| パフォーマンス品質 | JSバンドルサイズ増分 | `bundle_delta` | 親 | 手動 |
+| パフォーマンス品質 | 不要再レンダリング発生率 | `rerender_rate` | 親 | 手動 |
+| コード品質 | TypeScript型エラー数 | `typescript_errors` | 親 | 自動 |
+| コード品質 | tsconfig型安全設定 | `tsconfig_type_safety` | 親 | 自動 |
+| コード品質 | ESLint違反数 | `eslint_violations` | 親 | 手動 |
+| コード品質 | 循環依存数 | `circular_dependencies` | 親 | 自動 |
+| コード品質 | 高責務コンポーネント件数（静的推定） | `high_responsibility_components` | 親 | 自動 |
+| コード品質 | 型の逃げ道スコア | `type_escape_count` | 親 | 自動 |
+| テスト品質 | 対応テストファイル存在率（重み付き推定） | `matching_test_file_presence` | 親 | 自動 |
+| テスト品質 | Routeテスト対応率（重み付き推定） | `route_test_file_presence` | 派生 | 自動 |
+| テスト品質 | Featureテスト対応率（重み付き推定） | `feature_test_file_presence` | 派生 | 自動 |
+| テスト品質 | Formテスト対応率（重み付き推定） | `form_test_file_presence` | 派生 | 自動 |
+| テスト品質 | UIテスト対応率（重み付き推定） | `ui_test_file_presence` | 派生 | 自動 |
+| テスト品質 | Unitテスト通過率 | `unit_pass_rate` | 親 | 手動 |
+| テスト品質 | Storybook Interactionテスト通過率 | `storybook_pass_rate` | 親 | 手動 |
+| テスト品質 | E2Eテスト通過率 | `e2e_pass_rate` | 親 | 手動 |
+| テスト品質 | テスト網羅率（LCOV line coverage） | `coverage_rate` | 親 | 手動 |
+| テスト品質 | flaky test率 | `flaky_rate` | 親 | 手動 |
+| API連携品質 | APIレスポンス整合性 | `openapi_contract` | 親 | 手動 |
+| API連携品質 | エラーハンドリング網羅率 | `error_handling` | 親 | 手動 |
+| API連携品質 | タイムアウト/リトライ設計有無 | `timeout_retry` | 親 | 自動 |
+| API連携品質 | MSWとの整合性（採用シグナル） | `msw_alignment` | 親 | 自動 |
+| API連携品質 | データ型検証採用率（zod静的推定） | `zod_adoption` | 親 | 自動 |
+| セキュリティ品質 | dangerouslySetInnerHTML使用件数 | `dangerous_html` | 親 | 自動 |
+| セキュリティ品質 | CSRF対策 | `csrf_protection` | 親 | 手動 |
+| セキュリティ品質 | 認証・認可フロー検証 | `auth_flow` | 親 | 手動 |
+| セキュリティ品質 | 依存ライブラリ脆弱性 | `dependency_vulnerabilities` | 親 | 手動 |
+| セキュリティ品質 | 機密情報露出シグナル件数 | `secret_indicators` | 親 | 自動 |
+| 国際化（i18n）品質 | ハードコード製品文言件数（JSX） | `hardcoded_jsx_text` | 親 | 自動 |
+| 国際化（i18n）品質 | 翻訳キー存在率 | `translation_keys` | 親 | 手動 |
+| 国際化（i18n）品質 | 疑似ロケール対応 | `pseudo_locale` | 親 | 手動 |
+| 国際化（i18n）品質 | 日付/数値フォーマット適正 | `formatting` | 親 | 手動 |
+| 国際化（i18n）品質 | RTL対応 | `rtl` | 親 | 手動 |
+| 運用・保守性 | ドキュメント整備率シグナル | `documentation_presence` | 親 | 自動 |
+| 運用・保守性 | ログ出力設計 | `logging_design` | 親 | 手動 |
+| 運用・保守性 | エラートラッキング | `error_tracking` | 親 | 手動 |
+| 運用・保守性 | Feature Flag対応 | `feature_flags` | 親 | 手動 |
+| 運用・保守性 | 設定の外部化 | `externalized_config` | 親 | 手動 |
+| ビルド・デプロイ品質 | CI設定有無 | `ci_presence` | 親 | 自動 |
+| ビルド・デプロイ品質 | ビルド時間 | `build_time` | 親 | 手動 |
+| ビルド・デプロイ品質 | キャッシュ効率 | `cache_efficiency` | 親 | 手動 |
+| ビルド・デプロイ品質 | rollback手順有無 | `rollback` | 親 | 手動 |
+| ビルド・デプロイ品質 | 環境差異の有無 | `environment_diff` | 親 | 手動 |
+| 依存関係・ライブラリ品質 | 外部依存パッケージ数 | `external_package_count` | 親 | 自動 |
+| 依存関係・ライブラリ品質 | 循環依存件数（コード品質と同一事象） | `dependency_cycle_count` | 派生 | 自動 |
+| 依存関係・ライブラリ品質 | 不要依存の有無 | `unused_dependencies` | 親 | 手動 |
+| 依存関係・ライブラリ品質 | ライセンス適合性 | `license_compliance` | 親 | 手動 |
+| 依存関係・ライブラリ品質 | メンテナンス状態 | `maintenance_health` | 親 | 手動 |
+
+自動/手動は既定状態です。手動指標も対応する実績ファイル ([自動で取り込まれる実績ファイル](#自動で取り込まれる実績ファイル)) を置くと自動判定に変わるものがあります。
 
 ## 手動証跡 (quality.manual.json)
 

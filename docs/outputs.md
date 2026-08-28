@@ -10,7 +10,7 @@
 | `<prefix>_report.md` | 最初に読むサマリー。優先対応 Top 5、リスク分布、依存分析、ディレクトリ目的の改善提案 |
 | `<prefix>_report.html` | ブラウザで見るレポート。依存グラフの可視化、ファイル表、ソースへの `file://` リンク |
 | `<prefix>_report.json` | 機械処理向けの完全データ。統計、decision summary、ファイル別メトリクス、依存、graph metrics、cache stats、`directoryPurposeAudit` |
-| `<prefix>_files.csv` | ファイル単位の横比較。`File Type`、テストファイル有無、`Matrix Cluster`、複雑度、依存数、型安全性 |
+| `<prefix>_files.csv` | ファイル単位の横比較。`File Type`、テストファイル有無、`Matrix Cluster` (`S1`〜`L3`、日本語ラベル列付き)、複雑度、依存数、型安全性 |
 | `<prefix>_dependencies.csv` | import / export / dynamic import の一覧。循環依存や fan-out の根拠確認に |
 | `<prefix>_components.csv` | React コンポーネント単位の一覧。JSX 要素数、Hooks、props 数、render complexity |
 | `<prefix>_hooks.csv` | Hook 利用の集計。Hook 名ごとの回数、出現ファイル数、依存配列の指定率 |

@@ -807,7 +807,7 @@ async function qualityProject(
       await logger.close();
       const offenders = blockingRegressionMetrics
         .slice(0, 3)
-        .map((metric) => `${metric.categoryLabel}/${metric.label} (${metric.baselineVerdict ?? "不明"} -> ${metric.currentVerdict ?? "不明"})`)
+        .map((metric) => `${metric.categoryLabel}/${metric.label} (${metric.baselineVerdict ?? "不明"} → ${metric.currentVerdict ?? "不明"})`)
         .join(", ");
       console.error([
         "",

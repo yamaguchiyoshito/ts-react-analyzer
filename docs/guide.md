@@ -62,7 +62,7 @@ node dist/src/cli.js graph ../frontend --output ./analysis --prefix architecture
 
 1. `diff` の impacted files でスコアが高い
 2. `report.md` の hot spot Top 5 に入っている
-3. `files.csv` で `Matrix Cluster` が `S-H` (行数少・複雑度高) に寄っている
+3. `files.csv` で `Matrix Cluster` が `S3` (小規模・高複雑度) に寄っている (コードの読み方は → [用語集](glossary.md#クラスタコード))
 4. graph warnings に循環依存、hub、fan-out が出ている
 5. 型安全性で `any`、assertion、non-null assertion、`ts-ignore` が多い
 6. 「ディレクトリ目的と改善提案」に severity `high` の不整合が出ている

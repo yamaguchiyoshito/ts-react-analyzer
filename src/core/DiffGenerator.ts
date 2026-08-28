@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { normalizeClusterCode } from "./ClusterCodes.js";
+
 import type {
   AnalysisDiffReport,
   GraphJSON,
@@ -201,14 +203,14 @@ export class DiffGenerator {
       markdown += "|----------|--------|---------|-------|------|----------|----------|\n";
       for (const item of diff.hotSpotDelta.changed.slice(0, 10)) {
         const drivers = (item.complexityDriverDelta?.length ?? 0) > 0 ? `drivers=${item.complexityDriverDelta!.join(", ")}` : "—";
-        markdown += `| ${item.currentDisplayPath} | ${this.formatSigned(item.scoreDelta)} | ${this.formatSigned(item.complexityDelta)} | ${this.formatSigned(item.dependencyDelta)} | ${this.formatSigned(item.anyDelta)} | ${item.clusterBefore}->${item.clusterAfter} | ${drivers} |\n`;
+        markdown += `| ${item.currentDisplayPath} | ${this.formatSigned(item.scoreDelta)} | ${this.formatSigned(item.complexityDelta)} | ${this.formatSigned(item.dependencyDelta)} | ${this.formatSigned(item.anyDelta)} | ${item.clusterBefore} → ${item.clusterAfter} | ${drivers} |\n`;
       }
       markdown += "\n";
     }
     if (diff.hotSpotDelta.added.length > 0) {
       markdown += "### 新たに Hot Spot 入り\n\n";
       for (const item of diff.hotSpotDelta.added.slice(0, 10)) {
-        markdown += `- ${item.displayPath} score=${item.score} クラスタ=${item.cluster}\n`;
+        markdown += `- ${item.displayPath} score=${item.score} クラスタ=${normalizeClusterCode(item.cluster)}\n`;
         if ((item.complexityDrivers?.length ?? 0) > 0) {
           markdown += `  drivers=${item.complexityDrivers!.join(", ")}\n`;
         }
@@ -218,7 +220,7 @@ export class DiffGenerator {
     if (diff.hotSpotDelta.removed.length > 0) {
       markdown += "### Hot Spot 解消\n\n";
       for (const item of diff.hotSpotDelta.removed.slice(0, 10)) {
-        markdown += `- ${item.displayPath} score=${item.score} クラスタ=${item.cluster}\n`;
+        markdown += `- ${item.displayPath} score=${item.score} クラスタ=${normalizeClusterCode(item.cluster)}\n`;
       }
       markdown += "\n";
     }
@@ -326,17 +328,17 @@ export class DiffGenerator {
       : "<li>Warning Delta: none</li>";
     const hotSpotChanged = diff.hotSpotDelta.changed.length > 0
       ? `<ul>${diff.hotSpotDelta.changed.slice(0, 10).map((item) =>
-        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${this.escapeHtml(item.currentDisplayPath)}</a> scoreDelta=${item.scoreDelta} complexityDelta=${item.complexityDelta} dependencyDelta=${item.dependencyDelta} anyDelta=${item.anyDelta} cluster=${this.escapeHtml(item.clusterBefore)}-&gt;${this.escapeHtml(item.clusterAfter)}${this.renderHtmlDriverMeta(item.complexityDriverDelta)}</li>`
+        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${this.escapeHtml(item.currentDisplayPath)}</a> scoreDelta=${item.scoreDelta} complexityDelta=${item.complexityDelta} dependencyDelta=${item.dependencyDelta} anyDelta=${item.anyDelta} cluster=${this.escapeHtml(item.clusterBefore)} → ${this.escapeHtml(item.clusterAfter)}${this.renderHtmlDriverMeta(item.complexityDriverDelta)}</li>`
       ).join("")}</ul>`
       : "<p>No changed hot spots.</p>";
     const hotSpotAdded = diff.hotSpotDelta.added.length > 0
       ? `<ul>${diff.hotSpotDelta.added.slice(0, 10).map((item) =>
-        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${this.escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${this.escapeHtml(item.cluster)}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
+        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${this.escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${this.escapeHtml(normalizeClusterCode(item.cluster))}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
       ).join("")}</ul>`
       : "<p>No added hot spots.</p>";
     const hotSpotRemoved = diff.hotSpotDelta.removed.length > 0
       ? `<ul>${diff.hotSpotDelta.removed.slice(0, 10).map((item) =>
-        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${this.escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${this.escapeHtml(item.cluster)}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
+        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${this.escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${this.escapeHtml(normalizeClusterCode(item.cluster))}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
       ).join("")}</ul>`
       : "<p>No removed hot spots.</p>";
     const impactGraph = JSON.stringify(diff.impact.graph).replace(/</gu, "\\u003c");
@@ -783,13 +785,17 @@ export class DiffGenerator {
         baselineItem.complexityDrivers,
         currentItem.complexityDrivers,
       );
+      // 旧表記 (S-L 等) の baseline と比較しても、表記変更だけで
+      // クラスタ変化と誤検知しないよう正規化してから比較する
+      const clusterBefore = normalizeClusterCode(baselineItem.cluster);
+      const clusterAfter = normalizeClusterCode(currentItem.cluster);
 
       if (
         scoreDelta !== 0
         || complexityDelta !== 0
         || dependencyDelta !== 0
         || anyDelta !== 0
-        || currentItem.cluster !== baselineItem.cluster
+        || clusterAfter !== clusterBefore
         || complexityDriverDelta.length > 0
       ) {
         changed.push({
@@ -800,8 +806,8 @@ export class DiffGenerator {
           complexityDelta,
           dependencyDelta,
           anyDelta,
-          clusterBefore: baselineItem.cluster,
-          clusterAfter: currentItem.cluster,
+          clusterBefore,
+          clusterAfter,
           baselineComplexityDrivers: baselineItem.complexityDrivers,
           currentComplexityDrivers: currentItem.complexityDrivers,
           complexityDriverDelta,
@@ -832,7 +838,7 @@ export class DiffGenerator {
         continue;
       }
       if (before && after) {
-        deltas.push(`${key}=${before}->${after}`);
+        deltas.push(`${key}=${before} → ${after}`);
         continue;
       }
       if (!before && after) {
