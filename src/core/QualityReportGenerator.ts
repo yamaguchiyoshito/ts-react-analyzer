@@ -1229,13 +1229,13 @@ export class QualityReportGenerator {
     lines.push(
       "## 判定凡例",
       "",
-      "| 状態 | 定義 |",
-      "|------|------|",
-      "| PASS | 自動判定指標で重大な問題が検出されていない状態 |",
-      "| WARN | FAIL ではないが、継続監視または追加対応が必要な状態 |",
-      "| FAIL | カテゴリ内に失敗指標が1件以上ある状態 |",
-      "| PARTIAL | 自動判定は通るが、手動確認待ちが残っており完了扱いできない状態 |",
-      "| MANUAL | 自動判定指標がなく、手動証跡待ちの状態 |",
+      "| 記号 | 状態 | 定義 |",
+      "|------|------|------|",
+      "| ○ | PASS | 自動判定指標で重大な問題が検出されていない状態 |",
+      "| △ | WARN | FAIL ではないが、継続監視または追加対応が必要な状態 |",
+      "| × | FAIL | カテゴリ内に失敗指標が1件以上ある状態 |",
+      "| ◐ | PARTIAL | 自動判定は通るが、手動確認待ちが残っており完了扱いできない状態 |",
+      "| ― | MANUAL | 自動判定指標がなく、手動証跡待ちの状態 |",
       "",
       `- 総合判定ルール: ${this.describeOverallVerdictRule()}`,
       "- 信頼度: 高=実測/集計, 中=静的推定, 低=手動入力または未収集",
@@ -1248,13 +1248,13 @@ export class QualityReportGenerator {
       "## 要点",
       "",
       ...this.buildGateVerdictLines(),
-      `- 総合判定: ${this.verdictLabel(report.summary.overallVerdict)}`,
+      `- 総合判定: ${this.verdictBadge(report.summary.overallVerdict)}`,
       this.buildBaselineComparisonLine(report),
       `- 自動判定カバレッジ: ${automaticCoverage.automaticCount}/${automaticCoverage.totalCount} 指標 (${automaticCoverage.coverageRate.toFixed(1)}%)`,
       `- 実測ベーススコア: PASS率 ${measuredSignalStats.passRate.toFixed(1)}%（PASS ${measuredSignalStats.pass} / WARN ${measuredSignalStats.warn} / FAIL ${measuredSignalStats.fail} / PARTIAL ${measuredSignalStats.partial}）`,
       `- 推定込みスコア: PASS率 ${modeledSignalStats.passRate.toFixed(1)}%（PASS ${modeledSignalStats.pass} / WARN ${modeledSignalStats.warn} / FAIL ${modeledSignalStats.fail} / PARTIAL ${modeledSignalStats.partial}）`,
       `- 自動阻害指標: ${blockingMetrics.length > 0 ? blockingMetrics.map((entry) => `${entry.categoryLabel}/${entry.metric.label}`).join("、") : "なし"}`,
-      `- 注目下位指標: ${derivedInsights.length > 0 ? derivedInsights.map((entry) => `${entry.categoryLabel}/${entry.metric.label} ${entry.metric.actual} (${this.verdictLabel(entry.metric.verdict)})`).join("、") : "なし"}`,
+      `- 注目下位指標: ${derivedInsights.length > 0 ? derivedInsights.map((entry) => `${entry.categoryLabel}/${entry.metric.label} ${entry.metric.actual} (${this.verdictBadge(entry.metric.verdict)})`).join("、") : "なし"}`,
       `- FAILカテゴリ: ${failCategories.length > 0 ? failCategories.join("、") : "なし"}`,
       `- WARNカテゴリ: ${warnCategories.length > 0 ? warnCategories.join("、") : "なし"}`,
       `- PARTIALカテゴリ: ${partialCategories.length > 0 ? partialCategories.join("、") : "なし"}`,
@@ -1276,11 +1276,11 @@ export class QualityReportGenerator {
         const metricLabel = this.shouldRenderDetailedMetric(entry.metric)
           ? `[${entry.metric.label}](#${this.metricAnchor(entry.categoryLabel, entry.metric)})`
           : entry.metric.label;
-        lines.push(`| ${index + 1} | ${entry.categoryLabel} | ${metricLabel} | ${this.verdictLabel(entry.metric.verdict)} | ${this.escapePipe(entry.metric.actual)} | ${this.escapePipe(entry.metric.threshold)} | ${this.escapePipe(this.summarizeMetricTargets(entry.metric, 2))} |`);
+        lines.push(`| ${index + 1} | ${entry.categoryLabel} | ${metricLabel} | ${this.verdictBadge(entry.metric.verdict)} | ${this.escapePipe(entry.metric.actual)} | ${this.escapePipe(entry.metric.threshold)} | ${this.escapePipe(this.summarizeMetricTargets(entry.metric, 2))} |`);
       });
       lines.push("", "### 推奨アクション", "");
       priorityMetrics.forEach((entry, index) => {
-        lines.push(`${index + 1}. **${entry.metric.label}** (${this.verdictLabel(entry.metric.verdict)} ${entry.metric.actual}) — ${this.recommendMetricAction(entry.metric)}`);
+        lines.push(`${index + 1}. **${entry.metric.label}** (${this.verdictBadge(entry.metric.verdict)} ${entry.metric.actual}) — ${this.recommendMetricAction(entry.metric)}`);
       });
       lines.push("");
     }
@@ -1323,7 +1323,7 @@ export class QualityReportGenerator {
       const warnCount = primaryMetrics.filter((metric) => metric.verdict === "warn").length;
       const failCount = primaryMetrics.filter((metric) => metric.verdict === "fail").length;
       const manualCount = primaryMetrics.filter((metric) => metric.verdict === "manual").length;
-      lines.push(`| ${category.label} | ${autoCount} | ${failCount} | ${warnCount} | ${partialCount} | ${manualCount} | ${this.verdictLabel(category.verdict)} |`);
+      lines.push(`| ${category.label} | ${autoCount} | ${failCount} | ${warnCount} | ${partialCount} | ${manualCount} | ${this.verdictBadge(category.verdict)} |`);
     }
 
     lines.push(
@@ -1336,7 +1336,7 @@ export class QualityReportGenerator {
       `- WARN: ${report.summary.warnCount}`,
       `- FAIL: ${report.summary.failCount}`,
       `- MANUAL: ${report.summary.manualCount}`,
-      `- OVERALL: ${this.verdictLabel(report.summary.overallVerdict)}`,
+      `- OVERALL: ${this.verdictBadge(report.summary.overallVerdict)}`,
       "",
     );
 
@@ -1392,7 +1392,7 @@ export class QualityReportGenerator {
           "|------|------|------|------|------|----------|--------|--------|",
         );
         for (const metric of overviewMetrics) {
-          lines.push(`| ${metric.label} | ${metric.aggregation === "derived" ? "派生" : "親"} | ${this.escapePipe(metric.actual)} | ${this.escapePipe(metric.threshold)} | ${this.verdictLabel(metric.verdict)} | ${this.describeEvidenceType(metric)} | ${this.describeConfidenceLevel(metric)} | ${this.escapePipe(this.summarizeMetricTargets(metric, 2))} |`);
+          lines.push(`| ${metric.label} | ${metric.aggregation === "derived" ? "派生" : "親"} | ${this.escapePipe(metric.actual)} | ${this.escapePipe(metric.threshold)} | ${this.verdictBadge(metric.verdict)} | ${this.describeEvidenceType(metric)} | ${this.describeConfidenceLevel(metric)} | ${this.escapePipe(this.summarizeMetricTargets(metric, 2))} |`);
         }
         lines.push("");
       }
@@ -1406,7 +1406,7 @@ export class QualityReportGenerator {
       if (testBucketMetrics.length > 0) {
         lines.push("### 層別テスト対応率", "", "| 層 | 実績 | 基準 | 判定 |", "|----|------|------|------|");
         for (const metric of testBucketMetrics) {
-          lines.push(`| ${this.testPresenceLayerLabel(metric)} | ${this.escapePipe(metric.actual)} | ${this.escapePipe(metric.threshold)} | ${this.verdictLabel(metric.verdict)} |`);
+          lines.push(`| ${this.testPresenceLayerLabel(metric)} | ${this.escapePipe(metric.actual)} | ${this.escapePipe(metric.threshold)} | ${this.verdictBadge(metric.verdict)} |`);
         }
         lines.push("");
       }
@@ -1428,7 +1428,7 @@ export class QualityReportGenerator {
       lines.push("### 要確認項目", "");
       for (const metric of detailedMetrics) {
         const sortedEvidence = this.sortEvidenceForDisplay(metric.evidence);
-        lines.push(`<a id="${this.metricAnchor(category.label, metric)}"></a>`, `#### ${metric.label}`, "", `- 集計: ${metric.aggregation === "derived" ? "派生" : "親"}`, `- 判定: ${this.verdictLabel(metric.verdict)}`, `- 実績: ${metric.actual}`, `- 基準: ${metric.threshold}`, `- 証跡種別: ${this.describeEvidenceType(metric)}`, `- 信頼度: ${this.describeConfidenceLevel(metric)}`, `- 主対象: ${this.summarizeMetricTargets(metric, 3)}`, `- 推奨アクション: ${this.recommendMetricAction(metric)}`, `- 要点: ${metric.summary}`);
+        lines.push(`<a id="${this.metricAnchor(category.label, metric)}"></a>`, `#### ${metric.label}`, "", `- 指標ID: \`${metric.id}\` (gate の blocking / monitoring 指定に使う ID)`, `- 集計: ${metric.aggregation === "derived" ? "派生" : "親"}`, `- 判定: ${this.verdictBadge(metric.verdict)}`, `- 実績: ${metric.actual}`, `- 基準: ${metric.threshold}`, `- 証跡種別: ${this.describeEvidenceType(metric)}`, `- 信頼度: ${this.describeConfidenceLevel(metric)}`, `- 主対象: ${this.summarizeMetricTargets(metric, 3)}`, `- 推奨アクション: ${this.recommendMetricAction(metric)}`, `- 要点: ${metric.summary}`);
         if (metric.evidence.length > 0) {
           // 「他N件」だけだと実績値 (例: 108 件) との対応が読めないため、分母を明記する
           lines.push(sortedEvidence.length > 3 ? `- 証跡（代表 3 件 / 収集 ${sortedEvidence.length} 件）:` : "- 証跡:");
@@ -1448,7 +1448,7 @@ export class QualityReportGenerator {
       for (const category of manualOnlyCategories) {
         const primaryMetrics = this.primaryMetrics(category.metrics);
         const labels = primaryMetrics.map((metric) => metric.label).join("、");
-        lines.push(`### ${category.label}`, "", `- 判定: ${this.verdictLabel(category.verdict)}`, `- 指標: ${labels}`, `- 補足: ${category.summary}`, "");
+        lines.push(`### ${category.label}`, "", `- 判定: ${this.verdictBadge(category.verdict)}`, `- 指標: ${labels}`, `- 補足: ${category.summary}`, "");
       }
     }
 
@@ -1794,11 +1794,12 @@ export class QualityReportGenerator {
 
   private renderCsv(report: QualityReport): string {
     const rows = [
-      ["Category", "Metric", "Aggregation", "Automation", "Actual", "Threshold", "Verdict", "Summary"],
+      ["Category", "Metric", "Metric ID", "Aggregation", "Automation", "Actual", "Threshold", "Verdict", "Summary"],
       ...report.categories.flatMap((category) =>
         category.metrics.map((metric) => [
           category.label,
           metric.label,
+          metric.id,
           metric.aggregation,
           metric.automation,
           metric.actual,
@@ -1853,7 +1854,7 @@ export class QualityReportGenerator {
       const warnCount = primaryMetrics.filter((metric) => metric.verdict === "warn").length;
       const partialCount = primaryMetrics.filter((metric) => metric.verdict === "partial").length;
       const manualCount = primaryMetrics.filter((metric) => metric.verdict === "manual").length;
-      return `<tr><td>${this.escapeHtml(category.label)}</td><td>${autoCount}</td><td>${failCount}</td><td>${warnCount}</td><td>${partialCount}</td><td>${manualCount}</td><td>${this.escapeHtml(this.verdictLabel(category.verdict))}</td></tr>`;
+      return `<tr><td>${this.escapeHtml(category.label)}</td><td>${autoCount}</td><td>${failCount}</td><td>${warnCount}</td><td>${partialCount}</td><td>${manualCount}</td><td>${this.escapeHtml(this.verdictBadge(category.verdict))}</td></tr>`;
     }).join("\n");
     const segmentRows = workspaceSegments.map((segment) =>
       `<tr><td>${this.escapeHtml(segment.label)}</td><td>${segment.fileCount}</td><td>${segment.componentCount}</td><td>${segment.typeEscapeCount}</td><td>${segment.highResponsibilityComponentCount}</td><td>${segment.visualConsumerCount}</td><td>${segment.designSystemBackedCount}</td><td>${segment.weightedTestRate.toFixed(1)}%</td><td>${segment.productTextCount}</td></tr>`
@@ -1868,7 +1869,7 @@ export class QualityReportGenerator {
       const metricLabel = this.shouldRenderDetailedMetric(entry.metric)
         ? `<a href="#${this.escapeHtml(this.metricAnchor(entry.categoryLabel, entry.metric))}">${this.escapeHtml(entry.metric.label)}</a>`
         : this.escapeHtml(entry.metric.label);
-      return `<tr><td>${index + 1}</td><td>${this.escapeHtml(entry.categoryLabel)}</td><td>${metricLabel}</td><td>${this.escapeHtml(this.verdictLabel(entry.metric.verdict))}</td><td>${this.escapeHtml(entry.metric.actual)}</td><td>${this.escapeHtml(entry.metric.threshold)}</td><td>${this.escapeHtml(this.describeEvidenceType(entry.metric))}</td><td>${this.escapeHtml(this.describeConfidenceLevel(entry.metric))}</td><td>${this.escapeHtml(this.summarizeMetricTargets(entry.metric, 2))}</td><td>${this.escapeHtml(this.recommendMetricAction(entry.metric))}</td><td>${this.escapeHtml(entry.metric.summary)}</td></tr>`;
+      return `<tr><td>${index + 1}</td><td>${this.escapeHtml(entry.categoryLabel)}</td><td>${metricLabel}</td><td>${this.escapeHtml(this.verdictBadge(entry.metric.verdict))}</td><td>${this.escapeHtml(entry.metric.actual)}</td><td>${this.escapeHtml(entry.metric.threshold)}</td><td>${this.escapeHtml(this.describeEvidenceType(entry.metric))}</td><td>${this.escapeHtml(this.describeConfidenceLevel(entry.metric))}</td><td>${this.escapeHtml(this.summarizeMetricTargets(entry.metric, 2))}</td><td>${this.escapeHtml(this.recommendMetricAction(entry.metric))}</td><td>${this.escapeHtml(entry.metric.summary)}</td></tr>`;
     }).join("\n");
 
     const detailSections = mainCategories.map((category) => {
@@ -1882,27 +1883,27 @@ export class QualityReportGenerator {
       const overviewTable = overviewMetrics.length === 0
         ? "<p>自動判定指標はありません。</p>"
         : `<div class="table-wrap"><table><thead><tr><th>指標</th><th>集計</th><th>実績</th><th>基準</th><th>判定</th><th>証跡種別</th><th>信頼度</th><th>主対象</th></tr></thead><tbody>${overviewMetrics.map((metric) =>
-          `<tr><td>${this.escapeHtml(metric.label)}</td><td>${this.escapeHtml(metric.aggregation === "derived" ? "派生" : "親")}</td><td>${this.escapeHtml(metric.actual)}</td><td>${this.escapeHtml(metric.threshold)}</td><td>${this.escapeHtml(this.verdictLabel(metric.verdict))}</td><td>${this.escapeHtml(this.describeEvidenceType(metric))}</td><td>${this.escapeHtml(this.describeConfidenceLevel(metric))}</td><td>${this.escapeHtml(this.summarizeMetricTargets(metric, 2))}</td></tr>`
+          `<tr data-verdict="${this.escapeHtml(metric.verdict)}"><td>${this.escapeHtml(metric.label)}</td><td>${this.escapeHtml(metric.aggregation === "derived" ? "派生" : "親")}</td><td>${this.escapeHtml(metric.actual)}</td><td>${this.escapeHtml(metric.threshold)}</td><td>${this.escapeHtml(this.verdictBadge(metric.verdict))}</td><td>${this.escapeHtml(this.describeEvidenceType(metric))}</td><td>${this.escapeHtml(this.describeConfidenceLevel(metric))}</td><td>${this.escapeHtml(this.summarizeMetricTargets(metric, 2))}</td></tr>`
         ).join("\n")}</tbody></table></div>`;
       const manualNote = manualPrimaryMetrics.length > 0
         ? `<p>手動確認待ち ${manualPrimaryMetrics.length} 件: ${this.escapeHtml(manualPrimaryMetrics.slice(0, 4).map((metric) => metric.label).join("、"))}${manualPrimaryMetrics.length > 4 ? `、他${manualPrimaryMetrics.length - 4}件` : ""}。詳細は「不足証跡」または付録を参照してください。</p>`
         : "";
       const testBucketTable = testBucketMetrics.length > 0
         ? `<h3>層別テスト対応率</h3><div class="table-wrap"><table><thead><tr><th>層</th><th>実績</th><th>基準</th><th>判定</th></tr></thead><tbody>${testBucketMetrics.map((metric) =>
-          `<tr><td>${this.escapeHtml(this.testPresenceLayerLabel(metric))}</td><td>${this.escapeHtml(metric.actual)}</td><td>${this.escapeHtml(metric.threshold)}</td><td>${this.escapeHtml(this.verdictLabel(metric.verdict))}</td></tr>`
+          `<tr><td>${this.escapeHtml(this.testPresenceLayerLabel(metric))}</td><td>${this.escapeHtml(metric.actual)}</td><td>${this.escapeHtml(metric.threshold)}</td><td>${this.escapeHtml(this.verdictBadge(metric.verdict))}</td></tr>`
         ).join("\n")}</tbody></table></div>`
         : "";
       const detailCards = detailedMetrics.length === 0
         ? `<p>${hiddenManualMetrics.length > 0 ? `詳細展開は省略しています。手動確認待ち ${hiddenManualMetrics.length} 件は「不足証跡」を参照してください。` : "追加で確認すべき詳細はありません。"}</p>`
         : `<h3>要確認項目</h3><div class="metric-grid">${detailedMetrics.map((metric) => {
           const sortedEvidence = this.sortEvidenceForDisplay(metric.evidence);
-          return `<article class="metric-card" id="${this.escapeHtml(this.metricAnchor(category.label, metric))}"><h4>${this.escapeHtml(metric.label)}</h4><ul class="bullet-list"><li>集計: ${this.escapeHtml(metric.aggregation === "derived" ? "派生" : "親")}</li><li>判定: ${this.escapeHtml(this.verdictLabel(metric.verdict))}</li><li>実績: ${this.escapeHtml(metric.actual)}</li><li>基準: ${this.escapeHtml(metric.threshold)}</li><li>証跡種別: ${this.escapeHtml(this.describeEvidenceType(metric))}</li><li>信頼度: ${this.escapeHtml(this.describeConfidenceLevel(metric))}</li><li>主対象: ${this.escapeHtml(this.summarizeMetricTargets(metric, 3))}</li><li>推奨アクション: ${this.escapeHtml(this.recommendMetricAction(metric))}</li><li>要点: ${this.escapeHtml(metric.summary)}</li></ul>${sortedEvidence.length > 0 ? `<div><strong>証跡</strong><ul class="bullet-list">${sortedEvidence.slice(0, 3).map((evidence) => `<li>${this.escapeHtml(`${evidence.label}: ${evidence.value}`)}</li>`).join("")}${sortedEvidence.length > 3 ? `<li>他${sortedEvidence.length - 3}件</li>` : ""}</ul></div>` : ""}</article>`;
+          return `<article class="metric-card" data-verdict="${this.escapeHtml(metric.verdict)}" id="${this.escapeHtml(this.metricAnchor(category.label, metric))}"><h4>${this.escapeHtml(metric.label)}</h4><ul class="bullet-list"><li>指標ID: <code>${this.escapeHtml(metric.id)}</code></li><li>集計: ${this.escapeHtml(metric.aggregation === "derived" ? "派生" : "親")}</li><li>判定: ${this.escapeHtml(this.verdictBadge(metric.verdict))}</li><li>実績: ${this.escapeHtml(metric.actual)}</li><li>基準: ${this.escapeHtml(metric.threshold)}</li><li>証跡種別: ${this.escapeHtml(this.describeEvidenceType(metric))}</li><li>信頼度: ${this.escapeHtml(this.describeConfidenceLevel(metric))}</li><li>主対象: ${this.escapeHtml(this.summarizeMetricTargets(metric, 3))}</li><li>推奨アクション: ${this.escapeHtml(this.recommendMetricAction(metric))}</li><li>要点: ${this.escapeHtml(metric.summary)}</li></ul>${sortedEvidence.length > 0 ? `<div><strong>証跡</strong><ul class="bullet-list">${sortedEvidence.slice(0, 3).map((evidence) => `<li>${this.escapeHtml(`${evidence.label}: ${evidence.value}`)}</li>`).join("")}${sortedEvidence.length > 3 ? `<li>他${sortedEvidence.length - 3}件</li>` : ""}</ul></div>` : ""}</article>`;
         }).join("\n")}</div>`;
-      return `<section><h2>${this.escapeHtml(category.label)}</h2><p>${this.escapeHtml(category.summary)}</p>${overviewTable}${manualNote}${testBucketTable}${detailCards}</section>`;
+      return `<section class="category" data-verdict="${this.escapeHtml(category.verdict)}"><details open><summary>${this.escapeHtml(category.label)} — ${this.escapeHtml(this.verdictBadge(category.verdict))}</summary><p>${this.escapeHtml(category.summary)}</p>${overviewTable}${manualNote}${testBucketTable}${detailCards}</details></section>`;
     }).join("\n");
     const appendixSections = manualOnlyCategories.map((category) => {
       const primaryMetrics = this.primaryMetrics(category.metrics);
-      return `<section><h3>${this.escapeHtml(category.label)}</h3><ul class="bullet-list"><li>判定: ${this.escapeHtml(this.verdictLabel(category.verdict))}</li><li>指標: ${this.escapeHtml(primaryMetrics.map((metric) => metric.label).join("、"))}</li><li>補足: ${this.escapeHtml(category.summary)}</li></ul></section>`;
+      return `<section><h3>${this.escapeHtml(category.label)}</h3><ul class="bullet-list"><li>判定: ${this.escapeHtml(this.verdictBadge(category.verdict))}</li><li>指標: ${this.escapeHtml(primaryMetrics.map((metric) => metric.label).join("、"))}</li><li>補足: ${this.escapeHtml(category.summary)}</li></ul></section>`;
     }).join("\n");
 
     return `<!DOCTYPE html>
@@ -1923,12 +1924,17 @@ export class QualityReportGenerator {
     .metric-card { border: 1px solid #d1d5db; border-radius: 8px; padding: 12px 16px; background: #ffffff; }
     .bullet-list { margin: 8px 0 0 20px; padding: 0; }
     .bullet-list li { margin: 4px 0; }
+    .toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 12px 0; }
+    .toolbar button { border: 1px solid #9ca3af; background: #ffffff; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+    .category > details > summary { cursor: pointer; font-size: 1.25em; font-weight: 700; margin-bottom: 8px; }
+    [hidden] { display: none !important; }
+    code { background: #f3f4f6; border-radius: 4px; padding: 0 4px; }
   </style>
 </head>
 <body>
   <h1>React 出荷審査 品質レポート</h1>
   <div class="meta">
-    <div class="card"><strong>OVERALL</strong><br />${this.escapeHtml(this.verdictLabel(report.summary.overallVerdict))}</div>
+    <div class="card"><strong>OVERALL</strong><br />${this.escapeHtml(this.verdictBadge(report.summary.overallVerdict))}</div>
     <div class="card"><strong>自動判定カバレッジ</strong><br />${automaticCoverage.automaticCount}/${automaticCoverage.totalCount} (${automaticCoverage.coverageRate.toFixed(1)}%)</div>
     <div class="card"><strong>実測ベーススコア</strong><br />PASS率 ${measuredSignalStats.passRate.toFixed(1)}%</div>
     <div class="card"><strong>推定込みスコア</strong><br />PASS率 ${modeledSignalStats.passRate.toFixed(1)}%</div>
@@ -1942,14 +1948,14 @@ export class QualityReportGenerator {
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>状態</th><th>定義</th></tr>
+          <tr><th>記号</th><th>状態</th><th>定義</th></tr>
         </thead>
         <tbody>
-          <tr><td>PASS</td><td>自動判定指標で重大な問題が検出されていない状態</td></tr>
-          <tr><td>WARN</td><td>FAIL ではないが、継続監視または追加対応が必要な状態</td></tr>
-          <tr><td>FAIL</td><td>カテゴリ内に失敗指標が1件以上ある状態</td></tr>
-          <tr><td>PARTIAL</td><td>自動判定は通るが、手動確認待ちが残っており完了扱いできない状態</td></tr>
-          <tr><td>MANUAL</td><td>自動判定指標がなく、手動証跡待ちの状態</td></tr>
+          <tr><td>○</td><td>PASS</td><td>自動判定指標で重大な問題が検出されていない状態</td></tr>
+          <tr><td>△</td><td>WARN</td><td>FAIL ではないが、継続監視または追加対応が必要な状態</td></tr>
+          <tr><td>×</td><td>FAIL</td><td>カテゴリ内に失敗指標が1件以上ある状態</td></tr>
+          <tr><td>◐</td><td>PARTIAL</td><td>自動判定は通るが、手動確認待ちが残っており完了扱いできない状態</td></tr>
+          <tr><td>―</td><td>MANUAL</td><td>自動判定指標がなく、手動証跡待ちの状態</td></tr>
         </tbody>
       </table>
     </div>
@@ -1961,11 +1967,11 @@ export class QualityReportGenerator {
   <section>
     <h2>要点</h2>
     <ul class="bullet-list">
-      <li>総合判定: ${this.escapeHtml(this.verdictLabel(report.summary.overallVerdict))}</li>
+      <li>総合判定: ${this.escapeHtml(this.verdictBadge(report.summary.overallVerdict))}</li>
       ${this.buildGateVerdictLines().map((line) => `<li>${this.escapeHtml(line.replace(/^[-\s]*/u, "").replace(/\*\*/gu, ""))}</li>`).join("\n      ")}
       <li>${this.escapeHtml(this.buildBaselineComparisonLine(report).replace(/^[-\s]*/u, ""))}</li>
       <li>自動阻害指標: ${this.escapeHtml(blockingMetrics.length > 0 ? blockingMetrics.map((entry) => `${entry.categoryLabel}/${entry.metric.label}`).join("、") : "なし")}</li>
-      <li>注目下位指標: ${this.escapeHtml(derivedInsights.length > 0 ? derivedInsights.map((entry) => `${entry.categoryLabel}/${entry.metric.label} ${entry.metric.actual} (${this.verdictLabel(entry.metric.verdict)})`).join("、") : "なし")}</li>
+      <li>注目下位指標: ${this.escapeHtml(derivedInsights.length > 0 ? derivedInsights.map((entry) => `${entry.categoryLabel}/${entry.metric.label} ${entry.metric.actual} (${this.verdictBadge(entry.metric.verdict)})`).join("、") : "なし")}</li>
       <li>FAILカテゴリ: ${this.escapeHtml(failCategories.length > 0 ? failCategories.join("、") : "なし")}</li>
       <li>WARNカテゴリ: ${this.escapeHtml(warnCategories.length > 0 ? warnCategories.join("、") : "なし")}</li>
       <li>PARTIALカテゴリ: ${this.escapeHtml(partialCategories.length > 0 ? partialCategories.join("、") : "なし")}</li>
@@ -2004,11 +2010,19 @@ export class QualityReportGenerator {
       <li>WARN: ${report.summary.warnCount}</li>
       <li>FAIL: ${report.summary.failCount}</li>
       <li>MANUAL: ${report.summary.manualCount}</li>
-      <li>OVERALL: ${this.escapeHtml(this.verdictLabel(report.summary.overallVerdict))}</li>
+      <li>OVERALL: ${this.escapeHtml(this.verdictBadge(report.summary.overallVerdict))}</li>
     </ul>
   </section>
   ${showWorkspaceSegments ? `<section><h2>ワークスペース内訳</h2><div class="table-wrap"><table><thead><tr><th>セグメント</th><th>Files</th><th>Components</th><th>Type Escapes</th><th>High Responsibility</th><th>Visual Consumers</th><th>DS Backed</th><th>Test Rate</th><th>Product Text</th></tr></thead><tbody>${segmentRows}</tbody></table></div></section>` : ""}
   ${showFeatureSummaries ? `<section><h2>フィーチャー内訳</h2><h3>規模と複雑度</h3><div class="table-wrap"><table><thead><tr><th>フィーチャー</th><th>Files</th><th>Components</th><th>Avg Complexity</th><th>Max Complexity</th></tr></thead><tbody>${featureScaleRows}</tbody></table></div><h3>品質リスク</h3><div class="table-wrap"><table><thead><tr><th>フィーチャー</th><th>Type Escapes</th><th>High Responsibility</th><th>Visual Consumers</th><th>DS Backed</th><th>Test Rate</th><th>Product Text</th></tr></thead><tbody>${featureRiskRows}</tbody></table></div></section>` : ""}
+  <section>
+    <h2>観点別詳細</h2>
+    <div class="toolbar">
+      <label><input type="checkbox" id="only-flagged" /> × FAIL / △ WARN のみ表示</label>
+      <button type="button" id="collapse-all">すべて折りたたむ</button>
+      <button type="button" id="expand-all">すべて展開</button>
+    </div>
+  </section>
   ${detailSections}
   ${manualOnlyCategories.length > 0 ? `<section><h2>付録: 手動確認カテゴリ</h2><p>自動判定が無い、または対象外のみのカテゴリを付録へ退避しています。</p>${appendixSections}</section>` : ""}
   <section>
@@ -2020,6 +2034,28 @@ export class QualityReportGenerator {
       <li>品質プロファイル: ${this.escapeHtml(qualityProfile)}</li>
     </ul>
   </section>
+  <script>
+    const flaggedOnly = document.getElementById("only-flagged");
+    const flaggedVerdicts = new Set(["fail", "warn"]);
+    flaggedOnly.addEventListener("change", () => {
+      const active = flaggedOnly.checked;
+      for (const category of document.querySelectorAll("section.category")) {
+        category.hidden = active && !flaggedVerdicts.has(category.dataset.verdict);
+      }
+      for (const row of document.querySelectorAll("tr[data-verdict]")) {
+        row.hidden = active && !flaggedVerdicts.has(row.dataset.verdict);
+      }
+      for (const card of document.querySelectorAll(".metric-card[data-verdict]")) {
+        card.hidden = active && !flaggedVerdicts.has(card.dataset.verdict);
+      }
+    });
+    document.getElementById("collapse-all").addEventListener("click", () => {
+      for (const detail of document.querySelectorAll("section.category > details")) detail.open = false;
+    });
+    document.getElementById("expand-all").addEventListener("click", () => {
+      for (const detail of document.querySelectorAll("section.category > details")) detail.open = true;
+    });
+  </script>
 </body>
 </html>`;
   }
@@ -3585,9 +3621,9 @@ export class QualityReportGenerator {
     if (!context?.baselinePath) {
       return "- 前回比: N/A（ベースライン未設定）";
     }
-    const baselineLabel = context.baselineOverallVerdict ? this.verdictLabel(context.baselineOverallVerdict) : "不明";
-    const currentLabel = this.verdictLabel(report.summary.overallVerdict);
-    return `- 前回比: ${baselineLabel} -> ${currentLabel}（悪化 ${context.regressedCount ?? 0} 件 / 改善 ${context.improvedCount ?? 0} 件、ベースライン: ${this.toDisplayPath(context.baselinePath)}）`;
+    const baselineLabel = context.baselineOverallVerdict ? this.verdictBadge(context.baselineOverallVerdict) : "不明";
+    const currentLabel = this.verdictBadge(report.summary.overallVerdict);
+    return `- 前回比: ${baselineLabel} → ${currentLabel}（悪化 ${context.regressedCount ?? 0} 件 / 改善 ${context.improvedCount ?? 0} 件、ベースライン: ${this.toDisplayPath(context.baselinePath)}）`;
   }
 
   private buildGateVerdictLines(): string[] {
@@ -3596,17 +3632,17 @@ export class QualityReportGenerator {
       return [];
     }
     if (context.gateVerdict !== "fail") {
-      return ["- **ゲート判定: PASS**（自動FAILなし、ベースライン悪化なし）"];
+      return ["- **ゲート判定: ○ PASS**（自動FAILなし、ベースライン悪化なし）"];
     }
 
     const lines = [
-      `- **ゲート判定: FAIL**（自動FAIL ${context.failingAutomaticMetrics.length} 件 / ベースライン悪化 ${context.blockingRegressions.length} 件、終了コード 2）`,
+      `- **ゲート判定: × FAIL**（自動FAIL ${context.failingAutomaticMetrics.length} 件 / ベースライン悪化 ${context.blockingRegressions.length} 件、終了コード 2）`,
     ];
     for (const offender of context.failingAutomaticMetrics.slice(0, 5)) {
       lines.push(`  - 阻害: ${offender.category} / ${offender.label} — 実績 ${offender.actual}（基準 ${offender.threshold}）`);
     }
     for (const regression of context.blockingRegressions.slice(0, 5)) {
-      lines.push(`  - 悪化: ${regression.category} / ${regression.label} — ${regression.baselineVerdict} -> ${regression.currentVerdict}`);
+      lines.push(`  - 悪化: ${regression.category} / ${regression.label} — ${regression.baselineVerdict} → ${regression.currentVerdict} ↘`);
     }
     const hiddenCount = Math.max(0, context.failingAutomaticMetrics.length - 5) + Math.max(0, context.blockingRegressions.length - 5);
     if (hiddenCount > 0) {
@@ -3676,10 +3712,18 @@ export class QualityReportGenerator {
       case "fail":
         return "×";
       case "manual":
-        return "手動";
+        return "―";
       default:
-        return "対象外";
+        return "";
     }
+  }
+
+  // 判定は「記号 + 英字」の二重表記にする。色に依存せず、一覧表を斜め読み
+  // したときに ○△× で状態が拾えるようにするための表示規則
+  private verdictBadge(verdict: QualityVerdict): string {
+    const mark = this.verdictMark(verdict);
+    const label = this.verdictLabel(verdict);
+    return mark ? `${mark} ${label}` : label;
   }
 
   private verdictLabel(verdict: QualityVerdict): string {

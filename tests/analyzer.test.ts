@@ -590,7 +590,7 @@ test("ReportGenerator writes json, markdown, csv, and html outputs", async () =>
   assert.match(markdownReport, /0 件の種別 \d+ 件は省略しています。/u);
   assert.match(markdownReport, /\| src\/App\.tsx \| 1 \|/u);
   assert.match(filesCsv, /^File,File Type,Has Test File,Matrix Cluster,Lines,/mu);
-  assert.match(filesCsv, /src\/components\/Button\.tsx,UI component,No,S-L,/u);
+  assert.match(filesCsv, /src\/components\/Button\.tsx,UI component,No,S1,/u);
   assert.match(componentsCsv, /^Component,File,File Type,JSX Elements,/mu);
   assert.match(componentsCsv, /Button,src\/components\/Button\.tsx,UI component,/u);
 
@@ -748,7 +748,7 @@ test("QualityReportGenerator writes quality outputs with automatic and manual me
   assert.match(markdownReport, /### 推奨アクション/u);
   assert.match(markdownReport, /\| 指標 \| 集計 \| 実績 \| 基準 \| 判定 \| 証跡種別 \| 信頼度 \| 主対象 \|/u);
   assert.match(markdownReport, /## セキュリティ品質/u);
-  assert.match(csvReport, /^"Category","Metric","Aggregation","Automation","Actual","Threshold","Verdict","Summary"/mu);
+  assert.match(csvReport, /^"Category","Metric","Metric ID","Aggregation","Automation","Actual","Threshold","Verdict","Summary"/mu);
   assert.match(htmlReport, /React 出荷審査 品質レポート/u);
   assert.match(htmlReport, /判定凡例/u);
   assert.match(htmlReport, /自動判定カバレッジ/u);
@@ -867,9 +867,9 @@ test("CLI quality gate writes gate verdict and baseline comparison into the repo
   assert.equal(gateResult.code, 2);
 
   const markdownReport = await fs.readFile(path.join(outputDir, "rel_quality_report.md"), "utf8");
-  assert.match(markdownReport, /- \*\*ゲート判定: FAIL\*\*（自動FAIL \d+ 件 \/ ベースライン悪化 \d+ 件、終了コード 2）/u);
+  assert.match(markdownReport, /- \*\*ゲート判定: × FAIL\*\*（自動FAIL \d+ 件 \/ ベースライン悪化 \d+ 件、終了コード 2）/u);
   assert.match(markdownReport, /  - 阻害: セキュリティ品質 \/ dangerouslySetInnerHTML使用件数 — 実績 1（基準 0）/u);
-  assert.match(markdownReport, /- 前回比: FAIL -> FAIL（悪化 \d+ 件 \/ 改善 \d+ 件、ベースライン: /u);
+  assert.match(markdownReport, /- 前回比: × FAIL → × FAIL（悪化 \d+ 件 \/ 改善 \d+ 件、ベースライン: /u);
   assert.doesNotMatch(markdownReport, /前回比: N\/A（ベースライン未設定）/u);
 
   await fs.rm(projectRoot, { recursive: true, force: true });
@@ -4019,22 +4019,22 @@ test("ReportGenerator classifies feature, hook, context, API, barrel, schema, va
 
   const filesCsv = await fs.readFile(path.join(outputDir, "layers_files.csv"), "utf8");
 
-  assert.match(filesCsv, /\.storybook\/main\.js,Config,No,S-L,/u);
-  assert.match(filesCsv, /\.storybook\/components\/SBMermaid\.tsx,Storybook Support,No,S-L,/u);
-  assert.match(filesCsv, /src\/features\/chat\/TextChat\.tsx,Feature,No,S-L,/u);
-  assert.match(filesCsv, /src\/features\/user\/schemas\/user\.schema\.ts,Schema,No,S-L,/u);
-  assert.match(filesCsv, /src\/contexts\/chat\/ChatTurnStore\.tsx,Context\/State,No,S-L,/u);
-  assert.match(filesCsv, /src\/contexts\/chat\/useChatTurn\.ts,Hook,No,S-L,/u);
-  assert.match(filesCsv, /src\/bases\/api\/fetcher\.ts,API\/Infrastructure,No,S-L,/u);
-  assert.match(filesCsv, /src\/components\/forms\/validations\/common\.ts,Validation,No,S-L,/u);
-  assert.match(filesCsv, /src\/components\/ui\/sidebar\.tsx,UI component,No,S-L,/u);
-  assert.match(filesCsv, /src\/lib\/utils\.ts,Utils,No,S-L,/u);
-  assert.match(filesCsv, /src\/utils\/formatDate\.ts,Utils,No,S-L,/u);
-  assert.match(filesCsv, /src\/components\/index\.ts,Barrel,No,S-L,/u);
-  assert.match(filesCsv, /vitest\.shims\.d\.ts,Type Support,No,S-L,/u);
-  assert.match(filesCsv, /packages\/mui-material\/src\/Button\/Button\.tsx,UI component,No,S-L,/u);
-  assert.match(filesCsv, /packages\/mui-material\/src\/Button\/index\.ts,Barrel,No,S-L,/u);
-  assert.match(filesCsv, /packages\/mui-material\/src\/Slider\/useSlider\.ts,Hook,No,S-L,/u);
+  assert.match(filesCsv, /\.storybook\/main\.js,Config,No,S1,/u);
+  assert.match(filesCsv, /\.storybook\/components\/SBMermaid\.tsx,Storybook Support,No,S1,/u);
+  assert.match(filesCsv, /src\/features\/chat\/TextChat\.tsx,Feature,No,S1,/u);
+  assert.match(filesCsv, /src\/features\/user\/schemas\/user\.schema\.ts,Schema,No,S1,/u);
+  assert.match(filesCsv, /src\/contexts\/chat\/ChatTurnStore\.tsx,Context\/State,No,S1,/u);
+  assert.match(filesCsv, /src\/contexts\/chat\/useChatTurn\.ts,Hook,No,S1,/u);
+  assert.match(filesCsv, /src\/bases\/api\/fetcher\.ts,API\/Infrastructure,No,S1,/u);
+  assert.match(filesCsv, /src\/components\/forms\/validations\/common\.ts,Validation,No,S1,/u);
+  assert.match(filesCsv, /src\/components\/ui\/sidebar\.tsx,UI component,No,S1,/u);
+  assert.match(filesCsv, /src\/lib\/utils\.ts,Utils,No,S1,/u);
+  assert.match(filesCsv, /src\/utils\/formatDate\.ts,Utils,No,S1,/u);
+  assert.match(filesCsv, /src\/components\/index\.ts,Barrel,No,S1,/u);
+  assert.match(filesCsv, /vitest\.shims\.d\.ts,Type Support,No,S1,/u);
+  assert.match(filesCsv, /packages\/mui-material\/src\/Button\/Button\.tsx,UI component,No,S1,/u);
+  assert.match(filesCsv, /packages\/mui-material\/src\/Button\/index\.ts,Barrel,No,S1,/u);
+  assert.match(filesCsv, /packages\/mui-material\/src\/Slider\/useSlider\.ts,Hook,No,S1,/u);
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
@@ -4547,9 +4547,9 @@ test("ReportGenerator adds 3x3 size-complexity matrix clusters to files csv", as
 
   const filesCsv = await fs.readFile(path.join(outputDir, "matrix_files.csv"), "utf8");
   assert.match(filesCsv, /^File,File Type,Has Test File,Matrix Cluster,Lines,/mu);
-  assert.match(filesCsv, /src\/small\.ts,Shared,No,S-L,/u);
-  assert.match(filesCsv, /src\/medium\.ts,Shared,No,M-M,/u);
-  assert.match(filesCsv, /src\/large\.ts,Shared,No,L-H,/u);
+  assert.match(filesCsv, /src\/small\.ts,Shared,No,S1,/u);
+  assert.match(filesCsv, /src\/medium\.ts,Shared,No,M2,/u);
+  assert.match(filesCsv, /src\/large\.ts,Shared,No,L3,/u);
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });
@@ -4576,10 +4576,10 @@ test("ReportGenerator adds matching test-file presence to files csv", async () =
 
   const filesCsv = await fs.readFile(path.join(outputDir, "test-presence_files.csv"), "utf8");
   assert.match(filesCsv, /^File,File Type,Has Test File,Matrix Cluster,Lines,/mu);
-  assert.match(filesCsv, /src\/components\/Button\.tsx,UI component,Yes,S-L,/u);
-  assert.match(filesCsv, /src\/components\/Button\.test\.tsx,Test,Yes,S-L,/u);
-  assert.match(filesCsv, /src\/features\/OrderPage\.tsx,Feature,Yes,S-L,/u);
-  assert.match(filesCsv, /src\/utils\/format\.ts,Utils,No,S-L,/u);
+  assert.match(filesCsv, /src\/components\/Button\.tsx,UI component,Yes,S1,/u);
+  assert.match(filesCsv, /src\/components\/Button\.test\.tsx,Test,Yes,S1,/u);
+  assert.match(filesCsv, /src\/features\/OrderPage\.tsx,Feature,Yes,S1,/u);
+  assert.match(filesCsv, /src\/utils\/format\.ts,Utils,No,S1,/u);
 
   await fs.rm(projectRoot, { recursive: true, force: true });
 });

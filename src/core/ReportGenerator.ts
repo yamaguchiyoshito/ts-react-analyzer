@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { CLUSTER_CODES, describeClusterAxes, describeClusterMeaning, formatClusterWithLabel, getClusterWeight, isHighComplexityCluster } from "./ClusterCodes.js";
 import { auditDirectoryPurposes } from "./DirectoryPurposeAuditor.js";
 import { classifyFileType, getFileTypePurpose, KNOWN_FILE_TYPES } from "./FileConventions.js";
 import type {
@@ -135,24 +136,29 @@ export class ReportGenerator {
       "Dependencies",
       "Risk Level",
       "Type Safety",
+      "Matrix Cluster Label",
     ];
 
-    const rows = this.analysisResults.map((result) => [
-      this.toDisplayPath(result.filePath),
-      this.classifyFileType(result.filePath),
-      this.hasCorrespondingTestFile(result.filePath, testTargets) ? "Yes" : "No",
-      this.classifySizeComplexityCluster(result.complexity.codeLines, result.complexity.overallComplexity),
-      String(result.complexity.totalLines),
-      String(result.complexity.codeLines),
-      String(result.complexity.commentLines),
-      String(result.complexity.functions.length),
-      String(result.complexity.overallComplexity),
-      String(result.complexity.components.length),
-      String(result.complexity.hooks.length),
-      String(result.dependencies.length),
-      this.getRiskLevel(result.complexity.overallComplexity),
-      `${result.complexity.typeMetrics.anyTypeCount} any / ${result.complexity.typeMetrics.assertionCount} assertions`,
-    ]);
+    const rows = this.analysisResults.map((result) => {
+      const cluster = this.classifySizeComplexityCluster(result.complexity.codeLines, result.complexity.overallComplexity);
+      return [
+        this.toDisplayPath(result.filePath),
+        this.classifyFileType(result.filePath),
+        this.hasCorrespondingTestFile(result.filePath, testTargets) ? "Yes" : "No",
+        cluster,
+        String(result.complexity.totalLines),
+        String(result.complexity.codeLines),
+        String(result.complexity.commentLines),
+        String(result.complexity.functions.length),
+        String(result.complexity.overallComplexity),
+        String(result.complexity.components.length),
+        String(result.complexity.hooks.length),
+        String(result.dependencies.length),
+        this.getRiskLevel(result.complexity.overallComplexity),
+        `${result.complexity.typeMetrics.anyTypeCount} any / ${result.complexity.typeMetrics.assertionCount} assertions`,
+        describeClusterAxes(cluster),
+      ];
+    });
 
     return this.toCsvString([headers, ...rows]);
   }
@@ -357,11 +363,18 @@ export class ReportGenerator {
     });
     markdown += "\n";
 
+    markdown += "### score の内訳\n\n";
+    markdown += "score = 複雑度×5 + 依存×2 + any×4 + Hooks + クラスタ重み。各行の根拠は次のとおりです。\n\n";
+    hotSpots.forEach((item, index) => {
+      markdown += `- ${index + 1}位 ${item.displayPath}: ${item.score} = ${this.formatHotSpotScoreBreakdown(item)}\n`;
+    });
+    markdown += "\n";
+
     if (primary && (primary.complexityDrivers?.length ?? 0) > 0) {
       markdown += "### 最優先ファイルの補足\n\n";
       markdown += `- **対象**: ${primary.displayPath}\n`;
       markdown += `- **score帯**: ${this.getHotSpotSeverity(primary.score)}\n`;
-      markdown += `- **クラスタ**: ${primary.cluster}\n`;
+      markdown += `- **クラスタ**: ${formatClusterWithLabel(primary.cluster)}\n`;
       markdown += `- **複雑度内訳**: ${primary.complexityDrivers!.join(", ")}\n`;
       markdown += `- **推奨対応**: ${primary.action}\n`;
       markdown += "- **内訳の見方**: weighted=ファイル代表値 / peakFn=最も複雑な関数 / top3avg=上位3関数の平均 / nesting=最大ネスト深度 / hookPressure=コンポーネントあたりHooks数 / elevatedFns=複雑度5以上または深いネストの関数数\n";
@@ -431,8 +444,6 @@ export class ReportGenerator {
       return "## 3x3 マトリクス要約\n\nコード行数と複雑度の 3x3 マトリクスで、設計負債の位置を俯瞰します。\n\n解析対象ファイルはありません。\n\n";
     }
 
-    const sizeBands: Array<"S" | "M" | "L"> = ["S", "M", "L"];
-    const complexityBands: Array<"L" | "M" | "H"> = ["L", "M", "H"];
     const counts = new Map<string, number>();
 
     for (const result of this.analysisResults) {
@@ -441,20 +452,18 @@ export class ReportGenerator {
     }
 
     let markdown = "## 3x3 マトリクス要約\n\n";
-    markdown += "コード行数と複雑度の 3x3 マトリクスで、設計負債の位置を俯瞰します。\n\n";
-    markdown += `| 行数帯 \\\\ 複雑度 | 低 (<=${LOW_COMPLEXITY_MAX}) | 中 (<=${MEDIUM_COMPLEXITY_MAX}) | 高 (>${MEDIUM_COMPLEXITY_MAX}) |\n`;
+    markdown += "コード行数と複雑度の 3x3 マトリクスで、設計負債の位置を俯瞰します。  \n";
+    markdown += "クラスタコードは 行数帯 (S=小/M=中/L=大) × 複雑度帯 (1=低/2=中/3=高) です。例: `L3` = 大規模・高複雑度。\n\n";
+    markdown += `| 行数帯 \\\\ 複雑度 | 低=1 (<=${LOW_COMPLEXITY_MAX}) | 中=2 (<=${MEDIUM_COMPLEXITY_MAX}) | 高=3 (>${MEDIUM_COMPLEXITY_MAX}) |\n`;
     markdown += "|-------------------|----------|-----------|----------|\n";
-    markdown += `| 小 (<=100) | ${counts.get("S-L") ?? 0} | ${counts.get("S-M") ?? 0} | ${counts.get("S-H") ?? 0} |\n`;
-    markdown += `| 中 (<=300) | ${counts.get("M-L") ?? 0} | ${counts.get("M-M") ?? 0} | ${counts.get("M-H") ?? 0} |\n`;
-    markdown += `| 大 (>300) | ${counts.get("L-L") ?? 0} | ${counts.get("L-M") ?? 0} | ${counts.get("L-H") ?? 0} |\n\n`;
+    markdown += `| S=小 (<=100) | ${counts.get("S1") ?? 0} | ${counts.get("S2") ?? 0} | ${counts.get("S3") ?? 0} |\n`;
+    markdown += `| M=中 (<=300) | ${counts.get("M1") ?? 0} | ${counts.get("M2") ?? 0} | ${counts.get("M3") ?? 0} |\n`;
+    markdown += `| L=大 (>300) | ${counts.get("L1") ?? 0} | ${counts.get("L2") ?? 0} | ${counts.get("L3") ?? 0} |\n\n`;
 
-    markdown += "| クラスタ | 件数 | 意味 |\n";
-    markdown += "|----------|------|------|\n";
-    for (const sizeBand of sizeBands) {
-      for (const complexityBand of complexityBands) {
-        const cluster = `${sizeBand}-${complexityBand}`;
-        markdown += `| ${cluster} | ${counts.get(cluster) ?? 0} | ${this.describeCluster(cluster)} |\n`;
-      }
+    markdown += "| クラスタ | 行数×複雑度 | 件数 | 意味 |\n";
+    markdown += "|----------|--------------|------|------|\n";
+    for (const cluster of CLUSTER_CODES) {
+      markdown += `| ${cluster} | ${describeClusterAxes(cluster)} | ${counts.get(cluster) ?? 0} | ${describeClusterMeaning(cluster)} |\n`;
     }
     markdown += "\n";
     return markdown;
@@ -1088,7 +1097,8 @@ export class ReportGenerator {
     const rows = this.analysisResults
       .map((result) => {
         const risk = this.getRiskLevel(result.complexity.overallComplexity);
-        return `<tr class="${risk}" data-file="${this.escapeHtml(result.filePath)}"><td><a href="${this.toFileHref(result.filePath)}">${this.escapeHtml(this.toDisplayPath(result.filePath))}</a></td><td>${result.complexity.totalLines}</td><td>${result.complexity.overallComplexity}</td><td>${result.complexity.components.length}</td><td>${riskLabels[risk] ?? risk}</td></tr>`;
+        const cluster = this.classifySizeComplexityCluster(result.complexity.codeLines, result.complexity.overallComplexity);
+        return `<tr class="${risk}" data-file="${this.escapeHtml(result.filePath)}" data-risk="${risk}"><td><a href="${this.toFileHref(result.filePath)}">${this.escapeHtml(this.toDisplayPath(result.filePath))}</a></td><td>${result.complexity.totalLines}</td><td>${result.complexity.overallComplexity}</td><td>${result.complexity.components.length}</td><td title="${this.escapeHtml(describeClusterAxes(cluster))}">${cluster}</td><td>${riskLabels[risk] ?? risk}</td></tr>`;
       })
       .join("\n");
     // md 版の中核である優先対応 Top 5 を HTML でも先頭に出し、両者の結論を揃える
@@ -1143,8 +1153,13 @@ export class ReportGenerator {
     tr.medium { background: #fef3c7; }
     tr.low { background: #dcfce7; }
     code { background: #e5e7eb; padding: 0 4px; border-radius: 4px; }
-    .toolbar { display: flex; gap: 8px; align-items: center; margin: 12px 0; }
+    .toolbar { display: flex; gap: 8px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
+    .toolbar input[type="search"], .toolbar select { border: 1px solid #94a3b8; border-radius: 6px; padding: 6px 10px; font: inherit; }
+    .toolbar .hint { font-size: 12px; color: #64748b; }
     button { border: 1px solid #94a3b8; background: white; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+    details.criteria { margin: 12px 0; border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 12px; background: #f8fafc; }
+    details.criteria summary { cursor: pointer; font-weight: 600; }
+    #file-table th { cursor: pointer; user-select: none; }
     .legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: #475569; }
     .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 6px; border-radius: 999px; vertical-align: middle; }
     .legend .low::before { background: #8ce99a; }
@@ -1190,9 +1205,28 @@ export class ReportGenerator {
     </aside>
   </div>
   <h2>ファイル一覧</h2>
-  <table>
+  <details class="criteria">
+    <summary>判定基準と記号の凡例</summary>
+    <ul>
+      <li><strong>複雑度リスク</strong>: 低 &lt;= ${LOW_COMPLEXITY_MAX} / 中 &lt;= ${MEDIUM_COMPLEXITY_MAX} / 高 &gt; ${MEDIUM_COMPLEXITY_MAX}（重み付きファイル複雑度）</li>
+      <li><strong>クラスタ</strong>: 行数帯 (S=小 &lt;=100行 / M=中 &lt;=300行 / L=大) × 複雑度帯 (1=低 / 2=中 / 3=高)。例: L3 = 大規模・高複雑度</li>
+      <li><strong>severity</strong>: score により Critical &gt;= 120 / High &gt;= 80 / Medium &gt;= 40 / Low &lt; 40</li>
+      <li><strong>score</strong>: 複雑度×5 + 依存×2 + any×4 + Hooks + クラスタ重み</li>
+    </ul>
+  </details>
+  <div class="toolbar">
+    <input id="file-search" type="search" placeholder="ファイル名で絞り込み" />
+    <select id="risk-filter">
+      <option value="all">リスク: すべて</option>
+      <option value="high">リスク: 高のみ</option>
+      <option value="medium">リスク: 中のみ</option>
+      <option value="low">リスク: 低のみ</option>
+    </select>
+    <span class="hint">列見出しをクリックすると並べ替えできます</span>
+  </div>
+  <table id="file-table">
     <thead>
-      <tr><th>ファイル</th><th>行数</th><th>複雑度</th><th>コンポーネント</th><th>複雑度リスク</th></tr>
+      <tr><th data-sort="text">ファイル</th><th data-sort="number">行数</th><th data-sort="number">複雑度</th><th data-sort="number">コンポーネント</th><th data-sort="text">クラスタ</th><th data-sort="text">複雑度リスク</th></tr>
     </thead>
     <tbody>
       ${rows}
@@ -1206,10 +1240,53 @@ export class ReportGenerator {
     const graphHost = document.getElementById("graph");
     const emptyState = document.getElementById("graph-empty");
     const SVG_NS = "http://www.w3.org/2000/svg";
+
+    // 検索・リスク絞り込み・グラフのノード選択は 1 つの状態に集約し、
+    // どの操作でも同じ関数で表を再評価する
+    const filterState = { query: "", risk: "all", selectedFile: null };
+    const applyFilters = () => {
+      for (const row of tableRows) {
+        const matchesQuery = filterState.query === ""
+          || row.textContent.toLowerCase().includes(filterState.query);
+        const matchesRisk = filterState.risk === "all" || row.dataset.risk === filterState.risk;
+        const matchesSelection = filterState.selectedFile === null || row.dataset.file === filterState.selectedFile;
+        row.hidden = !(matchesQuery && matchesRisk && matchesSelection);
+      }
+    };
+    document.getElementById("file-search").addEventListener("input", (event) => {
+      filterState.query = event.target.value.trim().toLowerCase();
+      applyFilters();
+    });
+    document.getElementById("risk-filter").addEventListener("change", (event) => {
+      filterState.risk = event.target.value;
+      applyFilters();
+    });
     document.getElementById("reset-filter").addEventListener("click", () => {
-      for (const row of tableRows) row.style.display = "";
+      filterState.selectedFile = null;
+      applyFilters();
       selectionName.textContent = "なし";
       selectionMeta.textContent = "ノードをクリックするとファイル表を絞り込めます。";
+    });
+
+    const fileTable = document.getElementById("file-table");
+    const tableBody = fileTable.querySelector("tbody");
+    const sortState = { index: -1, ascending: true };
+    fileTable.querySelectorAll("th").forEach((header, index) => {
+      header.addEventListener("click", () => {
+        sortState.ascending = sortState.index === index ? !sortState.ascending : true;
+        sortState.index = index;
+        const numeric = header.dataset.sort === "number";
+        const direction = sortState.ascending ? 1 : -1;
+        const sorted = [...tableRows].sort((left, right) => {
+          const leftText = left.cells[index].textContent.trim();
+          const rightText = right.cells[index].textContent.trim();
+          if (numeric) return (Number(leftText) - Number(rightText)) * direction;
+          return leftText.localeCompare(rightText, "ja") * direction;
+        });
+        fileTable.querySelectorAll("th").forEach((th) => { th.textContent = th.textContent.replace(/ [▲▼]$/u, ""); });
+        header.textContent = header.textContent + (sortState.ascending ? " ▲" : " ▼");
+        for (const row of sorted) tableBody.appendChild(row);
+      });
     });
 
     if (!graphData.nodes.length) {
@@ -1278,9 +1355,8 @@ export class ReportGenerator {
         title.textContent = item.id;
         circle.appendChild(title);
         circle.addEventListener("click", () => {
-          for (const row of tableRows) {
-            row.style.display = row.dataset.file === item.id ? "" : "none";
-          }
+          filterState.selectedFile = item.id;
+          applyFilters();
           selectionName.textContent = item.id;
           selectionMeta.textContent = "inDegree=" + item.inDegree + ", outDegree=" + item.outDegree + ", pageRank=" + (item.pageRank || 0).toFixed(4);
         });
@@ -1443,7 +1519,7 @@ export class ReportGenerator {
   private classifySizeComplexityCluster(codeLines: number, complexity: number): string {
     const sizeBand = this.classifyCodeLineBand(codeLines);
     const complexityBand = this.classifyComplexityBand(complexity);
-    return `${sizeBand}-${complexityBand}`;
+    return `${sizeBand}${complexityBand}`;
   }
 
   private classifyCodeLineBand(codeLines: number): "S" | "M" | "L" {
@@ -1456,14 +1532,15 @@ export class ReportGenerator {
     return "L";
   }
 
-  private classifyComplexityBand(complexity: number): "L" | "M" | "H" {
+  // 複雑度帯は 1=低 / 2=中 / 3=高。行数帯の L (Large) と紛れないよう数字にする
+  private classifyComplexityBand(complexity: number): "1" | "2" | "3" {
     if (complexity <= LOW_COMPLEXITY_MAX) {
-      return "L";
+      return "1";
     }
     if (complexity <= MEDIUM_COMPLEXITY_MAX) {
-      return "M";
+      return "2";
     }
-    return "H";
+    return "3";
   }
 
   private getHotSpots(threshold: number, limit: number): HotSpotItem[] {
@@ -1480,13 +1557,13 @@ export class ReportGenerator {
           + (dependencies * 2)
           + (anyCount * 4)
           + hooks
-          + this.getClusterWeight(cluster);
+          + getClusterWeight(cluster);
         const reasons: string[] = [];
 
         if (result.complexity.overallComplexity >= threshold) {
           reasons.push(`complexity>=${threshold}`);
         }
-        if (cluster.endsWith("-H")) {
+        if (isHighComplexityCluster(cluster)) {
           reasons.push(`cluster=${cluster}`);
         }
         if (dependencies >= 5) {
@@ -1640,50 +1717,14 @@ export class ReportGenerator {
     return Number(value.toFixed(2)).toString();
   }
 
-  private getClusterWeight(cluster: string): number {
-    switch (cluster) {
-      case "L-H":
-        return 18;
-      case "M-H":
-        return 12;
-      case "L-M":
-        return 10;
-      case "S-H":
-        return 8;
-      case "M-M":
-        return 6;
-      case "L-L":
-        return 4;
-      case "S-M":
-        return 3;
-      default:
-        return 1;
-    }
-  }
-
-  private describeCluster(cluster: string): string {
-    switch (cluster) {
-      case "S-L":
-        return "小規模で安定";
-      case "S-M":
-        return "小規模だが分岐あり";
-      case "S-H":
-        return "小規模だが高リスク";
-      case "M-L":
-        return "中規模で管理可能";
-      case "M-M":
-        return "中規模で中リスク";
-      case "M-H":
-        return "中規模で高リスク";
-      case "L-L":
-        return "大規模だが安定";
-      case "L-M":
-        return "大規模で要注意";
-      case "L-H":
-        return "大規模で高リスク";
-      default:
-        return "未分類";
-    }
+  private formatHotSpotScoreBreakdown(item: HotSpotItem): string {
+    return [
+      `複雑度 ${item.complexity * 5}`,
+      `依存 ${item.dependencies * 2}`,
+      `any ${item.anyCount * 4}`,
+      `Hooks ${item.hooks}`,
+      `クラスタ重み ${getClusterWeight(item.cluster)} (${item.cluster})`,
+    ].join(" + ");
   }
 
   private getTypeSafetyTotals(): {

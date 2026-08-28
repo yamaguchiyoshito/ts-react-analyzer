@@ -372,16 +372,18 @@ export class QualityDiffGenerator {
     markdown += `- Current Timestamp: ${diff.currentTimestamp}\n`;
     markdown += `- Generated At: ${diff.generatedAt}\n\n`;
 
+    markdown += "凡例: 判定 = ○ PASS / △ WARN / × FAIL / ◐ PARTIAL / ― MANUAL、増減 = ↗ 改善 / ↘ 悪化 / → 変化なし\n\n";
+
     markdown += "## サマリー\n\n";
-    markdown += "| baseline判定 | current判定 | 変更カテゴリ | 変更指標 | 改善 | 悪化 | 自動悪化 | 手動悪化 |\n";
-    markdown += "|---|---:|---:|---:|---:|---:|---:|---:|\n";
-    markdown += `| ${diff.summary.baselineOverallVerdict} | ${diff.summary.currentOverallVerdict} | ${diff.summary.changedCategories} | ${diff.summary.changedMetrics} | ${diff.summary.improvedMetrics} | ${diff.summary.regressedMetrics} | ${diff.summary.automaticRegressions} | ${diff.summary.manualRegressions} |\n\n`;
+    markdown += "| baseline判定 | current判定 | 変更カテゴリ | 変更指標 | 改善 ↗ | 悪化 ↘ | 自動悪化 | 手動悪化 |\n";
+    markdown += "|---|---|---:|---:|---:|---:|---:|---:|\n";
+    markdown += `| ${this.verdictBadge(diff.summary.baselineOverallVerdict)} | ${this.verdictBadge(diff.summary.currentOverallVerdict)} | ${diff.summary.changedCategories} | ${diff.summary.changedMetrics} | ${diff.summary.improvedMetrics} | ${diff.summary.regressedMetrics} | ${diff.summary.automaticRegressions} | ${diff.summary.manualRegressions} |\n\n`;
 
     markdown += "## 観点差分\n\n";
-    markdown += "| 観点 | baseline | current | status | changed | improved | regressed |\n";
+    markdown += "| 観点 | baseline判定 | current判定 | 状態 | 変更 | 改善 ↗ | 悪化 ↘ |\n";
     markdown += "|---|---|---|---|---:|---:|---:|\n";
     for (const category of diff.categories) {
-      markdown += `| ${category.label} | ${category.baselineVerdict ?? "none"} | ${category.currentVerdict ?? "none"} | ${category.status} | ${category.changedMetrics} | ${category.improvedMetrics} | ${category.regressedMetrics} |\n`;
+      markdown += `| ${category.label} | ${this.verdictBadge(category.baselineVerdict)} | ${this.verdictBadge(category.currentVerdict)} | ${this.statusLabel(category.status)} | ${category.changedMetrics} | ${category.improvedMetrics} | ${category.regressedMetrics} |\n`;
     }
     markdown += "\n";
 
@@ -389,10 +391,10 @@ export class QualityDiffGenerator {
     if (regressions.length === 0) {
       markdown += "悪化した指標はありません。\n\n";
     } else {
-      markdown += "| 観点 | 指標 | baseline | current | automation | 変更 |\n";
+      markdown += "| 観点 | 指標 | baseline判定 | current判定 | 自動/手動 | 変更内容 |\n";
       markdown += "|---|---|---|---|---|---|\n";
       for (const metric of regressions) {
-        markdown += `| ${metric.categoryLabel} | ${metric.label} | ${metric.baselineVerdict ?? "none"} | ${metric.currentVerdict ?? "none"} | ${metric.currentAutomation ?? "none"} | ${metric.changes.join("<br />")} |\n`;
+        markdown += `| ${metric.categoryLabel} | ${metric.label} | ${this.verdictBadge(metric.baselineVerdict)} | ${this.verdictBadge(metric.currentVerdict)} | ${this.automationLabel(metric.currentAutomation)} | ${this.formatChanges(metric.changes).join("<br />")} |\n`;
       }
       markdown += "\n";
     }
@@ -404,12 +406,75 @@ export class QualityDiffGenerator {
     }
 
     for (const metric of changedMetrics) {
-      const visibleChanges = metric.changes.slice(0, 5);
+      const visibleChanges = this.formatChanges(metric.changes.slice(0, 5));
       const remainder = metric.changes.length - visibleChanges.length;
-      markdown += `- [${metric.status}/${metric.trend}] ${metric.categoryLabel} / ${metric.label}: ${visibleChanges.join("; ") || "value changed"}${remainder > 0 ? `; ほか${remainder}件 (JSON 参照)` : ""}\n`;
+      markdown += `- [${this.statusLabel(metric.status)} / ${this.trendBadge(metric.trend)}] ${metric.categoryLabel} / ${metric.label}: ${visibleChanges.join("; ") || "値の変更"}${remainder > 0 ? `; ほか${remainder}件 (JSON 参照)` : ""}\n`;
     }
 
     return markdown;
+  }
+
+  // 判定・増減の表示規則は品質レポート本体と揃える (記号 + 英字、色に依存しない)
+  private verdictBadge(verdict?: string): string {
+    switch (verdict) {
+      case "pass":
+        return "○ PASS";
+      case "warn":
+        return "△ WARN";
+      case "fail":
+        return "× FAIL";
+      case "partial":
+        return "◐ PARTIAL";
+      case "manual":
+        return "― MANUAL";
+      case undefined:
+        return "なし";
+      default:
+        return verdict;
+    }
+  }
+
+  private trendBadge(trend: string): string {
+    switch (trend) {
+      case "improved":
+        return "↗ 改善";
+      case "regressed":
+        return "↘ 悪化";
+      default:
+        return "→ 変化なし";
+    }
+  }
+
+  private statusLabel(status: string): string {
+    switch (status) {
+      case "added":
+        return "追加";
+      case "removed":
+        return "削除";
+      case "changed":
+        return "変更";
+      default:
+        return "変更なし";
+    }
+  }
+
+  private automationLabel(automation?: string): string {
+    switch (automation) {
+      case "automatic":
+        return "自動";
+      case "manual":
+        return "手動";
+      case undefined:
+        return "なし";
+      default:
+        return automation;
+    }
+  }
+
+  // JSON に永続化した changes ("verdict: pass -> warn" 等) は互換のため
+  // そのまま保持し、表示時のみ矢印を読みやすい表記へ変換する
+  private formatChanges(changes: string[]): string[] {
+    return changes.map((change) => change.replace(/ -> /gu, " → "));
   }
 
   private toHtml(diff: QualityDiffReport): string {
@@ -443,18 +508,18 @@ export class QualityDiffGenerator {
   <div class="cards">
     <div class="card"><strong>Baseline</strong><br /><a href="${this.toFileHref(diff.baselinePath)}"><code>${this.escapeHtml(diff.baselinePath)}</code></a></div>
     <div class="card"><strong>Current</strong><br /><a href="${this.toFileHref(diff.currentPath)}"><code>${this.escapeHtml(diff.currentPath)}</code></a></div>
-    <div class="card"><strong>Overall Verdict</strong><br />${this.escapeHtml(diff.summary.baselineOverallVerdict)} -> ${this.escapeHtml(diff.summary.currentOverallVerdict)}</div>
-    <div class="card"><strong>Changed / Regressed</strong><br />${diff.summary.changedMetrics} / ${diff.summary.regressedMetrics}</div>
+    <div class="card"><strong>総合判定</strong><br />${this.escapeHtml(this.verdictBadge(diff.summary.baselineOverallVerdict))} → ${this.escapeHtml(this.verdictBadge(diff.summary.currentOverallVerdict))}</div>
+    <div class="card"><strong>変更 / 悪化 ↘</strong><br />${diff.summary.changedMetrics} / ${diff.summary.regressedMetrics}</div>
   </div>
 
   <h2>観点差分</h2>
   <table>
     <thead>
-      <tr><th>観点</th><th>baseline</th><th>current</th><th>status</th><th>changed</th><th>improved</th><th>regressed</th></tr>
+      <tr><th>観点</th><th>baseline判定</th><th>current判定</th><th>状態</th><th>変更</th><th>改善 ↗</th><th>悪化 ↘</th></tr>
     </thead>
     <tbody>
       ${diff.categories.map((category) =>
-        `<tr><td>${this.escapeHtml(category.label)}</td><td>${this.escapeHtml(category.baselineVerdict ?? "none")}</td><td>${this.escapeHtml(category.currentVerdict ?? "none")}</td><td>${this.escapeHtml(category.status)}</td><td>${category.changedMetrics}</td><td>${category.improvedMetrics}</td><td>${category.regressedMetrics}</td></tr>`
+        `<tr><td>${this.escapeHtml(category.label)}</td><td>${this.escapeHtml(this.verdictBadge(category.baselineVerdict))}</td><td>${this.escapeHtml(this.verdictBadge(category.currentVerdict))}</td><td>${this.escapeHtml(this.statusLabel(category.status))}</td><td>${category.changedMetrics}</td><td>${category.improvedMetrics}</td><td>${category.regressedMetrics}</td></tr>`
       ).join("")}
     </tbody>
   </table>
@@ -462,18 +527,18 @@ export class QualityDiffGenerator {
   <h2>悪化指標</h2>
   ${regressions.length === 0
     ? "<p>悪化した指標はありません。</p>"
-    : `<table><thead><tr><th>観点</th><th>指標</th><th>baseline</th><th>current</th><th>automation</th><th>変更</th></tr></thead><tbody>${
+    : `<table><thead><tr><th>観点</th><th>指標</th><th>baseline判定</th><th>current判定</th><th>自動/手動</th><th>変更内容</th></tr></thead><tbody>${
       regressions.map((metric) =>
-        `<tr class="regressed"><td>${this.escapeHtml(metric.categoryLabel)}</td><td>${this.escapeHtml(metric.label)}</td><td>${this.escapeHtml(metric.baselineVerdict ?? "none")}</td><td>${this.escapeHtml(metric.currentVerdict ?? "none")}</td><td>${this.escapeHtml(metric.currentAutomation ?? "none")}</td><td>${this.escapeHtml(metric.changes.join("; "))}</td></tr>`
+        `<tr class="regressed"><td>${this.escapeHtml(metric.categoryLabel)}</td><td>${this.escapeHtml(metric.label)}</td><td>${this.escapeHtml(this.verdictBadge(metric.baselineVerdict))}</td><td>${this.escapeHtml(this.verdictBadge(metric.currentVerdict))}</td><td>${this.escapeHtml(this.automationLabel(metric.currentAutomation))}</td><td>${this.escapeHtml(this.formatChanges(metric.changes).join("; "))}</td></tr>`
       ).join("")
     }</tbody></table>`}
 
   <h2>変更指標</h2>
   ${changedMetrics.length === 0
     ? "<p>差分はありません。</p>"
-    : `<table><thead><tr><th>観点</th><th>指標</th><th>status</th><th>trend</th><th>変更</th></tr></thead><tbody>${
+    : `<table><thead><tr><th>観点</th><th>指標</th><th>状態</th><th>増減</th><th>変更内容</th></tr></thead><tbody>${
       changedMetrics.map((metric) =>
-        `<tr class="${this.escapeHtml(metric.trend)}"><td>${this.escapeHtml(metric.categoryLabel)}</td><td>${this.escapeHtml(metric.label)}</td><td>${this.escapeHtml(metric.status)}</td><td>${this.escapeHtml(metric.trend)}</td><td>${this.escapeHtml(metric.changes.join("; "))}</td></tr>`
+        `<tr class="${this.escapeHtml(metric.trend)}"><td>${this.escapeHtml(metric.categoryLabel)}</td><td>${this.escapeHtml(metric.label)}</td><td>${this.escapeHtml(this.statusLabel(metric.status))}</td><td>${this.escapeHtml(this.trendBadge(metric.trend))}</td><td>${this.escapeHtml(this.formatChanges(metric.changes).join("; "))}</td></tr>`
       ).join("")
     }</tbody></table>`}
 </body>
