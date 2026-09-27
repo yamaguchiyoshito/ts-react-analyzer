@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { diffStrings, escapeHtml, escapeMarkdownCell, REPORT_BASE_CSS, verdictBadge } from "./ReportUtils.js";
 import type {
   QualityCategoryDiffReport,
   QualityCategoryId,
@@ -133,7 +134,7 @@ export class QualityDiffGenerator {
       changes.push("summary updated");
     }
 
-    for (const evidenceChange of this.diffStrings(
+    for (const evidenceChange of diffStrings(
       this.serializeEvidence(current?.evidence ?? []),
       this.serializeEvidence(baseline?.evidence ?? []),
     )) {
@@ -353,14 +354,6 @@ export class QualityDiffGenerator {
     });
   }
 
-  private diffStrings(current: string[], baseline: string[]): string[] {
-    const currentSet = new Set(current);
-    const baselineSet = new Set(baseline);
-    const added = current.filter((item) => !baselineSet.has(item)).map((item) => `+${item}`);
-    const removed = baseline.filter((item) => !currentSet.has(item)).map((item) => `-${item}`);
-    return [...added, ...removed];
-  }
-
   private toMarkdown(diff: QualityDiffReport): string {
     const regressions = diff.metrics.filter((metric) => metric.trend === "regressed");
     const changedMetrics = diff.metrics.filter((metric) => metric.status !== "unchanged");
@@ -377,13 +370,13 @@ export class QualityDiffGenerator {
     markdown += "## サマリー\n\n";
     markdown += "| baseline判定 | current判定 | 変更カテゴリ | 変更指標 | 改善 ↗ | 悪化 ↘ | 自動悪化 | 手動悪化 |\n";
     markdown += "|---|---|---:|---:|---:|---:|---:|---:|\n";
-    markdown += `| ${this.verdictBadge(diff.summary.baselineOverallVerdict)} | ${this.verdictBadge(diff.summary.currentOverallVerdict)} | ${diff.summary.changedCategories} | ${diff.summary.changedMetrics} | ${diff.summary.improvedMetrics} | ${diff.summary.regressedMetrics} | ${diff.summary.automaticRegressions} | ${diff.summary.manualRegressions} |\n\n`;
+    markdown += `| ${verdictBadge(diff.summary.baselineOverallVerdict)} | ${verdictBadge(diff.summary.currentOverallVerdict)} | ${diff.summary.changedCategories} | ${diff.summary.changedMetrics} | ${diff.summary.improvedMetrics} | ${diff.summary.regressedMetrics} | ${diff.summary.automaticRegressions} | ${diff.summary.manualRegressions} |\n\n`;
 
     markdown += "## 観点差分\n\n";
     markdown += "| 観点 | baseline判定 | current判定 | 状態 | 変更 | 改善 ↗ | 悪化 ↘ |\n";
     markdown += "|---|---|---|---|---:|---:|---:|\n";
     for (const category of diff.categories) {
-      markdown += `| ${category.label} | ${this.verdictBadge(category.baselineVerdict)} | ${this.verdictBadge(category.currentVerdict)} | ${this.statusLabel(category.status)} | ${category.changedMetrics} | ${category.improvedMetrics} | ${category.regressedMetrics} |\n`;
+      markdown += `| ${escapeMarkdownCell(category.label)} | ${verdictBadge(category.baselineVerdict)} | ${verdictBadge(category.currentVerdict)} | ${this.statusLabel(category.status)} | ${category.changedMetrics} | ${category.improvedMetrics} | ${category.regressedMetrics} |\n`;
     }
     markdown += "\n";
 
@@ -394,7 +387,7 @@ export class QualityDiffGenerator {
       markdown += "| 観点 | 指標 | baseline判定 | current判定 | 自動/手動 | 変更内容 |\n";
       markdown += "|---|---|---|---|---|---|\n";
       for (const metric of regressions) {
-        markdown += `| ${metric.categoryLabel} | ${metric.label} | ${this.verdictBadge(metric.baselineVerdict)} | ${this.verdictBadge(metric.currentVerdict)} | ${this.automationLabel(metric.currentAutomation)} | ${this.formatChanges(metric.changes).join("<br />")} |\n`;
+        markdown += `| ${escapeMarkdownCell(metric.categoryLabel)} | ${escapeMarkdownCell(metric.label)} | ${verdictBadge(metric.baselineVerdict)} | ${verdictBadge(metric.currentVerdict)} | ${this.automationLabel(metric.currentAutomation)} | ${this.formatChanges(metric.changes).map((change) => escapeMarkdownCell(change)).join("<br />")} |\n`;
       }
       markdown += "\n";
     }
@@ -415,25 +408,6 @@ export class QualityDiffGenerator {
   }
 
   // 判定・増減の表示規則は品質レポート本体と揃える (記号 + 英字、色に依存しない)
-  private verdictBadge(verdict?: string): string {
-    switch (verdict) {
-      case "pass":
-        return "○ PASS";
-      case "warn":
-        return "△ WARN";
-      case "fail":
-        return "× FAIL";
-      case "partial":
-        return "◐ PARTIAL";
-      case "manual":
-        return "― MANUAL";
-      case undefined:
-        return "なし";
-      default:
-        return verdict;
-    }
-  }
-
   private trendBadge(trend: string): string {
     switch (trend) {
       case "improved":
@@ -487,28 +461,23 @@ export class QualityDiffGenerator {
   <meta charset="utf-8" />
   <title>React 出荷審査 品質差分レポート</title>
   <style>
-    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 24px; color: #111827; background: #f8fafc; }
-    h1, h2 { margin-bottom: 8px; }
+${REPORT_BASE_CSS}
+    body { background: #f8fafc; }
     .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
-    .card { background: white; border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px; }
-    table { width: 100%; border-collapse: collapse; background: white; margin-bottom: 20px; }
-    th, td { border: 1px solid #cbd5e1; padding: 8px; text-align: left; vertical-align: top; }
-    th { background: #e2e8f0; }
+    .card { background: white; }
+    table { margin: 0 0 20px; }
     .regressed { background: #fee2e2; }
     .improved { background: #dcfce7; }
     .neutral { background: #f8fafc; }
-    a { color: #0f766e; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    code { background: #e2e8f0; border-radius: 4px; padding: 0 4px; }
     ul { margin: 0; padding-left: 18px; }
   </style>
 </head>
 <body>
   <h1>React 出荷審査 品質差分レポート</h1>
   <div class="cards">
-    <div class="card"><strong>Baseline</strong><br /><a href="${this.toFileHref(diff.baselinePath)}"><code>${this.escapeHtml(diff.baselinePath)}</code></a></div>
-    <div class="card"><strong>Current</strong><br /><a href="${this.toFileHref(diff.currentPath)}"><code>${this.escapeHtml(diff.currentPath)}</code></a></div>
-    <div class="card"><strong>総合判定</strong><br />${this.escapeHtml(this.verdictBadge(diff.summary.baselineOverallVerdict))} → ${this.escapeHtml(this.verdictBadge(diff.summary.currentOverallVerdict))}</div>
+    <div class="card"><strong>Baseline</strong><br /><a href="${this.toFileHref(diff.baselinePath)}"><code>${escapeHtml(diff.baselinePath)}</code></a></div>
+    <div class="card"><strong>Current</strong><br /><a href="${this.toFileHref(diff.currentPath)}"><code>${escapeHtml(diff.currentPath)}</code></a></div>
+    <div class="card"><strong>総合判定</strong><br />${escapeHtml(verdictBadge(diff.summary.baselineOverallVerdict))} → ${escapeHtml(verdictBadge(diff.summary.currentOverallVerdict))}</div>
     <div class="card"><strong>変更 / 悪化 ↘</strong><br />${diff.summary.changedMetrics} / ${diff.summary.regressedMetrics}</div>
   </div>
 
@@ -519,7 +488,7 @@ export class QualityDiffGenerator {
     </thead>
     <tbody>
       ${diff.categories.map((category) =>
-        `<tr><td>${this.escapeHtml(category.label)}</td><td>${this.escapeHtml(this.verdictBadge(category.baselineVerdict))}</td><td>${this.escapeHtml(this.verdictBadge(category.currentVerdict))}</td><td>${this.escapeHtml(this.statusLabel(category.status))}</td><td>${category.changedMetrics}</td><td>${category.improvedMetrics}</td><td>${category.regressedMetrics}</td></tr>`
+        `<tr><td>${escapeHtml(category.label)}</td><td>${escapeHtml(verdictBadge(category.baselineVerdict))}</td><td>${escapeHtml(verdictBadge(category.currentVerdict))}</td><td>${escapeHtml(this.statusLabel(category.status))}</td><td>${category.changedMetrics}</td><td>${category.improvedMetrics}</td><td>${category.regressedMetrics}</td></tr>`
       ).join("")}
     </tbody>
   </table>
@@ -529,7 +498,7 @@ export class QualityDiffGenerator {
     ? "<p>悪化した指標はありません。</p>"
     : `<table><thead><tr><th>観点</th><th>指標</th><th>baseline判定</th><th>current判定</th><th>自動/手動</th><th>変更内容</th></tr></thead><tbody>${
       regressions.map((metric) =>
-        `<tr class="regressed"><td>${this.escapeHtml(metric.categoryLabel)}</td><td>${this.escapeHtml(metric.label)}</td><td>${this.escapeHtml(this.verdictBadge(metric.baselineVerdict))}</td><td>${this.escapeHtml(this.verdictBadge(metric.currentVerdict))}</td><td>${this.escapeHtml(this.automationLabel(metric.currentAutomation))}</td><td>${this.escapeHtml(this.formatChanges(metric.changes).join("; "))}</td></tr>`
+        `<tr class="regressed"><td>${escapeHtml(metric.categoryLabel)}</td><td>${escapeHtml(metric.label)}</td><td>${escapeHtml(verdictBadge(metric.baselineVerdict))}</td><td>${escapeHtml(verdictBadge(metric.currentVerdict))}</td><td>${escapeHtml(this.automationLabel(metric.currentAutomation))}</td><td>${escapeHtml(this.formatChanges(metric.changes).join("; "))}</td></tr>`
       ).join("")
     }</tbody></table>`}
 
@@ -538,20 +507,11 @@ export class QualityDiffGenerator {
     ? "<p>差分はありません。</p>"
     : `<table><thead><tr><th>観点</th><th>指標</th><th>状態</th><th>増減</th><th>変更内容</th></tr></thead><tbody>${
       changedMetrics.map((metric) =>
-        `<tr class="${this.escapeHtml(metric.trend)}"><td>${this.escapeHtml(metric.categoryLabel)}</td><td>${this.escapeHtml(metric.label)}</td><td>${this.escapeHtml(this.statusLabel(metric.status))}</td><td>${this.escapeHtml(this.trendBadge(metric.trend))}</td><td>${this.escapeHtml(this.formatChanges(metric.changes).join("; "))}</td></tr>`
+        `<tr class="${escapeHtml(metric.trend)}"><td>${escapeHtml(metric.categoryLabel)}</td><td>${escapeHtml(metric.label)}</td><td>${escapeHtml(this.statusLabel(metric.status))}</td><td>${escapeHtml(this.trendBadge(metric.trend))}</td><td>${escapeHtml(this.formatChanges(metric.changes).join("; "))}</td></tr>`
       ).join("")
     }</tbody></table>`}
 </body>
 </html>`;
-  }
-
-  private escapeHtml(value: string): string {
-    return value
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#39;");
   }
 
   private toFileHref(filePath: string): string {
