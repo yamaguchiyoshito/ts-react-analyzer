@@ -45,6 +45,12 @@ export interface TypeCheckSummary {
   issues: TypeCheckIssue[];
   tsConfigPath?: string;
   skippedReason?: string;
+  /**
+   * 検査対象として見つかったが実際には型検査されなかったファイル数 (上限超過・実行時エラー時)。
+   * 0 のスキップ (対象ファイルなし) と区別し、複数 tsconfig を合算した際に
+   * 「一部だけ検査済み」を pass と誤認しないために使う。
+   */
+  skippedFiles?: number;
   strictnessSummary?: TypeCheckStrictnessSummary;
 }
 
@@ -217,12 +223,14 @@ export class TypeCheckAnalyzer {
         maxRootNames: options.maxRootNames,
         tsConfigPath: resolvedTsConfigPath,
       });
+      // 何も検査していないので checkedFiles は 0。対象数は skippedFiles で別途伝える
       return {
         totalErrors: 0,
-        checkedFiles: rootNames.filter((fileName) => this.isWithinDirectory(fileName, projectRoot)).length,
+        checkedFiles: 0,
         issues: [],
         tsConfigPath: resolvedTsConfigPath,
         skippedReason: `TypeScript 対象が ${rootNames.length} ファイルで上限 ${options.maxRootNames} を超えるため、型検査をスキップしました。`,
+        skippedFiles: rootNames.length,
         strictnessSummary,
       };
     }
@@ -251,6 +259,7 @@ export class TypeCheckAnalyzer {
         issues: [],
         tsConfigPath: resolvedTsConfigPath,
         skippedReason: `型検査の実行中にエラーが発生したため型検査をスキップしました (${message})。`,
+        skippedFiles: rootNames.length,
         strictnessSummary,
       };
     }
@@ -337,9 +346,11 @@ export class TypeCheckAnalyzer {
     const issueMap = new Map<string, TypeCheckIssue>();
     const skippedReasons: string[] = [];
     let checkedFiles = 0;
+    let skippedFiles = 0;
 
     for (const summary of summaries) {
       checkedFiles += summary.checkedFiles;
+      skippedFiles += summary.skippedFiles ?? 0;
       for (const issue of summary.issues) {
         const key = `${issue.filePath}:${issue.line}:${issue.character}:${issue.code}:${issue.message}`;
         issueMap.set(key, issue);
@@ -350,14 +361,20 @@ export class TypeCheckAnalyzer {
       }
     }
 
+    // 対象ファイルを持つ tsconfig が 1 つでも未検査 (上限超過・実行時エラー) なら、他の tsconfig が
+    // 検査できていても skippedReason を残す。6000 ファイルの app が飛ばされ 50 ファイルの
+    // tsconfig.node.json だけ通った結果を「型エラー 0 の pass」と読ませないため。
+    // 対象ファイルが元々無い (checkedFiles も skippedFiles も 0 の) スキップは、
+    // 他で検査できていれば従来どおり黙殺する。
+    const shouldSurfaceSkip = skippedReasons.length > 0 && (checkedFiles === 0 || skippedFiles > 0);
+
     return {
       totalErrors: issueMap.size,
       checkedFiles,
       issues: Array.from(issueMap.values()),
       tsConfigPath: tsConfigPaths.length === 1 ? tsConfigPaths[0] : undefined,
-      skippedReason: checkedFiles === 0 && skippedReasons.length > 0
-        ? skippedReasons.join(" / ")
-        : undefined,
+      skippedReason: shouldSurfaceSkip ? skippedReasons.join(" / ") : undefined,
+      ...(skippedFiles > 0 ? { skippedFiles } : {}),
       strictnessSummary: this.mergeStrictnessSummaries(summaries),
     };
   }

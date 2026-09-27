@@ -1,3 +1,4 @@
+import path from "node:path";
 import ts from "typescript";
 
 import type {
@@ -23,8 +24,60 @@ type AnalyzableFunctionNode =
   | ts.GetAccessorDeclaration
   | ts.SetAccessorDeclaration;
 
+type FunctionLikeInitializer = ts.ArrowFunction | ts.FunctionExpression;
+
+type ComponentNode =
+  | ts.FunctionDeclaration
+  | ts.VariableDeclaration
+  | ts.ClassDeclaration
+  | ts.ExportAssignment;
+
+type AssertionNode = ts.AsExpression | ts.TypeAssertion;
+
+// React 本体の型名。`React.FC<Props>` / `FC<Props>` など、変数の型注釈から props 型を取り出す
+const FUNCTION_COMPONENT_TYPE_NAMES = new Set([
+  "FC",
+  "FunctionComponent",
+  "VFC",
+  "VoidFunctionComponent",
+  "ComponentType",
+]);
+
+// クラスコンポーネントの基底クラス名 (`React.Component` / `Component` / `PureComponent`)
+const CLASS_COMPONENT_BASE_NAMES = new Set(["Component", "PureComponent"]);
+
+// 依存配列を受け取る組み込み hook と、依存配列の位置 (引数 index)
+const DEPENDENCY_HOOK_ARGUMENT_INDEX: Record<string, number> = {
+  useEffect: 1,
+  useLayoutEffect: 1,
+  useInsertionEffect: 1,
+  useMemo: 1,
+  useCallback: 1,
+  useImperativeHandle: 2,
+};
+
+// 依存配列を持たない組み込み hook (第 2 引数があっても依存配列ではない)
+const NO_DEPENDENCY_HOOKS = new Set([
+  "use",
+  "useState",
+  "useRef",
+  "useContext",
+  "useReducer",
+  "useId",
+  "useTransition",
+  "useDeferredValue",
+  "useDebugValue",
+  "useSyncExternalStore",
+  "useOptimistic",
+  "useActionState",
+  "useFormStatus",
+]);
+
+const MAX_TYPE_RESOLUTION_DEPTH = 4;
+
 export class ComplexityAnalyzer {
   private readonly hooksRegistry = new Set([
+    "use",
     "useState",
     "useEffect",
     "useContext",
@@ -33,11 +86,16 @@ export class ComplexityAnalyzer {
     "useMemo",
     "useRef",
     "useLayoutEffect",
+    "useInsertionEffect",
     "useImperativeHandle",
     "useDebugValue",
     "useDeferredValue",
     "useTransition",
     "useId",
+    "useSyncExternalStore",
+    "useOptimistic",
+    "useActionState",
+    "useFormStatus",
   ]);
 
   analyzeFile(sourceFile: ts.SourceFile, filePath: string): FileComplexityAnalysis {
@@ -115,22 +173,7 @@ export class ComplexityAnalyzer {
         typeMetrics.unknownTypeCount += 1;
       }
       if (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) {
-        typeMetrics.assertionCount += 1;
-        if (this.isConstAssertion(node)) {
-          typeMetrics.constAssertionCount = (typeMetrics.constAssertionCount ?? 0) + 1;
-          typeMetrics.uncheckedPatterns.push("type-assertion:const");
-        }
-        if (this.isDoubleAssertion(node)) {
-          typeMetrics.doubleAssertionCount = (typeMetrics.doubleAssertionCount ?? 0) + 1;
-          typeMetrics.uncheckedPatterns.push("double-assertion");
-        }
-        if (this.isUnsafeAssertion(node)) {
-          typeMetrics.unsafeAssertionCount = (typeMetrics.unsafeAssertionCount ?? 0) + 1;
-          typeMetrics.uncheckedPatterns.push("unsafe-assertion");
-        }
-        if (node.getText().includes(" as any") || node.getText().startsWith("<any>")) {
-          typeMetrics.uncheckedPatterns.push("type-assertion:any");
-        }
+        this.collectAssertionMetrics(node, typeMetrics);
       }
       if (ts.isNonNullExpression(node)) {
         typeMetrics.nonNullAssertionCount += 1;
@@ -182,6 +225,31 @@ export class ComplexityAnalyzer {
     }
   }
 
+  // 型アサーションの計数。`as const` は型を狭めるだけで型安全性を損なわないため、
+  // constAssertionCount だけに数え、assertionCount / unsafe / unchecked には含めない。
+  // 判定はすべて AST で行い、`as (any)` や `as any /* comment */` も取り違えない。
+  private collectAssertionMetrics(node: AssertionNode, typeMetrics: TypeSafetyMetrics): void {
+    if (this.isConstAssertion(node)) {
+      typeMetrics.constAssertionCount = (typeMetrics.constAssertionCount ?? 0) + 1;
+      return;
+    }
+
+    typeMetrics.assertionCount += 1;
+    if (this.isDoubleAssertion(node)) {
+      typeMetrics.doubleAssertionCount = (typeMetrics.doubleAssertionCount ?? 0) + 1;
+      typeMetrics.uncheckedPatterns.push("double-assertion");
+    }
+    if (this.isUnsafeAssertion(node)) {
+      typeMetrics.unsafeAssertionCount = (typeMetrics.unsafeAssertionCount ?? 0) + 1;
+      typeMetrics.uncheckedPatterns.push("unsafe-assertion");
+    }
+    // ネストした `(x as any) as Foo` の内側は独立したノードとして訪問されるため、
+    // 対象型が any のノードだけで 1 回数える (テキスト包含判定による二重計上を防ぐ)
+    if (this.isAnyTypeNode(node.type)) {
+      typeMetrics.uncheckedPatterns.push("type-assertion:any");
+    }
+  }
+
   private analyzeFunctionComplexity(node: AnalyzableFunctionNode): FunctionMetrics {
     let cyclomaticComplexity = 1;
     let branchCount = 0;
@@ -227,10 +295,20 @@ export class ComplexityAnalyzer {
 
       if (ts.isBinaryExpression(child)) {
         const operator = child.operatorToken.kind;
-        if (operator === ts.SyntaxKind.AmpersandAmpersandToken || operator === ts.SyntaxKind.BarBarToken) {
+        if (
+          operator === ts.SyntaxKind.AmpersandAmpersandToken
+          || operator === ts.SyntaxKind.BarBarToken
+          || operator === ts.SyntaxKind.QuestionQuestionToken
+        ) {
           logicalOpCount += 1;
           cyclomaticComplexity += 1;
         }
+      }
+
+      // `a?.b?.c` のようなオプショナルチェーンは 1 連鎖につき 1 つの短絡分岐として数える
+      if (this.isOptionalChainEnd(child)) {
+        branchCount += 1;
+        cyclomaticComplexity += 1;
       }
 
       ts.forEachChild(child, (grandChild) => visit(grandChild, nestedDepth));
@@ -266,7 +344,16 @@ export class ComplexityAnalyzer {
     };
   }
 
-  private analyzeComponent(node: ts.Node): ComponentMetrics {
+  // オプショナルチェーンの最外ノード (親がチェーンを継続していないノード) だけを 1 回数える
+  private isOptionalChainEnd(node: ts.Node): boolean {
+    if (!ts.isOptionalChain(node)) {
+      return false;
+    }
+    const parent = node.parent;
+    return !(parent && ts.isOptionalChain(parent) && parent.expression === node);
+  }
+
+  private analyzeComponent(node: ComponentNode): ComponentMetrics {
     const hooksUsed = this.extractHooksFromComponent(node);
     return {
       name: this.extractComponentName(node),
@@ -315,60 +402,257 @@ export class ComplexityAnalyzer {
   }
 
   private extractHookUsage(node: ts.CallExpression): HookInfo | null {
-    const expression = node.expression;
+    const hookName = this.resolveHookName(node.expression);
+    if (!hookName) {
+      return null;
+    }
+
+    return {
+      name: hookName,
+      startLine: ts.getLineAndCharacterOfPosition(node.getSourceFile(), node.getStart()).line + 1,
+      args: node.arguments.length,
+      hasDependencies: this.hasDependencyArray(node, hookName),
+    };
+  }
+
+  private resolveHookName(expression: ts.Expression): string | null {
     let hookName: string | null = null;
+    let isMemberCall = false;
+    let receiver: ts.Expression | null = null;
 
     if (ts.isIdentifier(expression)) {
       hookName = expression.text;
     } else if (ts.isPropertyAccessExpression(expression)) {
       hookName = expression.name.text;
+      isMemberCall = true;
+      receiver = expression.expression;
     }
 
-    if (hookName && (this.hooksRegistry.has(hookName) || /^use[A-Z0-9]/u.test(hookName))) {
+    if (!hookName) {
+      return null;
+    }
+
+    // React 19 の `use(promise)`。`app.use(middleware)` (Express 等) を hook と誤認しないよう、
+    // メンバー呼び出しは `React.use(...)` だけを認める
+    if (hookName === "use") {
+      if (!isMemberCall) {
+        return hookName;
+      }
+      return receiver && ts.isIdentifier(receiver) && receiver.text === "React" ? hookName : null;
+    }
+
+    if (this.hooksRegistry.has(hookName) || /^use[A-Z0-9]/u.test(hookName)) {
+      return hookName;
+    }
+    return null;
+  }
+
+  private hasDependencyArray(node: ts.CallExpression, hookName: string): boolean {
+    if (NO_DEPENDENCY_HOOKS.has(hookName)) {
+      return false;
+    }
+
+    const dependencyIndex = DEPENDENCY_HOOK_ARGUMENT_INDEX[hookName];
+    if (typeof dependencyIndex === "number") {
+      // `useEffect(fn, [a, b])` も `useEffect(fn, deps)` も依存配列付きとして扱う
+      const dependencyArg = node.arguments[dependencyIndex];
+      if (!dependencyArg) {
+        return false;
+      }
+      const unwrapped = this.unwrapExpression(dependencyArg);
+      return ts.isArrayLiteralExpression(unwrapped) || ts.isIdentifier(unwrapped);
+    }
+
+    // カスタム hook は末尾引数が配列リテラルのときだけ依存配列付きとみなす
+    if (node.arguments.length < 2) {
+      return false;
+    }
+    const lastArg = node.arguments[node.arguments.length - 1];
+    return !!lastArg && ts.isArrayLiteralExpression(this.unwrapExpression(lastArg));
+  }
+
+  private extractPropsType(node: ComponentNode): PropType | null {
+    if (ts.isClassDeclaration(node)) {
+      const propsTypeNode = this.getClassComponentPropsTypeNode(node);
+      return propsTypeNode ? this.buildPropTypeFromTypeNode(propsTypeNode) : null;
+    }
+
+    const functionNode = this.resolveComponentFunctionNode(node);
+    const propsParam = functionNode?.parameters[0];
+    if (propsParam?.type) {
       return {
-        name: hookName,
-        startLine: ts.getLineAndCharacterOfPosition(node.getSourceFile(), node.getStart()).line + 1,
-        args: node.arguments.length,
-        hasDependencies: this.hasDependencyArray(node),
+        name: propsParam.name.getText(),
+        typeDeclaration: propsParam.type.getText(),
+        properties: this.extractProperties(propsParam.type),
       };
+    }
+
+    // 引数に型が無い場合は `const X: React.FC<Props> = ...` の型注釈や
+    // `forwardRef<Element, Props>(...)` / `memo<Props>(...)` の型引数から props 型を得る
+    const annotatedTypeNode = this.resolveAnnotatedPropsTypeNode(node);
+    return annotatedTypeNode ? this.buildPropTypeFromTypeNode(annotatedTypeNode) : null;
+  }
+
+  private buildPropTypeFromTypeNode(typeNode: ts.TypeNode): PropType {
+    const typeText = typeNode.getText();
+    return {
+      name: ts.isTypeReferenceNode(typeNode) ? typeText : "props",
+      typeDeclaration: typeText,
+      properties: this.extractProperties(typeNode),
+    };
+  }
+
+  private resolveAnnotatedPropsTypeNode(node: ComponentNode): ts.TypeNode | null {
+    if (ts.isVariableDeclaration(node)) {
+      if (node.type) {
+        const fromAnnotation = this.extractFunctionComponentTypeArgument(node.type);
+        if (fromAnnotation) {
+          return fromAnnotation;
+        }
+      }
+      const initializer = node.initializer ? this.unwrapExpression(node.initializer) : null;
+      if (initializer && ts.isCallExpression(initializer)) {
+        return this.resolvePropsTypeFromWrapperCall(initializer, 0);
+      }
+      return null;
+    }
+
+    if (ts.isExportAssignment(node)) {
+      const expression = this.unwrapExpression(node.expression);
+      if (ts.isCallExpression(expression)) {
+        return this.resolvePropsTypeFromWrapperCall(expression, 0);
+      }
     }
 
     return null;
   }
 
-  private hasDependencyArray(node: ts.CallExpression): boolean {
-    if (node.arguments.length < 2) {
-      return false;
+  private extractFunctionComponentTypeArgument(typeNode: ts.TypeNode): ts.TypeNode | null {
+    if (!ts.isTypeReferenceNode(typeNode)) {
+      return null;
     }
-    const lastArg = node.arguments[node.arguments.length - 1];
-    return !!lastArg && ts.isArrayLiteralExpression(lastArg);
+    const typeName = this.getEntityNameLastIdentifier(typeNode.typeName);
+    if (!FUNCTION_COMPONENT_TYPE_NAMES.has(typeName)) {
+      return null;
+    }
+    return typeNode.typeArguments?.[0] ?? null;
   }
 
-  private extractPropsType(node: ts.Node): PropType | null {
-    const functionNode = this.resolveComponentFunctionNode(node);
-    if (!functionNode || functionNode.parameters.length === 0) {
+  private resolvePropsTypeFromWrapperCall(call: ts.CallExpression, depth: number): ts.TypeNode | null {
+    if (depth > MAX_TYPE_RESOLUTION_DEPTH) {
       return null;
     }
 
-    const propsParam = functionNode.parameters[0];
-    if (!propsParam?.type) {
-      return null;
+    const calleeName = this.getCalleeName(call.expression);
+    if (calleeName === "forwardRef") {
+      const propsArgument = call.typeArguments?.[1];
+      if (propsArgument) {
+        return propsArgument;
+      }
+    } else if (calleeName === "memo") {
+      const propsArgument = call.typeArguments?.[0];
+      if (propsArgument) {
+        return propsArgument;
+      }
     }
 
-    return {
-      name: propsParam.name.getText(),
-      typeDeclaration: propsParam.type.getText(),
-      properties: this.extractProperties(propsParam.type),
-    };
+    // `memo(forwardRef<E, P>(...))` のような入れ子のラッパーを辿る
+    for (const arg of call.arguments) {
+      const unwrapped = this.unwrapExpression(arg);
+      if (ts.isCallExpression(unwrapped)) {
+        const nested = this.resolvePropsTypeFromWrapperCall(unwrapped, depth + 1);
+        if (nested) {
+          return nested;
+        }
+      }
+    }
+    return null;
+  }
+
+  private getCalleeName(expression: ts.Expression): string | null {
+    if (ts.isIdentifier(expression)) {
+      return expression.text;
+    }
+    if (ts.isPropertyAccessExpression(expression)) {
+      return expression.name.text;
+    }
+    return null;
+  }
+
+  private getEntityNameLastIdentifier(name: ts.EntityName): string {
+    return ts.isIdentifier(name) ? name.text : name.right.text;
   }
 
   private extractProperties(typeNode: ts.TypeNode): PropProperty[] {
-    if (!ts.isTypeLiteralNode(typeNode)) {
+    const properties = this.collectProperties(typeNode, new Set<string>(), 0);
+    // 交差型や継承で同名プロパティが重複した場合は最初の定義だけ残す
+    const seen = new Set<string>();
+    return properties.filter((property) => {
+      if (seen.has(property.name)) {
+        return false;
+      }
+      seen.add(property.name);
+      return true;
+    });
+  }
+
+  private collectProperties(typeNode: ts.TypeNode, seenTypeNames: Set<string>, depth: number): PropProperty[] {
+    if (depth > MAX_TYPE_RESOLUTION_DEPTH) {
       return [];
     }
 
+    if (ts.isTypeLiteralNode(typeNode)) {
+      return this.collectMemberProperties(typeNode.members);
+    }
+
+    if (ts.isParenthesizedTypeNode(typeNode)) {
+      return this.collectProperties(typeNode.type, seenTypeNames, depth + 1);
+    }
+
+    if (ts.isIntersectionTypeNode(typeNode)) {
+      return typeNode.types.flatMap((member) => this.collectProperties(member, seenTypeNames, depth + 1));
+    }
+
+    // 同一ファイル内で宣言された interface / type alias なら、その定義を辿ってプロパティを得る
+    if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName) && !typeNode.typeArguments) {
+      return this.collectPropertiesFromLocalDeclaration(typeNode.typeName.text, typeNode.getSourceFile(), seenTypeNames, depth);
+    }
+    if (ts.isExpressionWithTypeArguments(typeNode) && ts.isIdentifier(typeNode.expression) && !typeNode.typeArguments) {
+      return this.collectPropertiesFromLocalDeclaration(typeNode.expression.text, typeNode.getSourceFile(), seenTypeNames, depth);
+    }
+
+    return [];
+  }
+
+  private collectPropertiesFromLocalDeclaration(
+    typeName: string,
+    sourceFile: ts.SourceFile,
+    seenTypeNames: Set<string>,
+    depth: number,
+  ): PropProperty[] {
+    if (seenTypeNames.has(typeName)) {
+      return [];
+    }
+    seenTypeNames.add(typeName);
+
+    for (const statement of sourceFile.statements) {
+      if (ts.isInterfaceDeclaration(statement) && statement.name.text === typeName) {
+        const inherited = (statement.heritageClauses ?? [])
+          .filter((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword)
+          .flatMap((clause) => clause.types)
+          .flatMap((base) => this.collectProperties(base, seenTypeNames, depth + 1));
+        return [...this.collectMemberProperties(statement.members), ...inherited];
+      }
+      if (ts.isTypeAliasDeclaration(statement) && statement.name.text === typeName) {
+        return this.collectProperties(statement.type, seenTypeNames, depth + 1);
+      }
+    }
+    return [];
+  }
+
+  private collectMemberProperties(members: ts.NodeArray<ts.TypeElement>): PropProperty[] {
     const properties: PropProperty[] = [];
-    for (const member of typeNode.members) {
+    for (const member of members) {
       if (ts.isPropertySignature(member)) {
         properties.push({
           name: member.name.getText(),
@@ -380,16 +664,131 @@ export class ComplexityAnalyzer {
     return properties;
   }
 
-  private isReactComponent(node: ts.Node): boolean {
+  private isReactComponent(node: ts.Node): node is ComponentNode {
     if (ts.isFunctionDeclaration(node)) {
-      return this.isPascalCase(node.name?.text) && this.containsJsx(node);
+      if (node.name) {
+        return this.isPascalCase(node.name.text) && this.containsJsx(node);
+      }
+      // `export default function () { return <div /> }`
+      return this.hasExportDefaultModifier(node) && this.containsJsx(node);
     }
 
     if (ts.isVariableDeclaration(node)) {
-      return this.isPascalCase(node.name.getText()) && this.containsJsx(node);
+      if (!this.isPascalCase(node.name.getText()) || !node.initializer) {
+        return false;
+      }
+      // `const Template = <Card />` や `const Routes = [<A />, <B />]` は JSX を含むが
+      // コンポーネント定義ではないため、初期化子が関数 (またはラッパー呼び出し) のものだけ認める
+      return this.isComponentInitializer(node.initializer, node.type);
+    }
+
+    if (ts.isClassDeclaration(node)) {
+      return this.isClassComponent(node);
+    }
+
+    if (ts.isExportAssignment(node)) {
+      // `export default () => <div />` / `export default memo(function () { ... })`
+      return !node.isExportEquals && this.isComponentInitializer(node.expression, undefined);
     }
 
     return false;
+  }
+
+  private isComponentInitializer(initializer: ts.Expression, typeAnnotation: ts.TypeNode | undefined): boolean {
+    const unwrapped = this.unwrapExpression(initializer);
+    if (ts.isArrowFunction(unwrapped) || ts.isFunctionExpression(unwrapped)) {
+      if (this.containsJsx(unwrapped)) {
+        return true;
+      }
+      // JSX を返さず null や文字列を返すコンポーネントでも、React.FC 型注釈があれば認める
+      return this.isFunctionComponentTypeAnnotation(typeAnnotation);
+    }
+
+    if (ts.isCallExpression(unwrapped)) {
+      // memo / forwardRef / observer / styled 系など、関数を引数に取るラッパー呼び出し
+      const wrappedFunction = this.findFunctionArgument(unwrapped, 0);
+      return wrappedFunction !== null && this.containsJsx(wrappedFunction);
+    }
+
+    return false;
+  }
+
+  private isFunctionComponentTypeAnnotation(typeAnnotation: ts.TypeNode | undefined): boolean {
+    if (!typeAnnotation || !ts.isTypeReferenceNode(typeAnnotation)) {
+      return false;
+    }
+    return FUNCTION_COMPONENT_TYPE_NAMES.has(this.getEntityNameLastIdentifier(typeAnnotation.typeName));
+  }
+
+  private findFunctionArgument(call: ts.CallExpression, depth: number): FunctionLikeInitializer | null {
+    if (depth > MAX_TYPE_RESOLUTION_DEPTH) {
+      return null;
+    }
+    for (const arg of call.arguments) {
+      const unwrapped = this.unwrapExpression(arg);
+      if (ts.isArrowFunction(unwrapped) || ts.isFunctionExpression(unwrapped)) {
+        return unwrapped;
+      }
+      if (ts.isCallExpression(unwrapped)) {
+        const nested = this.findFunctionArgument(unwrapped, depth + 1);
+        if (nested) {
+          return nested;
+        }
+      }
+    }
+    return null;
+  }
+
+  private isClassComponent(node: ts.ClassDeclaration): boolean {
+    const baseType = this.getClassHeritageType(node);
+    if (!baseType) {
+      return false;
+    }
+    const baseName = this.getCalleeName(baseType.expression);
+    if (!baseName || !CLASS_COMPONENT_BASE_NAMES.has(baseName)) {
+      return false;
+    }
+    return node.members.some((member) =>
+      ts.isMethodDeclaration(member) && ts.isIdentifier(member.name) && member.name.text === "render");
+  }
+
+  private getClassHeritageType(node: ts.ClassDeclaration): ts.ExpressionWithTypeArguments | null {
+    for (const clause of node.heritageClauses ?? []) {
+      if (clause.token === ts.SyntaxKind.ExtendsKeyword) {
+        return clause.types[0] ?? null;
+      }
+    }
+    return null;
+  }
+
+  private getClassComponentPropsTypeNode(node: ts.ClassDeclaration): ts.TypeNode | null {
+    const baseType = this.getClassHeritageType(node);
+    const propsTypeNode = baseType?.typeArguments?.[0];
+    if (!propsTypeNode) {
+      return null;
+    }
+    return ts.isTypeReferenceNode(propsTypeNode) || ts.isTypeLiteralNode(propsTypeNode) || ts.isIntersectionTypeNode(propsTypeNode)
+      ? propsTypeNode
+      : null;
+  }
+
+  private hasExportDefaultModifier(node: ts.Node): boolean {
+    const modifiers = ts.canHaveModifiers(node) ? ts.getModifiers(node) : undefined;
+    return !!modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword);
+  }
+
+  private unwrapExpression(expression: ts.Expression): ts.Expression {
+    let current = expression;
+    while (
+      ts.isParenthesizedExpression(current)
+      || ts.isAsExpression(current)
+      || ts.isSatisfiesExpression(current)
+      || ts.isTypeAssertionExpression(current)
+      || ts.isNonNullExpression(current)
+    ) {
+      current = current.expression;
+    }
+    return current;
   }
 
   private containsJsx(node: ts.Node): boolean {
@@ -410,14 +809,30 @@ export class ComplexityAnalyzer {
     return found;
   }
 
-  private extractComponentName(node: ts.Node): string {
-    if (ts.isFunctionDeclaration(node)) {
-      return node.name?.text ?? "anonymous";
+  private extractComponentName(node: ComponentNode): string {
+    if (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) {
+      return node.name?.text ?? this.defaultExportComponentName(node.getSourceFile());
     }
     if (ts.isVariableDeclaration(node)) {
       return node.name.getText();
     }
-    return "anonymous";
+    // export default: ラップされた名前付き関数式 (`memo(function Card() {...})`) があればその名前
+    const expression = this.unwrapExpression(node.expression);
+    const wrapped = ts.isCallExpression(expression) ? this.findFunctionArgument(expression, 0) : expression;
+    if (wrapped && ts.isFunctionExpression(wrapped) && wrapped.name && this.isPascalCase(wrapped.name.text)) {
+      return wrapped.name.text;
+    }
+    return this.defaultExportComponentName(node.getSourceFile());
+  }
+
+  // 無名の default export はファイル名 (拡張子と .stories 等の接尾辞を除いた先頭部分) で呼ぶ。
+  // index や識別子にならない名前のときは "default"
+  private defaultExportComponentName(sourceFile: ts.SourceFile): string {
+    const stem = path.basename(sourceFile.fileName).split(".")[0] ?? "";
+    if (stem && stem !== "index" && /^[A-Za-z_$][\w$]*$/u.test(stem)) {
+      return stem;
+    }
+    return "default";
   }
 
   private checksForChildren(node: ts.Node): boolean {
@@ -554,31 +969,57 @@ export class ComplexityAnalyzer {
       || ts.isCatchClause(node);
   }
 
-  private isConstAssertion(node: ts.AsExpression | ts.TypeAssertion): boolean {
-    const typeText = node.type.getText().trim();
-    return typeText === "const";
+  private unwrapTypeNode(typeNode: ts.TypeNode): ts.TypeNode {
+    let current = typeNode;
+    while (ts.isParenthesizedTypeNode(current)) {
+      current = current.type;
+    }
+    return current;
   }
 
-  private isDoubleAssertion(node: ts.AsExpression | ts.TypeAssertion): boolean {
-    return ts.isAsExpression(node.expression) || ts.isTypeAssertionExpression(node.expression);
+  private isAnyTypeNode(typeNode: ts.TypeNode): boolean {
+    return this.unwrapTypeNode(typeNode).kind === ts.SyntaxKind.AnyKeyword;
   }
 
-  private isUnsafeAssertion(node: ts.AsExpression | ts.TypeAssertion): boolean {
-    const targetType = node.type.getText().trim();
-    if (targetType === "any") {
+  private isUnknownTypeNode(typeNode: ts.TypeNode): boolean {
+    return this.unwrapTypeNode(typeNode).kind === ts.SyntaxKind.UnknownKeyword;
+  }
+
+  // `as const` は TypeReference(typeName = const) として構文木に現れる
+  private isConstAssertion(node: AssertionNode): boolean {
+    const typeNode = this.unwrapTypeNode(node.type);
+    return ts.isTypeReferenceNode(typeNode)
+      && ts.isIdentifier(typeNode.typeName)
+      && typeNode.typeName.text === "const"
+      && !typeNode.typeArguments;
+  }
+
+  private getInnerAssertion(node: AssertionNode): AssertionNode | null {
+    // `(x as any) as Foo` のように括弧で包まれた内側のアサーションも辿る
+    let inner: ts.Expression = node.expression;
+    while (ts.isParenthesizedExpression(inner) || ts.isNonNullExpression(inner)) {
+      inner = inner.expression;
+    }
+    if ((ts.isAsExpression(inner) || ts.isTypeAssertionExpression(inner)) && !this.isConstAssertion(inner)) {
+      return inner;
+    }
+    return null;
+  }
+
+  private isDoubleAssertion(node: AssertionNode): boolean {
+    return this.getInnerAssertion(node) !== null;
+  }
+
+  private isUnsafeAssertion(node: AssertionNode): boolean {
+    if (this.isAnyTypeNode(node.type)) {
       return true;
     }
 
-    if (!this.isDoubleAssertion(node)) {
+    const inner = this.getInnerAssertion(node);
+    if (!inner) {
       return false;
     }
-
-    const nested = node.expression;
-    if (!ts.isAsExpression(nested) && !ts.isTypeAssertionExpression(nested)) {
-      return false;
-    }
-    const nestedTarget = nested.type.getText().trim();
-    return nestedTarget === "any" || nestedTarget === "unknown";
+    return this.isAnyTypeNode(inner.type) || this.isUnknownTypeNode(inner.type);
   }
 
   private buildComplexityScoreBreakdown(
@@ -668,11 +1109,31 @@ export class ComplexityAnalyzer {
     if (node.name) {
       return node.name.getText();
     }
-    if (ts.isArrowFunction(node)) {
-      const parent = node.parent;
-      if (ts.isVariableDeclaration(parent)) {
-        return parent.name.getText();
-      }
+    if (ts.isFunctionDeclaration(node)) {
+      return this.hasExportDefaultModifier(node) ? "default" : "anonymous";
+    }
+
+    // 無名のアロー関数 / 関数式は代入先の名前で呼ぶ:
+    // `const x = function () {}` → x、`{ onClick: () => {} }` → onClick、クラスフィールドも同様
+    let parent: ts.Node | undefined = node.parent;
+    while (
+      parent
+      && (ts.isParenthesizedExpression(parent)
+        || ts.isAsExpression(parent)
+        || ts.isSatisfiesExpression(parent)
+        || ts.isTypeAssertionExpression(parent)
+        || ts.isNonNullExpression(parent))
+    ) {
+      parent = parent.parent;
+    }
+    if (!parent) {
+      return "anonymous";
+    }
+    if (ts.isVariableDeclaration(parent) || ts.isPropertyAssignment(parent) || ts.isPropertyDeclaration(parent)) {
+      return parent.name.getText();
+    }
+    if (ts.isExportAssignment(parent)) {
+      return "default";
     }
     return "anonymous";
   }
@@ -681,25 +1142,24 @@ export class ComplexityAnalyzer {
     return !!name && /^[A-Z][A-Za-z0-9]*$/u.test(name);
   }
 
-  private resolveComponentFunctionNode(node: ts.Node): ts.SignatureDeclarationBase | null {
+  private resolveComponentFunctionNode(node: ComponentNode): ts.SignatureDeclarationBase | null {
     if (ts.isFunctionDeclaration(node)) {
       return node;
     }
-    if (ts.isVariableDeclaration(node)) {
-      const initializer = node.initializer;
-      if (!initializer) {
-        return null;
-      }
-      if (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)) {
-        return initializer;
-      }
-      if (ts.isCallExpression(initializer)) {
-        for (const arg of initializer.arguments) {
-          if (ts.isArrowFunction(arg) || ts.isFunctionExpression(arg)) {
-            return arg;
-          }
-        }
-      }
+    if (ts.isClassDeclaration(node)) {
+      return null;
+    }
+
+    const initializer = ts.isVariableDeclaration(node) ? node.initializer : node.expression;
+    if (!initializer) {
+      return null;
+    }
+    const unwrapped = this.unwrapExpression(initializer);
+    if (ts.isArrowFunction(unwrapped) || ts.isFunctionExpression(unwrapped)) {
+      return unwrapped;
+    }
+    if (ts.isCallExpression(unwrapped)) {
+      return this.findFunctionArgument(unwrapped, 0);
     }
     return null;
   }

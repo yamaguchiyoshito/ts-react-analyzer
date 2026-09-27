@@ -1,0 +1,274 @@
+# ============================================================================
+# ts-react-analyzer を GitHub Actions に組み込むテンプレート
+#
+# このファイルを自分のリポジトリの .github/workflows/ts-react-analyzer.yml にコピーしてください。
+# 3 つのジョブを提供します (GitLab CI テンプレートと同じ構成です)。
+#   baseline       デフォルトブランチへの push で基準点 (baseline) を更新し、artifact に保存する
+#   diff           pull_request ごとに、影響度の高い危険な変更だけを止める (PR ゲート)
+#   quality-gate   デフォルトブランチとタグで、品質悪化を止める (出荷ゲート)
+#
+# baseline は「デフォルトブランチで最後に成功した baseline ジョブの artifact」を
+# GitHub API で探して actions/download-artifact で取得します。baseline がまだ無い初回は、
+# 現状解析だけを実行して成功します。
+#
+# 使い方・変数の説明は同じディレクトリの README.md を参照してください。
+# ============================================================================
+name: ts-react-analyzer
+
+on:
+  push:
+    # デフォルトブランチ名が main 以外 (例: master) なら書き換えてください。
+    # ジョブ側でも default_branch を確認しているため、他のブランチを足しても baseline は汚れません
+    branches: [main]
+    tags: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+  # 別の実行 (デフォルトブランチの baseline) の artifact を取得するために必要
+  actions: read
+
+env:
+  # 解析対象ディレクトリ (リポジトリルートからの相対パス)
+  TSRA_PROJECT_DIR: "."
+  # レポート出力先 (TSRA_PROJECT_DIR 基準)
+  TSRA_OUTPUT_DIR: "analysis-reports"
+  # 出力ファイルの接頭辞
+  TSRA_PREFIX: "ci"
+  # この影響度スコア以上のファイルがあると PR を失敗させる
+  TSRA_IMPACT_THRESHOLD: "60"
+  # 悪化しても出荷は止めず、監視だけにする品質指標 ID (カンマ区切り、空で無効)
+  TSRA_QUALITY_MONITORING_METRICS: ""
+  # 解析前に TSRA_PROJECT_DIR で実行するコマンド (例: "npm ci"。型エラー数を正しく測りたい場合に指定)
+  TSRA_SETUP_CMD: ""
+  # 実行する Node.js のバージョン
+  TSRA_NODE_VERSION: "22"
+  # ts-react-analyzer の取得元とリビジョン
+  # TSRA_REPO_REF にはブランチ名・タグ名・コミット SHA (完全形) を指定できます。
+  # 本番運用ではタグまたはコミット SHA に固定し、更新は意図したタイミングで行ってください。
+  TSRA_REPO_URL: "https://github.com/yamaguchiyoshito/ts-react-analyzer.git"
+  TSRA_REPO_REF: "master"
+  # baseline を保存する artifact 名 (diff / quality-gate がこの名前で探します)
+  TSRA_BASELINE_ARTIFACT: "tsra-baseline"
+
+jobs:
+  # --------------------------------------------------------------------------
+  # デフォルトブランチで基準点を更新する
+  # ここで保存した artifact を、PR ゲートと出荷ゲートが比較元として取得します
+  # --------------------------------------------------------------------------
+  baseline:
+    name: "tsra: baseline"
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.TSRA_NODE_VERSION }}
+
+      - name: 解析キャッシュを復元する
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TSRA_PROJECT_DIR }}/.ts-analyzer-cache
+          key: tsra-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            tsra-${{ runner.os }}-${{ github.ref_name }}-
+            tsra-${{ runner.os }}-
+
+      - name: ts-react-analyzer を取得してビルドする
+        run: |
+          git init --quiet "$RUNNER_TEMP/tsra"
+          git -C "$RUNNER_TEMP/tsra" remote add origin "$TSRA_REPO_URL"
+          git -C "$RUNNER_TEMP/tsra" fetch --depth 1 origin "$TSRA_REPO_REF"
+          git -C "$RUNNER_TEMP/tsra" checkout --quiet FETCH_HEAD
+          (cd "$RUNNER_TEMP/tsra" && npm install --no-audit --no-fund && npm run build)
+          echo "TSRA_CLI=$RUNNER_TEMP/tsra/dist/src/cli.js" >> "$GITHUB_ENV"
+          if [ -n "$TSRA_SETUP_CMD" ]; then (cd "$TSRA_PROJECT_DIR" && eval "$TSRA_SETUP_CMD"); fi
+
+      - name: 基準点 (baseline) を生成する
+        run: |
+          node "$TSRA_CLI" analyze "$TSRA_PROJECT_DIR" --output "$TSRA_OUTPUT_DIR" --prefix "$TSRA_PREFIX"
+          node "$TSRA_CLI" quality collect "$TSRA_PROJECT_DIR" --output "$TSRA_OUTPUT_DIR" --prefix "$TSRA_PREFIX"
+
+      - name: baseline を artifact に保存する
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TSRA_BASELINE_ARTIFACT }}
+          path: ${{ env.TSRA_PROJECT_DIR }}/${{ env.TSRA_OUTPUT_DIR }}
+          retention-days: 90
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # PR ゲート: 今回の変更で危険になった箇所だけを止める
+  # baseline はデフォルトブランチで最後に成功した baseline ジョブの artifact から取得します
+  # baseline がまだ無い初回は、現状解析だけ実行して成功します
+  # --------------------------------------------------------------------------
+  diff:
+    name: "tsra: diff (PR gate)"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.TSRA_NODE_VERSION }}
+
+      - name: 解析キャッシュを復元する
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TSRA_PROJECT_DIR }}/.ts-analyzer-cache
+          key: tsra-${{ runner.os }}-${{ github.head_ref }}-${{ github.sha }}
+          restore-keys: |
+            tsra-${{ runner.os }}-${{ github.head_ref }}-
+            tsra-${{ runner.os }}-${{ github.base_ref }}-
+            tsra-${{ runner.os }}-
+
+      - name: ts-react-analyzer を取得してビルドする
+        run: |
+          git init --quiet "$RUNNER_TEMP/tsra"
+          git -C "$RUNNER_TEMP/tsra" remote add origin "$TSRA_REPO_URL"
+          git -C "$RUNNER_TEMP/tsra" fetch --depth 1 origin "$TSRA_REPO_REF"
+          git -C "$RUNNER_TEMP/tsra" checkout --quiet FETCH_HEAD
+          (cd "$RUNNER_TEMP/tsra" && npm install --no-audit --no-fund && npm run build)
+          echo "TSRA_CLI=$RUNNER_TEMP/tsra/dist/src/cli.js" >> "$GITHUB_ENV"
+          if [ -n "$TSRA_SETUP_CMD" ]; then (cd "$TSRA_PROJECT_DIR" && eval "$TSRA_SETUP_CMD"); fi
+
+      - name: デフォルトブランチの最新 baseline を探す
+        id: find-baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # 期限切れでない baseline artifact のうち、デフォルトブランチで作られた最新のものの run id を取る
+          # (この実行自身の artifact は除外する)
+          run_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$TSRA_BASELINE_ARTIFACT&per_page=100" \
+            --jq "[.artifacts[] | select(.expired == false and .workflow_run.head_branch == \"$DEFAULT_BRANCH\" and .workflow_run.id != $GITHUB_RUN_ID)] | sort_by(.created_at) | reverse | .[0].workflow_run.id // empty")"
+          if [ -n "$run_id" ]; then
+            echo "baseline: run $run_id の artifact '$TSRA_BASELINE_ARTIFACT' を使います"
+          else
+            echo "baseline がまだありません (ブランチ: $DEFAULT_BRANCH)。今回は現状解析のみ実行します。"
+            echo "デフォルトブランチで baseline ジョブが一度成功すると、次の PR から差分ゲートが有効になります。"
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: baseline artifact を取得する
+        if: steps.find-baseline.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.TSRA_BASELINE_ARTIFACT }}
+          path: ${{ runner.temp }}/tsra-baseline
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.find-baseline.outputs.run_id }}
+
+      - name: 差分ゲートを実行する
+        run: |
+          baseline_json="$RUNNER_TEMP/tsra-baseline/${TSRA_PREFIX}_report.json"
+          if [ -f "$baseline_json" ]; then
+            node "$TSRA_CLI" diff "$TSRA_PROJECT_DIR" \
+              --output "$TSRA_OUTPUT_DIR" \
+              --prefix "$TSRA_PREFIX" \
+              --baseline "$baseline_json" \
+              --impact-threshold "$TSRA_IMPACT_THRESHOLD" \
+              --fail-on-impact
+          else
+            node "$TSRA_CLI" analyze "$TSRA_PROJECT_DIR" --output "$TSRA_OUTPUT_DIR" --prefix "$TSRA_PREFIX"
+          fi
+
+      - name: レポートを artifact に保存する
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsra-diff
+          path: ${{ env.TSRA_PROJECT_DIR }}/${{ env.TSRA_OUTPUT_DIR }}
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # --------------------------------------------------------------------------
+  # 出荷ゲート: 品質レポートの FAIL と、前回からの品質悪化で失敗させる
+  # デフォルトブランチとタグ (リリース) で実行します
+  # --------------------------------------------------------------------------
+  quality-gate:
+    name: "tsra: quality gate"
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.TSRA_NODE_VERSION }}
+
+      - name: 解析キャッシュを復元する
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TSRA_PROJECT_DIR }}/.ts-analyzer-cache
+          key: tsra-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            tsra-${{ runner.os }}-${{ github.ref_name }}-
+            tsra-${{ runner.os }}-
+
+      - name: ts-react-analyzer を取得してビルドする
+        run: |
+          git init --quiet "$RUNNER_TEMP/tsra"
+          git -C "$RUNNER_TEMP/tsra" remote add origin "$TSRA_REPO_URL"
+          git -C "$RUNNER_TEMP/tsra" fetch --depth 1 origin "$TSRA_REPO_REF"
+          git -C "$RUNNER_TEMP/tsra" checkout --quiet FETCH_HEAD
+          (cd "$RUNNER_TEMP/tsra" && npm install --no-audit --no-fund && npm run build)
+          echo "TSRA_CLI=$RUNNER_TEMP/tsra/dist/src/cli.js" >> "$GITHUB_ENV"
+          if [ -n "$TSRA_SETUP_CMD" ]; then (cd "$TSRA_PROJECT_DIR" && eval "$TSRA_SETUP_CMD"); fi
+
+      - name: 前回の品質レポート (デフォルトブランチの baseline) を探す
+        id: find-baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # この実行と同時に走る baseline ジョブの artifact を拾わないよう、自分の run id は除外する
+          run_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$TSRA_BASELINE_ARTIFACT&per_page=100" \
+            --jq "[.artifacts[] | select(.expired == false and .workflow_run.head_branch == \"$DEFAULT_BRANCH\" and .workflow_run.id != $GITHUB_RUN_ID)] | sort_by(.created_at) | reverse | .[0].workflow_run.id // empty")"
+          if [ -n "$run_id" ]; then
+            echo "前回の品質レポート: run $run_id の artifact '$TSRA_BASELINE_ARTIFACT' を使います"
+          else
+            echo "前回の品質レポートがまだありません。今回は現状の品質だけで判定します。"
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: baseline artifact を取得する
+        if: steps.find-baseline.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.TSRA_BASELINE_ARTIFACT }}
+          path: ${{ runner.temp }}/tsra-baseline
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.find-baseline.outputs.run_id }}
+
+      - name: 出荷ゲートを実行する
+        run: |
+          baseline_json="$RUNNER_TEMP/tsra-baseline/${TSRA_PREFIX}_quality_report.json"
+          # 引数は配列で組み立てる (パスに空白があっても分割されないように)
+          gate_args=()
+          if [ -f "$baseline_json" ]; then
+            gate_args+=(--baseline "$baseline_json")
+          fi
+          if [ -n "$TSRA_QUALITY_MONITORING_METRICS" ]; then
+            gate_args+=(--quality-gate-monitoring-metrics "$TSRA_QUALITY_MONITORING_METRICS")
+          fi
+          node "$TSRA_CLI" quality gate "$TSRA_PROJECT_DIR" \
+            --output "$TSRA_OUTPUT_DIR" \
+            --prefix "$TSRA_PREFIX" \
+            "${gate_args[@]}"
+
+      - name: レポートを artifact に保存する
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsra-quality-gate
+          path: ${{ env.TSRA_PROJECT_DIR }}/${{ env.TSRA_OUTPUT_DIR }}
+          retention-days: 90
+          if-no-files-found: ignore

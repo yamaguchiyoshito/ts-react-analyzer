@@ -4306,7 +4306,7 @@ test("TypeCheckAnalyzer skips oversized scoped type checks when maxRootNames is 
   });
 
   assert.equal(summary.totalErrors, 0);
-  assert.equal(summary.checkedFiles, 2);
+  assert.equal(summary.checkedFiles, 0);
   assert.match(summary.skippedReason ?? "", /上限 1 を超える/u);
 
   await fs.rm(projectRoot, { recursive: true, force: true });
