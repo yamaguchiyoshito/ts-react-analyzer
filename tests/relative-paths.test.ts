@@ -32,7 +32,11 @@ test("FileScanner does not apply default exclude groups to directories above the
   try {
     // プロジェクト自体が build/ 配下にあっても、既定の build 除外に巻き込まれない
     const projectRoot = path.join(tempRoot, "build", "app");
-    await fs.cp(sampleProject, projectRoot, { recursive: true });
+    // 他のテストが fixture 直下へ書き出す .cache や一時出力を巻き込まないよう、
+    // ソースと tsconfig だけをコピーする
+    await fs.mkdir(projectRoot, { recursive: true });
+    await fs.cp(path.join(sampleProject, "src"), path.join(projectRoot, "src"), { recursive: true });
+    await fs.copyFile(path.join(sampleProject, "tsconfig.json"), path.join(projectRoot, "tsconfig.json"));
 
     const result = await createDefaultScanner(tempRoot).scanProject(projectRoot);
 
