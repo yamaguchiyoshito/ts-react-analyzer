@@ -95,3 +95,11 @@ quality gate の blocking / monitoring 指定の意味は [品質レポート](q
 
 同じソース・同じ設定なら 2 回目以降は再計算が減り、レポートの `reusedFiles` が増えます。  
 CI では `.ts-analyzer-cache` をキャッシュ対象に含めることを推奨します。
+
+解析対象プロジェクトには `analysis-reports/`、`.ts-analyzer-cache/`、`analysis.log` が書き込まれます。リポジトリにコミットしないよう、対象プロジェクトの `.gitignore` に次を追加してください。
+
+```gitignore
+analysis-reports/
+.ts-analyzer-cache/
+analysis.log
+```

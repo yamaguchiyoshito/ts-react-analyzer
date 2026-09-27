@@ -39,7 +39,7 @@ variables:
     - git clone --depth 1 --branch "$TSRA_REPO_REF" "$TSRA_REPO_URL" /tmp/tsra
     - (cd /tmp/tsra && npm install --no-audit --no-fund && npm run build)
     - export TSRA_CLI=/tmp/tsra/dist/src/cli.js
-    # 出力ディレクトリのリポジトリルートからのパス (artifacts / API 取得用)
+    # 出力ディレクトリのリポジトリルートからのパス (API で成果物を取得するときの URL 用)
     - |
       _p="${TSRA_PROJECT_DIR#./}"; _p="${_p%/}"
       if [ "$_p" = "." ] || [ -z "$_p" ]; then _p=""; else _p="$_p/"; fi
@@ -59,7 +59,9 @@ tsra:baseline:
     - node "$TSRA_CLI" quality collect "$TSRA_PROJECT_DIR" --output "$TSRA_OUTPUT_DIR" --prefix "$TSRA_PREFIX"
   artifacts:
     paths:
-      - "$TSRA_REPORTS_PATH/"
+      # artifacts:paths は script 内で export した変数を展開しないため、
+      # variables で定義した値だけで組み立てる
+      - "$TSRA_PROJECT_DIR/$TSRA_OUTPUT_DIR/"
     expire_in: 90 days
 
 # ----------------------------------------------------------------------------
@@ -92,7 +94,9 @@ tsra:diff:
   artifacts:
     when: always
     paths:
-      - "$TSRA_REPORTS_PATH/"
+      # artifacts:paths は script 内で export した変数を展開しないため、
+      # variables で定義した値だけで組み立てる
+      - "$TSRA_PROJECT_DIR/$TSRA_OUTPUT_DIR/"
     expire_in: 30 days
 
 # ----------------------------------------------------------------------------
@@ -126,5 +130,7 @@ tsra:quality-gate:
   artifacts:
     when: always
     paths:
-      - "$TSRA_REPORTS_PATH/"
+      # artifacts:paths は script 内で export した変数を展開しないため、
+      # variables で定義した値だけで組み立てる
+      - "$TSRA_PROJECT_DIR/$TSRA_OUTPUT_DIR/"
     expire_in: 90 days
