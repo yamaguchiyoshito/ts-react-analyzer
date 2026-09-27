@@ -7,7 +7,7 @@ import { parseArgs } from "node:util";
 
 import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, ManualQualityInputLoader, QualityDiffGenerator, QualityReportGenerator, ReportGenerator } from "./core/index.js";
 import { shouldIncludeInAnalysisScope } from "./core/FileConventions.js";
-import type { AnalysisConfig, AnalysisDiffReport, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, OutputFormat, ParseIssue, PersistedAnalysisReport, QualityDiffReport, QualityMetricDiffEntry, QualityReport } from "./types/index.js";
+import type { AnalysisConfig, AnalysisDiffReport, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, OutputFormat, ParseIssue, PersistedAnalysisReport, QualityDiffReport, QualityMetricDiffEntry, QualityReport, SkippedFile } from "./types/index.js";
 
 interface RunArtifacts {
   results: AnalysisResult[];
@@ -302,8 +302,38 @@ function printAnalyzeSummary(report: PersistedAnalysisReport, config: AnalysisCo
     lines.push(`  最優先ファイル: ${primary ? primary.displayPath ?? primary.path : "なし"}`);
     lines.push(`  優先改修候補: ${summary.topHotSpots.length} 件 / ${summary.cycleStatus}`);
   }
+  const excludedLine = formatExcludedSkipsLine(report.skippedFiles ?? [], report.projectRoot);
+  if (excludedLine) {
+    lines.push(excludedLine);
+  }
   printOutputFiles(lines, config.outputDir, listReportFiles(config.filePrefix, config.outputFormats, "analyze"), "まずこのファイルから読み始めてください");
   console.log(lines.join("\n"));
+}
+
+// 除外パターンでスキップしたディレクトリ/ファイルを 1 行で知らせる。
+// src/build/ のようにプロジェクト内部の階層が既定の除外に巻き込まれても気づけるよう、
+// ルート直下 (node_modules, dist など) より深い階層のパスを先に例示する。
+function formatExcludedSkipsLine(skippedFiles: SkippedFile[], projectRoot?: string): string | undefined {
+  const excluded = skippedFiles.filter((skipped) => skipped.reason === "Excluded pattern match");
+  if (excluded.length === 0) {
+    return undefined;
+  }
+
+  const toRelative = (filePath: string): string => {
+    if (projectRoot && path.isAbsolute(filePath)) {
+      const relativePath = path.relative(projectRoot, filePath);
+      if (relativePath && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)) {
+        return relativePath.split(path.sep).join("/");
+      }
+    }
+    return filePath.split(path.sep).join("/");
+  };
+  const relativePaths = excluded.map((skipped) => toRelative(skipped.filePath));
+  const nested = relativePaths.filter((relativePath) => relativePath.includes("/"));
+  const topLevel = relativePaths.filter((relativePath) => !relativePath.includes("/"));
+  const examples = [...nested, ...topLevel].slice(0, 3);
+  const suffix = excluded.length > examples.length ? " ..." : "";
+  return `  除外: ${excluded.length} 件のディレクトリ/ファイルを既定の除外設定でスキップしました (${examples.join(", ")}${suffix})`;
 }
 
 function printDiffSummary(diff: AnalysisDiffReport, config: AnalysisConfig): void {
@@ -666,7 +696,7 @@ async function buildArtifacts(
     analysisScope: preferUnscopedScan ? "all" : config.analysisScope,
   }).scanProject(projectDir);
   const scopedParsedFiles = fullScanResult.parsed.filter((parsedFile) =>
-    shouldIncludeInAnalysisScope(parsedFile.filePath, config.analysisScope)
+    shouldIncludeInAnalysisScope(parsedFile.filePath, config.analysisScope, projectDir)
   );
   const scopedFilePaths = new Set(scopedParsedFiles.map((parsedFile) => parsedFile.filePath));
   const scanResult = {
