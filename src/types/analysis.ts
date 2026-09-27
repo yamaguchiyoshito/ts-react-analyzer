@@ -125,10 +125,18 @@ export interface CachedAnalysisPayload {
 }
 
 export interface CachedAnalysisRecord {
+  /** レコード形式の版 (AnalysisCache.ANALYSIS_CACHE_SCHEMA)。無い・異なるレコードはミス扱い */
+  schema: number;
+  /** プロジェクト相対パス (スラッシュ区切り)。projectRoot 外のファイルは絶対パスのまま */
   filePath: string;
   sourceSha256: string;
   configHash: string;
   analysisContextHash: string;
+  /** 走査対象ファイル集合の指紋。追加・削除・改名で変わる */
+  fileSetHash: string;
+  /** 解決できた内部依存先 (プロジェクト相対)。1 つでも消えていればミス扱い */
+  internalTargets: string[];
+  /** パスをプロジェクト相対にした解析結果 */
   payload: CachedAnalysisPayload;
   timestamp: number;
 }

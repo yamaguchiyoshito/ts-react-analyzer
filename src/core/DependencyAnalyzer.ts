@@ -501,12 +501,15 @@ export class DependencyAnalyzer {
   private loadResolutionContext(tsConfigPath: string): ResolutionContext {
     const configDir = path.dirname(tsConfigPath);
     try {
+      // hash は解析キャッシュのキーになるため、checkout の絶対パスに依存しないよう
+      // tsconfig のパスをプロジェクト相対にして混ぜる
+      const tsConfigKey = this.toProjectRelativeKey(tsConfigPath);
       const { config } = parseTsConfig(tsConfigPath);
       if (!config) {
         return {
           compilerOptions: this.compilerOptions,
           configDir,
-          hash: `invalid:${tsConfigPath}:${this.compilerOptionsHash}`,
+          hash: `invalid:${tsConfigKey}:${this.compilerOptionsHash}`,
         };
       }
 
@@ -516,7 +519,7 @@ export class DependencyAnalyzer {
           ...config.parsed.options,
         },
         configDir,
-        hash: this.hash(`${tsConfigPath}:${this.stableStringify(config.parsed.options)}`),
+        hash: this.hash(`${tsConfigKey}:${this.stableStringify(config.parsed.options)}`),
       };
     } catch {
       return {
@@ -688,6 +691,20 @@ export class DependencyAnalyzer {
     return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
   }
 
+  // projectRoot 配下の絶対パスをスラッシュ区切りの相対パスにする (ハッシュ用)。配下でなければそのまま
+  private toProjectRelativeKey(filePath: string): string {
+    const relative = path.relative(this.projectRoot, path.resolve(filePath));
+    if (relative === "") {
+      return ".";
+    }
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      return filePath;
+    }
+    return relative.split(path.sep).join("/");
+  }
+
+  // ハッシュ用の直列化。tsconfig 解析後の compilerOptions には絶対化された baseUrl /
+  // configFilePath / pathsBasePath などが含まれるため、projectRoot 配下の絶対パスは相対化して混ぜる
   private stableStringify(value: unknown): string {
     if (Array.isArray(value)) {
       return `[${value.map((item) => this.stableStringify(item)).join(",")}]`;
@@ -698,6 +715,10 @@ export class DependencyAnalyzer {
         .sort(([left], [right]) => left.localeCompare(right))
         .map(([key, item]) => `${JSON.stringify(key)}:${this.stableStringify(item)}`)
         .join(",")}}`;
+    }
+
+    if (typeof value === "string" && path.isAbsolute(value)) {
+      return JSON.stringify(this.toProjectRelativeKey(value));
     }
 
     return JSON.stringify(value);
