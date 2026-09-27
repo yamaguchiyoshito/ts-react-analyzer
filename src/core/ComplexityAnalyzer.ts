@@ -237,7 +237,13 @@ export class ComplexityAnalyzer {
     };
 
     if (node.body) {
-      ts.forEachChild(node.body, (child) => visit(child, 0));
+      if (ts.isBlock(node.body)) {
+        ts.forEachChild(node.body, (child) => visit(child, 0));
+      } else {
+        // 式本体のアロー関数 (`(a) => a > 1 ? 1 : 2`) は body 自体が条件式や論理式なので、
+        // 子ではなく body ノードそのものから訪問する。ネストした関数は visit 側で除外される
+        visit(node.body, 0);
+      }
     }
 
     const startLine = ts.getLineAndCharacterOfPosition(node.getSourceFile(), node.getStart()).line + 1;

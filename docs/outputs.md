@@ -42,11 +42,15 @@
 | `<prefix>_diff.md` | 今回の変更の影響サマリー。changed files、hot spot delta、影響度スコア |
 | `<prefix>_diff.html` | 影響サブツリーの可視化。subtree の drill-down、優先度スコア、ソースリンク |
 | `<prefix>_diff.json` | 差分の完全データ。file diff、graph delta、impact subtree |
+| `<prefix>_current_report.md` / `.json` / `.html` | diff 実行時点の解析結果 (`analyze` と同じ内容)。`--format` に従います |
+| `<prefix>_current_files.csv` など | diff 実行時点の CSV (`--format` に csv を含む場合) |
+
+baseline に指定した `<prefix>_report.json` は diff では上書きされません。今回の状態は `<prefix>_current_*` に書かれるため、同じ基準点に対して繰り返し比較できます。
 
 ### diff レポートに載っている情報
 
 - added / removed / changed / unchanged の内訳
-- 複雑度差分、依存差分、warning 差分
+- 複雑度差分、依存差分、関数数差分、コード行数差分、warning 差分 (いずれかが変化したファイルを changed とみなします)
 - 変更の影響が波及するサブツリー (changed subtree)
 - 影響を受けるファイルの優先度スコア
 - root ごとの subtree metrics

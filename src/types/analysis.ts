@@ -453,6 +453,10 @@ export interface FileDiffEntry {
   status: "added" | "removed" | "changed" | "unchanged";
   complexityDelta: number;
   dependencyDelta: number;
+  /** 関数定義数の増減 (complexity.functions.length の差) */
+  functionCountDelta: number;
+  /** コード行数の増減 (complexity.codeLines の差) */
+  codeLinesDelta: number;
   warningDelta: string[];
 }
 

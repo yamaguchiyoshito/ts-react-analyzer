@@ -129,6 +129,8 @@ export class DiffGenerator {
         status: "added" as const,
         complexityDelta: current.complexity.overallComplexity,
         dependencyDelta: current.dependencies.length,
+        functionCountDelta: current.complexity.functions.length,
+        codeLinesDelta: current.complexity.codeLines,
         warningDelta: current.warnings.map((warning) => `+${warning}`),
       };
     }
@@ -139,14 +141,24 @@ export class DiffGenerator {
         status: "removed" as const,
         complexityDelta: -baseline.complexity.overallComplexity,
         dependencyDelta: -baseline.dependencies.length,
+        functionCountDelta: -baseline.complexity.functions.length,
+        codeLinesDelta: -baseline.complexity.codeLines,
         warningDelta: baseline.warnings.map((warning) => `-${warning}`),
       };
     }
 
     const complexityDelta = (current?.complexity.overallComplexity ?? 0) - (baseline?.complexity.overallComplexity ?? 0);
     const dependencyDelta = (current?.dependencies.length ?? 0) - (baseline?.dependencies.length ?? 0);
+    // 関数の追加や行数の増減だけでも「変更あり」として拾う (overallComplexity は
+    // 丸めや平均化で相殺され、関数を丸ごと足しても 0 のままになることがある)
+    const functionCountDelta = (current?.complexity.functions.length ?? 0) - (baseline?.complexity.functions.length ?? 0);
+    const codeLinesDelta = (current?.complexity.codeLines ?? 0) - (baseline?.complexity.codeLines ?? 0);
     const warningDelta = this.diffStrings(current?.warnings ?? [], baseline?.warnings ?? []);
-    const status = complexityDelta !== 0 || dependencyDelta !== 0 || warningDelta.length > 0
+    const status = complexityDelta !== 0
+      || dependencyDelta !== 0
+      || functionCountDelta !== 0
+      || codeLinesDelta !== 0
+      || warningDelta.length > 0
       ? "changed" as const
       : "unchanged" as const;
 
@@ -155,6 +167,8 @@ export class DiffGenerator {
       status,
       complexityDelta,
       dependencyDelta,
+      functionCountDelta,
+      codeLinesDelta,
       warningDelta,
     };
   }
@@ -247,11 +261,11 @@ export class DiffGenerator {
       return markdown;
     }
 
-    markdown += "| ファイル | 状態 | 複雑度Δ | 依存Δ | 警告差分 |\n";
-    markdown += "|----------|------|---------|-------|----------|\n";
+    markdown += "| ファイル | 状態 | 複雑度Δ | 依存Δ | 関数数Δ | 行数Δ | 警告差分 |\n";
+    markdown += "|----------|------|---------|-------|---------|-------|----------|\n";
     for (const file of changedFiles) {
       const warnings = file.warningDelta.length > 0 ? file.warningDelta.join("、") : "—";
-      markdown += `| ${display(file.path)} | ${statusLabel[file.status] ?? file.status} | ${this.formatSigned(file.complexityDelta)} | ${this.formatSigned(file.dependencyDelta)} | ${warnings} |\n`;
+      markdown += `| ${display(file.path)} | ${statusLabel[file.status] ?? file.status} | ${this.formatSigned(file.complexityDelta)} | ${this.formatSigned(file.dependencyDelta)} | ${this.formatSigned(file.functionCountDelta)} | ${this.formatSigned(file.codeLinesDelta)} | ${warnings} |\n`;
     }
 
     return markdown;
@@ -320,7 +334,7 @@ export class DiffGenerator {
       .filter((file) => file.status !== "unchanged")
       .map((file) => {
         const warningDelta = file.warningDelta.length > 0 ? file.warningDelta.join(", ") : "";
-        return `<tr class="${file.status}" data-file="${this.escapeHtml(file.path)}"><td><a href="${this.toFileHref(toAbsolute(file.path))}">${this.escapeHtml(this.toRenderDisplayPath(file.path, options.projectRoot))}</a></td><td>${file.status}</td><td>${file.complexityDelta}</td><td>${file.dependencyDelta}</td><td>${this.escapeHtml(warningDelta)}</td></tr>`;
+        return `<tr class="${file.status}" data-file="${this.escapeHtml(file.path)}"><td><a href="${this.toFileHref(toAbsolute(file.path))}">${this.escapeHtml(this.toRenderDisplayPath(file.path, options.projectRoot))}</a></td><td>${file.status}</td><td>${file.complexityDelta}</td><td>${file.dependencyDelta}</td><td>${file.functionCountDelta}</td><td>${file.codeLinesDelta}</td><td>${this.escapeHtml(warningDelta)}</td></tr>`;
       })
       .join("\n");
     const warningDelta = diff.graphDelta.warningDelta.length > 0
@@ -341,10 +355,12 @@ export class DiffGenerator {
         `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${this.escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${this.escapeHtml(normalizeClusterCode(item.cluster))}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
       ).join("")}</ul>`
       : "<p>No removed hot spots.</p>";
-    const impactGraph = JSON.stringify(diff.impact.graph).replace(/</gu, "\\u003c");
-    const subtreeData = JSON.stringify(diff.impact.subtrees).replace(/</gu, "\\u003c");
-    const subtreeMetricsData = JSON.stringify(diff.impact.subtrees).replace(/</gu, "\\u003c");
-    const prioritizedData = JSON.stringify(diff.impact.prioritizedFiles).replace(/</gu, "\\u003c");
+    const impactGraph = this.serializeForHtmlScript(diff.impact.graph);
+    const subtreeData = this.serializeForHtmlScript(diff.impact.subtrees);
+    const subtreeMetricsData = this.serializeForHtmlScript(diff.impact.subtrees);
+    const prioritizedData = this.serializeForHtmlScript(diff.impact.prioritizedFiles);
+    const changedIds = this.serializeForHtmlScript(Array.from(changedSet));
+    const impactedIds = this.serializeForHtmlScript(Array.from(impactedSet));
     const focusOptions = [
       `<option value="__all__">All Changed Files</option>`,
       ...diff.impact.subtrees.map((subtree) =>
@@ -446,10 +462,10 @@ export class DiffGenerator {
   <h2>Changed Files</h2>
   <table>
     <thead>
-      <tr><th>File</th><th>Status</th><th>Complexity Delta</th><th>Dependency Delta</th><th>Warning Delta</th></tr>
+      <tr><th>File</th><th>Status</th><th>Complexity Delta</th><th>Dependency Delta</th><th>Function Delta</th><th>Code Lines Delta</th><th>Warning Delta</th></tr>
     </thead>
     <tbody>
-      ${rows || "<tr><td colspan=\"5\">No changed files.</td></tr>"}
+      ${rows || "<tr><td colspan=\"7\">No changed files.</td></tr>"}
     </tbody>
   </table>
   <script>
@@ -457,8 +473,8 @@ export class DiffGenerator {
     const subtreeData = ${subtreeData};
     const subtreeMetricsData = ${subtreeMetricsData};
     const prioritizedData = ${prioritizedData};
-    const changed = new Set(${JSON.stringify(Array.from(changedSet))});
-    const impacted = new Set(${JSON.stringify(Array.from(impactedSet))});
+    const changed = new Set(${changedIds});
+    const impacted = new Set(${impactedIds});
     const changedTableRows = Array.from(document.querySelectorAll("tbody tr[data-file]"));
     const host = document.getElementById("impact-graph");
     const priorityHost = document.getElementById("impact-priority");
@@ -468,6 +484,16 @@ export class DiffGenerator {
     const SVG_NS = "http://www.w3.org/2000/svg";
     const subtreeMap = new Map(subtreeData.map((item) => [item.root, item]));
 
+    // ファイル名などのデータ値を innerHTML に埋め込む前に必ずエスケープする
+    function esc(value) {
+      return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
     function renderList(visibleIds) {
       if (!priorityHost) return;
       const visible = prioritizedData
@@ -476,11 +502,11 @@ export class DiffGenerator {
       priorityHost.innerHTML = visible.length === 0
         ? "<p>No impacted files.</p>"
         : visible.map((item) => {
-            const reasons = item.reasons.join(", ");
-            const complexityPressure = item.complexityPressure > 0 ? ", complexityPressure=" + item.complexityPressure : "";
+            const reasons = esc(item.reasons.join(", "));
+            const complexityPressure = item.complexityPressure > 0 ? ", complexityPressure=" + Number(item.complexityPressure) : "";
             return "<div class=\\"impact-entry\\">" +
-              "<div><span class=\\"impact-score\\">" + item.score + "</span><a href=\\"" + toHref(item.path) + "\\">" + item.path + "</a></div>" +
-              "<div class=\\"impact-meta\\">distance=" + item.distance + ", inbound=" + item.inboundDegree + ", outbound=" + item.outboundDegree + complexityPressure + ", reasons=" + reasons + "</div>" +
+              "<div><span class=\\"impact-score\\">" + Number(item.score) + "</span><a href=\\"" + esc(toHref(item.path)) + "\\">" + esc(item.path) + "</a></div>" +
+              "<div class=\\"impact-meta\\">distance=" + Number(item.distance) + ", inbound=" + Number(item.inboundDegree) + ", outbound=" + Number(item.outboundDegree) + complexityPressure + ", reasons=" + reasons + "</div>" +
             "</div>";
           }).join("");
     }
@@ -555,7 +581,8 @@ export class DiffGenerator {
       const absolute = projectRootForHref && !filePath.startsWith("/") && !/^[A-Za-z]:/.test(filePath)
         ? projectRootForHref.replace(/[/\\]+$/, "") + "/" + filePath
         : filePath;
-      return "file://" + encodeURI(absolute);
+      // encodeURI は " < > をパーセントエンコードするが、属性へ埋め込む側でも esc() を通すこと
+      return "file://" + encodeURI(absolute).replace(/"/g, "%22").replace(/'/g, "%27");
     }
 
     function renderSubtreeMetrics(sortKey) {
@@ -571,13 +598,13 @@ export class DiffGenerator {
       });
       subtreeMetricsBody.innerHTML = items.map((item) =>
         "<tr>" +
-          "<td><button type=\\"button\\" data-focus-root=\\"" + item.root + "\\">" + item.root + "</button></td>" +
-          "<td>" + item.metrics.impactedCount + "</td>" +
-          "<td>" + item.metrics.maxScore + "</td>" +
-          "<td>" + item.metrics.averageScore.toFixed(1) + "</td>" +
-          "<td>" + item.metrics.averageDistance.toFixed(1) + "</td>" +
-          "<td>" + item.metrics.maxInboundDegree + "</td>" +
-          "<td>" + item.metrics.maxOutboundDegree + "</td>" +
+          "<td><button type=\\"button\\" data-focus-root=\\"" + esc(item.root) + "\\">" + esc(item.root) + "</button></td>" +
+          "<td>" + Number(item.metrics.impactedCount) + "</td>" +
+          "<td>" + Number(item.metrics.maxScore) + "</td>" +
+          "<td>" + Number(item.metrics.averageScore).toFixed(1) + "</td>" +
+          "<td>" + Number(item.metrics.averageDistance).toFixed(1) + "</td>" +
+          "<td>" + Number(item.metrics.maxInboundDegree) + "</td>" +
+          "<td>" + Number(item.metrics.maxOutboundDegree) + "</td>" +
         "</tr>"
       ).join("");
       for (const button of subtreeMetricsBody.querySelectorAll("button[data-focus-root]")) {
@@ -1119,7 +1146,8 @@ export class DiffGenerator {
       .replace(/"/gu, "&quot;");
   }
 
-  private serializeForHtmlScript(value: string): string {
+  private serializeForHtmlScript(value: unknown): string {
+    // </script> や <!-- を含む値がスクリプトを閉じないよう、JSON 内の < を必ずエスケープする
     return JSON.stringify(value).replace(/</gu, "\\u003c");
   }
 

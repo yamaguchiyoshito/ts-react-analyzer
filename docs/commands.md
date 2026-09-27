@@ -80,7 +80,9 @@ node dist/src/cli.js diff ./my-app \
 
 - `--baseline` を省略すると `<outputDir>/<prefix>_report.json` を読みます
 - 差分ファイル (JSON / Markdown / HTML) は `--format` に関係なく常に生成されます
-- 実行時に現在状態の `*_report.*` も同時に更新されます
+- 今回の解析結果は `<prefix>_current_report.*` (および `<prefix>_current_files.csv` など) に出力されます。baseline の `<prefix>_report.json` は上書きされないため、同じ基準点に対して何度でも diff を実行できます
+- `--baseline` に diff 自身の出力ファイル (`<prefix>_current_report.json` や `<prefix>_diff.json`) を指定するとエラーで停止します
+- `--watch` では baseline を起動時に一度だけ読み込み、以後の再実行でも同じ内容と比較します
 
 ## quality — 出荷前の品質を審査する
 
@@ -113,7 +115,7 @@ node dist/src/cli.js quality gate ./my-app --output ./reports --prefix release \
 | `--format <formats>` | `csv,markdown,json,html,all` |
 | `--config <path>` | 設定ファイルのパス |
 | `--prefix <name>` | 出力ファイルの接頭辞 |
-| `--open` | 生成した HTML レポートをブラウザで開く (`--format` に html が必要。`diff` は常に開けます) |
+| `--open` | 生成した HTML レポートをブラウザで開く (`--format` に html が無い場合はこの実行に限り自動で追加します。`diff` は常に開けます) |
 | `--verbose` | 詳細ログを有効化 |
 | `--max-file-size <bytes>` | 指定サイズ超のファイルを解析から除外 |
 | `--complexity-threshold <n>` | 複雑度の警告閾値 |

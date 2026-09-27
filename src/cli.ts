@@ -336,16 +336,47 @@ function formatExcludedSkipsLine(skippedFiles: SkippedFile[], projectRoot?: stri
   return `  除外: ${excluded.length} 件のディレクトリ/ファイルを既定の除外設定でスキップしました (${examples.join(", ")}${suffix})`;
 }
 
-function printDiffSummary(diff: AnalysisDiffReport, config: AnalysisConfig): void {
-  const lines: string[] = [""];
-  lines.push(`✔ 差分解析が完了しました: 変更 ${diff.summary.changedFiles} / 追加 ${diff.summary.addedFiles} / 削除 ${diff.summary.removedFiles}`);
-  printOutputFiles(lines, config.outputDir, [
+/** diff が今回の解析結果を書き出す接頭辞。baseline (`<prefix>_report.json`) を上書きしないよう別名にする */
+function diffCurrentPrefix(prefix: string): string {
+  return `${prefix}_current`;
+}
+
+function listDiffOutputFiles(config: AnalysisConfig): string[] {
+  return [
     `${config.filePrefix}_diff.md`,
     `${config.filePrefix}_diff.html`,
     `${config.filePrefix}_diff.json`,
-  ], "まずこのファイルから読み始めてください");
+    ...listReportFiles(diffCurrentPrefix(config.filePrefix), config.outputFormats, "analyze"),
+  ];
+}
+
+function printDiffSummary(diff: AnalysisDiffReport, config: AnalysisConfig): void {
+  const lines: string[] = [""];
+  lines.push(`✔ 差分解析が完了しました: 変更 ${diff.summary.changedFiles} / 追加 ${diff.summary.addedFiles} / 削除 ${diff.summary.removedFiles}`);
+  printOutputFiles(lines, config.outputDir, listDiffOutputFiles(config), "まずこのファイルから読み始めてください");
+  lines.push(`  baseline (${diff.baselinePath}) は上書きされません。今回の解析結果は ${diffCurrentPrefix(config.filePrefix)}_report.* に出力されます`);
   console.log(lines.join("\n"));
 }
+
+/**
+ * baseline が diff 自身の出力ファイルと同じパスなら、比較元を壊してしまうため実行前に止める。
+ * (旧バージョンは `<prefix>_report.json` を diff が上書きし、2 回目以降の比較が前回実行との差分になっていた)
+ */
+function assertBaselineIsNotDiffOutput(baselinePath: string, config: AnalysisConfig): void {
+  const resolvedBaseline = path.resolve(baselinePath);
+  const collision = listDiffOutputFiles(config)
+    .map((file) => path.join(config.outputDir, file))
+    .find((candidate) => path.resolve(candidate) === resolvedBaseline);
+  if (collision) {
+    throw new CliUserError([
+      `baseline が diff の出力ファイルと同じパスです: ${resolvedBaseline}`,
+      "diff はこのファイルを上書きするため、比較元として使えません。",
+      "analyze が出力した <prefix>_report.json を --baseline に指定するか、--output / --prefix で出力先を分けてください。",
+    ].join("\n"));
+  }
+}
+
+type DiffBaselineSource = string | { path: string; report: PersistedAnalysisReport };
 
 function printQualitySummary(report: QualityReport, config: AnalysisConfig, mode: "collect" | "report" | "gate"): void {
   const lines: string[] = [""];
@@ -614,7 +645,26 @@ async function watchDiff(
   baselinePath: string,
   openReport: boolean,
 ): Promise<number> {
-  const initialCode = await diffProject(projectRoot, config, baselinePath, { openReport });
+  // baseline は最初に一度だけ読み込み、以後の再実行でも同じ内容と比較する
+  // (毎回ディスクから読み直すと、旧バージョンのように前回実行の出力と比較してしまう)
+  let baselineSource: DiffBaselineSource;
+  try {
+    baselineSource = {
+      path: baselinePath,
+      report: await loadBaselineReport<PersistedAnalysisReport>(
+        baselinePath,
+        "先に analyze を実行して baseline を作成するか、--baseline で既存の *_report.json を指定してください。",
+      ),
+    };
+  } catch (error) {
+    if (error instanceof CliUserError) {
+      console.error(`エラー: ${error.message}`);
+      return 1;
+    }
+    throw error;
+  }
+
+  const initialCode = await diffProject(projectRoot, config, baselineSource, { openReport });
   if (initialCode === 1) {
     // baseline 不在などの実行失敗は監視を始めても回復しないため終了する
     return 1;
@@ -634,7 +684,7 @@ async function watchDiff(
     running = true;
     try {
       console.log(`\n―― ${new Date().toISOString()} 変更を検知したため diff を再実行します ――`);
-      await diffProject(projectRoot, config, baselinePath, {});
+      await diffProject(projectRoot, config, baselineSource, {});
     } finally {
       running = false;
       if (pendingRerun) {
@@ -924,25 +974,31 @@ async function graphProject(projectDir: string, config: AnalysisConfig): Promise
 async function diffProject(
   projectDir: string,
   config: AnalysisConfig,
-  baselinePath: string,
+  baselineSource: DiffBaselineSource,
   options: { openReport?: boolean } = {},
 ): Promise<number> {
   const logger = new Logger(config.verbose ? "DEBUG" : "INFO", config.logFile);
   await logger.initialize();
   const startTime = Date.now();
+  const baselinePath = typeof baselineSource === "string" ? baselineSource : baselineSource.path;
+  const currentPrefix = diffCurrentPrefix(config.filePrefix);
 
   try {
     logger.info("Diff started", { projectDir, baselinePath });
-    const baseline = await loadBaselineReport<PersistedAnalysisReport>(
-      baselinePath,
-      "先に analyze を実行して baseline を作成するか、--baseline で既存の *_report.json を指定してください。",
-    );
+    assertBaselineIsNotDiffOutput(baselinePath, config);
+    const baseline = typeof baselineSource === "string"
+      ? await loadBaselineReport<PersistedAnalysisReport>(
+          baselineSource,
+          "先に analyze を実行して baseline を作成するか、--baseline で既存の *_report.json を指定してください。",
+        )
+      : baselineSource.report;
     const artifacts = await buildArtifacts(projectDir, config, logger);
 
+    // 今回の解析結果は `<prefix>_current_report.*` に書き、baseline (`<prefix>_report.json`) は保持する
     const reportGenerator = new ReportGenerator();
     const currentReport = await reportGenerator.generateReports(artifacts.results, artifacts.graphMetrics, {
       outputDir: config.outputDir,
-      prefix: config.filePrefix,
+      prefix: currentPrefix,
       formats: config.outputFormats,
       complexityThreshold: config.complexityThreshold,
       executionTimeMs: Date.now() - startTime,
@@ -956,7 +1012,7 @@ async function diffProject(
       graphJson: artifacts.graphJson,
     });
 
-    const currentReportPath = path.join(config.outputDir, `${config.filePrefix}_report.json`);
+    const currentReportPath = path.join(config.outputDir, `${currentPrefix}_report.json`);
     const diffGenerator = new DiffGenerator();
     const diff = diffGenerator.compare(currentReport, baseline, baselinePath, currentReportPath, { projectRoot: projectDir });
     await diffGenerator.writeReports(diff, config.outputDir, config.filePrefix, {
@@ -1423,6 +1479,18 @@ async function main(): Promise<number> {
 
   if (config.outputFormats.length === 0) {
     config.outputFormats = ["json", "markdown", "csv"];
+  }
+  // --open は HTML レポートを前提とするため、--format に無ければこの実行に限り html を足す
+  // (diff の差分 HTML は --format に関係なく常に生成され、graph は HTML を持たない)
+  if (
+    openReport
+    && command !== "graph"
+    && command !== "diff"
+    && !config.outputFormats.includes("html")
+    && !config.outputFormats.includes("all")
+  ) {
+    config.outputFormats = [...config.outputFormats, "html"];
+    console.log("--open: --format に html が含まれていないため、この実行では html を追加して HTML レポートを生成します。");
   }
 
   config.outputDir = path.resolve(projectRoot, config.outputDir);
