@@ -6,6 +6,7 @@
 #   tsra:diff          MR ごとに、影響度の高い危険な変更だけを止める (MR ゲート)
 #   tsra:quality-gate  デフォルトブランチとタグで、品質悪化を止める (出荷ゲート)
 #
+# script は bash を前提にしています (node:* イメージの既定シェル)。
 # 使い方・変数の説明は同じディレクトリの README.md を参照してください。
 # ============================================================================
 
@@ -25,6 +26,8 @@ variables:
   # 実行イメージ
   TSRA_NODE_IMAGE: "node:22"
   # ts-react-analyzer の取得元とリビジョン
+  # TSRA_REPO_REF にはブランチ名・タグ名・コミット SHA (完全形) を指定できます。
+  # 本番運用ではタグまたはコミット SHA に固定し、更新は意図したタイミングで行ってください。
   TSRA_REPO_URL: "https://github.com/yamaguchiyoshito/ts-react-analyzer.git"
   TSRA_REPO_REF: "master"
 
@@ -36,14 +39,20 @@ variables:
     paths:
       - "$TSRA_PROJECT_DIR/.ts-analyzer-cache/"
   before_script:
-    - git clone --depth 1 --branch "$TSRA_REPO_REF" "$TSRA_REPO_URL" /tmp/tsra
+    # ブランチ・タグ・コミット SHA のどれでも同じ手順で取得できるよう fetch + checkout にする
+    - git init --quiet /tmp/tsra
+    - git -C /tmp/tsra remote add origin "$TSRA_REPO_URL"
+    - git -C /tmp/tsra fetch --depth 1 origin "$TSRA_REPO_REF"
+    - git -C /tmp/tsra checkout --quiet FETCH_HEAD
     - (cd /tmp/tsra && npm install --no-audit --no-fund && npm run build)
     - export TSRA_CLI=/tmp/tsra/dist/src/cli.js
-    # 出力ディレクトリのリポジトリルートからのパス (API で成果物を取得するときの URL 用)
+    # 出力ディレクトリのリポジトリルートからのパスと、その URL エンコード形
+    # (成果物 API の URL に埋め込むため。空白や日本語を含むパスでも 404 にならないように)
     - |
       _p="${TSRA_PROJECT_DIR#./}"; _p="${_p%/}"
       if [ "$_p" = "." ] || [ -z "$_p" ]; then _p=""; else _p="$_p/"; fi
       export TSRA_REPORTS_PATH="${_p}${TSRA_OUTPUT_DIR}"
+      export TSRA_REPORTS_PATH_URL="$(node -p 'process.argv[1].split("/").map(encodeURIComponent).join("/")' "$TSRA_REPORTS_PATH")"
     - if [ -n "$TSRA_SETUP_CMD" ]; then (cd "$TSRA_PROJECT_DIR" && eval "$TSRA_SETUP_CMD"); fi
 
 # ----------------------------------------------------------------------------
@@ -76,10 +85,14 @@ tsra:diff:
   script:
     - |
       baseline_json="$CI_PROJECT_DIR/tsra-baseline_report.json"
-      if curl --silent --fail --location \
+      # ref 名は URL エンコードが必須 (release/1.2 のようなブランチ名は "/" を %2F にしないと 404 になる)
+      target_ref_url="$(node -p 'encodeURIComponent(process.argv[1])' "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME")"
+      baseline_url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/jobs/artifacts/$target_ref_url/raw/$TSRA_REPORTS_PATH_URL/${TSRA_PREFIX}_report.json?job=tsra%3Abaseline"
+      http_code="$(curl --silent --location --write-out '%{http_code}' \
            --header "JOB-TOKEN: $CI_JOB_TOKEN" \
            --output "$baseline_json" \
-           "$CI_API_V4_URL/projects/$CI_PROJECT_ID/jobs/artifacts/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME/raw/$TSRA_REPORTS_PATH/${TSRA_PREFIX}_report.json?job=tsra%3Abaseline"; then
+           "$baseline_url" || echo "000")"
+      if [ "$http_code" = "200" ]; then
         node "$TSRA_CLI" diff "$TSRA_PROJECT_DIR" \
           --output "$TSRA_OUTPUT_DIR" \
           --prefix "$TSRA_PREFIX" \
@@ -87,8 +100,14 @@ tsra:diff:
           --impact-threshold "$TSRA_IMPACT_THRESHOLD" \
           --fail-on-impact
       else
-        echo "baseline がまだありません。今回は現状解析のみ実行します。"
-        echo "デフォルトブランチで tsra:baseline が一度成功すると、次の MR から差分ゲートが有効になります。"
+        rm -f "$baseline_json"
+        if [ "$http_code" = "404" ]; then
+          echo "baseline がまだありません (ターゲットブランチ: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME)。今回は現状解析のみ実行します。"
+          echo "デフォルトブランチで tsra:baseline が一度成功すると、次の MR から差分ゲートが有効になります。"
+        else
+          echo "警告: baseline の取得に失敗しました (HTTP $http_code)。今回は現状解析のみ実行します。"
+          echo "       URL: $baseline_url"
+        fi
         node "$TSRA_CLI" analyze "$TSRA_PROJECT_DIR" --output "$TSRA_OUTPUT_DIR" --prefix "$TSRA_PREFIX"
       fi
   artifacts:
@@ -111,22 +130,32 @@ tsra:quality-gate:
   script:
     - |
       baseline_json="$CI_PROJECT_DIR/tsra-baseline_quality_report.json"
-      gate_args=""
-      if curl --silent --fail --location \
+      default_ref_url="$(node -p 'encodeURIComponent(process.argv[1])' "$CI_DEFAULT_BRANCH")"
+      baseline_url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/jobs/artifacts/$default_ref_url/raw/$TSRA_REPORTS_PATH_URL/${TSRA_PREFIX}_quality_report.json?job=tsra%3Abaseline"
+      # 引数は配列で組み立てる (パスに空白があっても分割されないように)
+      gate_args=()
+      http_code="$(curl --silent --location --write-out '%{http_code}' \
            --header "JOB-TOKEN: $CI_JOB_TOKEN" \
            --output "$baseline_json" \
-           "$CI_API_V4_URL/projects/$CI_PROJECT_ID/jobs/artifacts/$CI_DEFAULT_BRANCH/raw/$TSRA_REPORTS_PATH/${TSRA_PREFIX}_quality_report.json?job=tsra%3Abaseline"; then
-        gate_args="--baseline $baseline_json"
+           "$baseline_url" || echo "000")"
+      if [ "$http_code" = "200" ]; then
+        gate_args+=(--baseline "$baseline_json")
       else
-        echo "前回の品質レポートがまだありません。今回は現状の品質だけで判定します。"
+        rm -f "$baseline_json"
+        if [ "$http_code" = "404" ]; then
+          echo "前回の品質レポートがまだありません。今回は現状の品質だけで判定します。"
+        else
+          echo "警告: 前回の品質レポートの取得に失敗しました (HTTP $http_code)。今回は現状の品質だけで判定します。"
+          echo "       URL: $baseline_url"
+        fi
       fi
       if [ -n "$TSRA_QUALITY_MONITORING_METRICS" ]; then
-        gate_args="$gate_args --quality-gate-monitoring-metrics $TSRA_QUALITY_MONITORING_METRICS"
+        gate_args+=(--quality-gate-monitoring-metrics "$TSRA_QUALITY_MONITORING_METRICS")
       fi
       node "$TSRA_CLI" quality gate "$TSRA_PROJECT_DIR" \
         --output "$TSRA_OUTPUT_DIR" \
         --prefix "$TSRA_PREFIX" \
-        $gate_args
+        "${gate_args[@]}"
   artifacts:
     when: always
     paths:

@@ -116,17 +116,31 @@ node dist/src/cli.js quality gate ./my-app --output ./reports --prefix release \
 | `--config <path>` | 設定ファイルのパス |
 | `--prefix <name>` | 出力ファイルの接頭辞 |
 | `--open` | 生成した HTML レポートをブラウザで開く (`--format` に html が無い場合はこの実行に限り自動で追加します。`diff` は常に開けます) |
-| `--verbose` | 詳細ログを有効化 |
+| `--verbose` | 詳細ログを有効化 (`DEBUG` をログファイルと画面に出す。エラー時はスタックトレースも標準エラーに出す) |
+| `--quiet` / `-q` | 進行ログ (`[INFO]` / `[DEBUG]`) を画面に出さない。ログファイルには通常どおり書かれ、警告・エラー・結果サマリー (`✔ ...`) は表示されます。CI のログを短くしたいときに |
 | `--max-file-size <bytes>` | 指定サイズ超のファイルを解析から除外 |
+| `--analysis-scope <scope>` | `all` (既定) または `source-only`。`source-only` は [File Type](file-types.md) が `Test` / `Story` / `Fixture` / `Config` / `Storybook Support` のファイルを解析対象から外します |
 | `--complexity-threshold <n>` | 複雑度の警告閾値 |
+| `--exclude-groups <groups>` | 既定の除外グループに追加するグループ名 (カンマ区切り。一覧は [既定の除外対象](configuration.md#既定の除外対象)) |
 | `--exclude-patterns <patterns>` | 除外パターン (カンマ区切り正規表現) |
 | `--cache-dir <dir>` | キャッシュディレクトリ |
 | `--log-file <path>` | ログファイルのパス |
 | `--manual-input <path>` | 手動品質証跡 JSON のパス |
 | `--quality-gate-blocking-metrics <ids>` | baseline 悪化で gate を落とす指標 ID (カンマ区切り) |
 | `--quality-gate-monitoring-metrics <ids>` | baseline 悪化を監視だけに留める指標 ID (カンマ区切り) |
-| `--version` | バージョンを表示 |
-| `--help` | ヘルプを表示 |
+| `--version` / `-v` | バージョンを表示して終了コード `0` |
+| `--help` / `-h` | ヘルプを表示して終了コード `0` (`analyze --help` のようにコマンド名の後ろに付けるとコマンド別ヘルプ) |
+
+### 画面出力の振り分け
+
+| 出力 | 行き先 |
+|---|---|
+| 進行ログ `[INFO]` / `[DEBUG]` | 標準出力 (`--quiet` で抑止) |
+| 警告 `[WARN]` / エラー `[ERROR]`、`エラー: ...`、`警告: ...` | 標準エラー |
+| 結果サマリー (`✔ 解析が完了しました ...` と出力ファイルの一覧) | 標準出力 (`--quiet` でも表示) |
+| ログファイル (`<projectDir>/analysis.log`) | すべてのレベルを `--quiet` の有無に関係なく記録 |
+
+実行に失敗したときは `エラー: <理由>` に続けて `詳細は --verbose を付けて再実行するか、<ログファイル> を確認してください。` と表示されます。スタックトレースは常にログファイルに残り、`--verbose` を付けると標準エラーにも出ます。
 
 ### diff 専用
 
@@ -147,10 +161,12 @@ node dist/src/cli.js quality gate ./my-app --output ./reports --prefix release \
 
 | オプション | 意味 |
 |---|---|
+| `--quality-profile <profile>` | `application` (既定) または `library-repo`。テスト存在率などの合格基準をプロファイルごとの閾値に切り替えます (→ [品質レポート](quality.md)) |
 | `--manual-input <path>` | 手動品質証跡 JSON。未指定時は `<projectDir>/quality.manual.json` を自動で読みます |
 | `--baseline <path>` | `quality gate` / `quality diff` の比較元 `*_quality_report.json` |
 | `--quality-gate-blocking-metrics <ids>` | baseline 悪化で gate を落とす指標 ID |
 | `--quality-gate-monitoring-metrics <ids>` | baseline 悪化を監視だけに留める指標 ID |
+| `--max-typecheck-root-names <n>` | TypeScript 型検査に渡すルートファイル数の上限 (既定: 5000)。超えた場合は型検査をスキップし、型エラー数の指標を手動証跡待ちにします |
 
 ## 終了コード
 
@@ -158,6 +174,8 @@ CI に組み込むときは `2` を明示的に拾ってください。
 
 | コード | 意味 |
 |---|---|
-| `0` | 成功 |
-| `1` | 実行失敗 (パス誤りなどの一般エラー) |
-| `2` | 判定による失敗 — `diff` の影響度閾値超過、または `quality gate` の出荷判定 NG |
+| `0` | 成功。`--help` / `-h` と `--version` / `-v` もこのコードで終了します |
+| `1` | 実行失敗 — パス誤り・設定値の不正などの一般エラー、**引数なしでの起動** (ヘルプを標準エラーに表示)、不明なコマンド・不明なオプション、Node.js 20 未満での起動 |
+| `2` | 判定による失敗 — `diff` の影響度閾値超過 (`--fail-on-impact` 指定時)、または `quality gate` の出荷判定 NG |
+
+引数なしで起動した場合は「使い方が分からない」状態とみなし、ヘルプを表示したうえで `1` で終了します (v0.3 まで `0` でした)。CI でコマンドの組み立てに失敗したとき、ヘルプだけ出て成功扱いにならないようにするためです。ヘルプを見たいだけのときは `--help` を付けてください。

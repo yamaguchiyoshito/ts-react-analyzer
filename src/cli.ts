@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import path from "node:path";
 import fs from "node:fs/promises";
 import { spawnSync } from "node:child_process";
@@ -51,7 +52,8 @@ const COMMON_OPTIONS_HELP = `共通オプション:
   --config <path>                設定ファイルのパス (既定: <projectDir>/analyzer.config.json)
   --prefix <name>                出力ファイル名の接頭辞 (既定: analysis)
   --open                         生成した HTML レポートをブラウザで開く
-  --verbose                      詳細ログを有効化
+  --verbose                      詳細ログを有効化 (DEBUG をログファイルと画面に出す)
+  --quiet, -q                    進行ログ ([INFO] / [DEBUG]) を画面に出さない (ログファイルには残る。警告・エラー・結果サマリーは表示)
   --max-file-size <bytes>        指定サイズ超のファイルを解析から除外
   --analysis-scope <scope>       all | source-only
   --complexity-threshold <n>     複雑度の警告閾値
@@ -59,8 +61,8 @@ const COMMON_OPTIONS_HELP = `共通オプション:
   --exclude-patterns <patterns>  除外パターン (カンマ区切り正規表現)
   --cache-dir <dir>              キャッシュディレクトリ
   --log-file <path>              ログファイルのパス
-  --version                      バージョンを表示
-  --help                         ヘルプを表示 (例: analyze --help でコマンド別ヘルプ)`;
+  --version, -v                  バージョンを表示
+  --help, -h                     ヘルプを表示 (例: analyze --help でコマンド別ヘルプ)`;
 
 const COMMAND_OPTIONS_HELP = {
   diff: `diff のオプション:
@@ -81,7 +83,9 @@ const COMMAND_OPTIONS_HELP = {
   --yes                          質問せず既定値で analyzer.config.json を生成する`,
 };
 
-function printHelp(command?: string): void {
+// 引数誤りの案内としてヘルプを出すときは、正常出力 (レポートのパスなど) と混ざらないよう
+// 標準エラーへ出す。--help で明示的に求められたときは標準出力へ出す
+function printHelp(command?: string, options: { stream?: "stdout" | "stderr" } = {}): void {
   const lines: string[] = ["ts-react-analyzer — React / TypeScript プロジェクトの静的解析 CLI", ""];
 
   const entry = command ? COMMAND_USAGE[command] : undefined;
@@ -114,8 +118,13 @@ function printHelp(command?: string): void {
     );
   }
 
-  lines.push("終了コード: 0=成功 / 1=実行失敗 / 2=判定による失敗 (diff の閾値超過、quality gate の FAIL)");
-  console.log(lines.join("\n"));
+  lines.push("終了コード: 0=成功 / 1=実行失敗・引数誤り / 2=判定による失敗 (diff の閾値超過、quality gate の FAIL)");
+  const text = lines.join("\n");
+  if (options.stream === "stderr") {
+    console.error(text);
+  } else {
+    console.log(text);
+  }
 }
 
 // ユーザー操作起因の失敗 (パス誤りなど)。message はそのまま画面に出す前提で書く
@@ -127,6 +136,7 @@ const CLI_OPTIONS = {
   config: { type: "string" },
   prefix: { type: "string" },
   verbose: { type: "boolean" },
+  quiet: { type: "boolean", short: "q" },
   "max-file-size": { type: "string" },
   "analysis-scope": { type: "string" },
   "quality-profile": { type: "string" },
@@ -145,9 +155,25 @@ const CLI_OPTIONS = {
   open: { type: "boolean" },
   watch: { type: "boolean" },
   yes: { type: "boolean" },
-  version: { type: "boolean" },
-  help: { type: "boolean" },
+  version: { type: "boolean", short: "v" },
+  help: { type: "boolean", short: "h" },
 } as const;
+
+// package.json の engines (>=20) より古い Node では parseArgs の short や
+// Array.prototype.at などが無く、意味の分からない例外で落ちる。先に理由を示して止める
+const MINIMUM_NODE_MAJOR = 20;
+
+function checkNodeVersion(): number | undefined {
+  const major = Number.parseInt(process.versions.node.split(".")[0] ?? "", 10);
+  if (Number.isFinite(major) && major >= MINIMUM_NODE_MAJOR) {
+    return undefined;
+  }
+  console.error(
+    `エラー: ts-react-analyzer は Node.js ${MINIMUM_NODE_MAJOR} 以上が必要です (現在: ${process.versions.node})。`,
+  );
+  console.error("Node.js を更新するか、nvm / volta などで新しいバージョンに切り替えてから再実行してください。");
+  return 1;
+}
 
 function parseCliArgs() {
   return parseArgs({
@@ -251,7 +277,7 @@ async function handleCommandError(
     const message = error instanceof Error ? error.message : String(error);
     console.error(`エラー: ${message}`);
     if (!options.verbose) {
-      console.error(`  詳細 (スタックトレース) はログファイルに記録しました。--verbose を付けると標準エラーにも出力します。`);
+      console.error(`詳細は --verbose を付けて再実行するか、${logger.logFilePath} を確認してください。`);
     }
     // スタックトレースは常にログファイルへ残す。画面には --verbose のときだけ出す
     logger.error(logMessage, { error: message, stack });
@@ -1381,6 +1407,11 @@ function buildGraphWarnings(
 }
 
 async function main(): Promise<number> {
+  const nodeVersionExitCode = checkNodeVersion();
+  if (nodeVersionExitCode !== undefined) {
+    return nodeVersionExitCode;
+  }
+
   let parsed: ReturnType<typeof parseCliArgs>;
   try {
     parsed = parseCliArgs();
@@ -1392,6 +1423,9 @@ async function main(): Promise<number> {
     await printVersion();
     return 0;
   }
+
+  // --quiet は画面の [INFO] / [DEBUG] だけを抑止する (ログファイルと警告・エラー・結果サマリーはそのまま)
+  Logger.configureConsole({ quiet: Boolean(parsed.values.quiet) });
 
   const [command, maybeSubcommand, maybeProjectDir] = parsed.positionals;
   const projectDir = command === "quality" ? maybeProjectDir : maybeSubcommand;
@@ -1409,9 +1443,16 @@ async function main(): Promise<number> {
     )
     : undefined;
 
-  if (parsed.values.help || !command) {
+  if (parsed.values.help) {
     printHelp(command && command in COMMAND_USAGE ? command : undefined);
     return 0;
+  }
+  // 引数なしは「使い方が分からない」状態なので、--help と区別して失敗 (1) にする
+  // (CI でコマンドの組み立てに失敗したとき、ヘルプを出して成功扱いにならないように)
+  if (!command) {
+    console.error("エラー: コマンドを指定してください。使用できるコマンド: analyze, graph, diff, quality, init\n");
+    printHelp(undefined, { stream: "stderr" });
+    return 1;
   }
 
   const validCommands = ["analyze", "graph", "diff", "quality", "init"];
@@ -1424,7 +1465,7 @@ async function main(): Promise<number> {
       const commandExample = command === "quality" ? `quality ${qualityMode}` : command;
       console.error(`エラー: 解析対象の <projectDir> を指定してください。例: ${commandExample} ./my-app\n`);
     }
-    printHelp(validCommands.includes(command) ? command : undefined);
+    printHelp(validCommands.includes(command) ? command : undefined, { stream: "stderr" });
     return 1;
   }
 
