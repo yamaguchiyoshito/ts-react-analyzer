@@ -168,6 +168,9 @@ export interface Dependency {
   modulePath: string;
   imported?: ImportedItem[];
   exported?: ExportedItem[];
+  // `import type` / `export type` / 全 specifier が `type` 付きの import。
+  // 実行時の依存を生まないため、依存グラフ (循環検出) には辺として載せない
+  isTypeOnly?: boolean;
   range: DependencyRange;
 }
 
@@ -453,6 +456,10 @@ export interface FileDiffEntry {
   status: "added" | "removed" | "changed" | "unchanged";
   complexityDelta: number;
   dependencyDelta: number;
+  /** 関数定義数の増減 (complexity.functions.length の差) */
+  functionCountDelta: number;
+  /** コード行数の増減 (complexity.codeLines の差) */
+  codeLinesDelta: number;
   warningDelta: string[];
 }
 

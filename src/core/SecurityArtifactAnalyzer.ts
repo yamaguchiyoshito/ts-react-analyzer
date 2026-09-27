@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { formatArtifactWarning, isRecord, readJsonArtifact } from "./ArtifactJson.js";
+
 interface VulnerabilityCount {
   critical: number;
   high: number;
@@ -15,21 +17,37 @@ export interface SecurityToolSummary extends VulnerabilityCount {
 
 export interface SecurityArtifactSummary {
   tools: SecurityToolSummary[];
+  /** 名前は一致したが読めなかった / 形式が違ったため無視した成果物 */
+  warnings: string[];
 }
+
+// ファイル名 (basename) 単位で先頭一致させる。`.*audit.*` のような緩い一致だと
+// lighthouse-audit.json や a11y-audit.json を npm audit と誤認し、脆弱性 0 件で
+// pass 扱いになってしまう。
+const NPM_AUDIT_FILE_PATTERN = /^(npm-)?audit([-.][\w.-]*)?\.json$/iu;
+const TRIVY_FILE_PATTERN = /^trivy([-.][\w.-]*)?\.json$/iu;
 
 export class SecurityArtifactAnalyzer {
   async analyzeProject(projectRoot: string): Promise<SecurityArtifactSummary> {
     const toolSummaries: SecurityToolSummary[] = [];
+    const warnings: string[] = [];
 
     for (const filePath of await this.findNpmAuditFiles(projectRoot)) {
-      toolSummaries.push(await this.parseNpmAuditFile(filePath));
+      const summary = await this.parseNpmAuditFile(filePath, warnings);
+      if (summary) {
+        toolSummaries.push(summary);
+      }
     }
     for (const filePath of await this.findTrivyFiles(projectRoot)) {
-      toolSummaries.push(await this.parseTrivyFile(filePath));
+      const summary = await this.parseTrivyFile(filePath, warnings);
+      if (summary) {
+        toolSummaries.push(summary);
+      }
     }
 
     return {
       tools: toolSummaries,
+      warnings,
     };
   }
 
@@ -39,7 +57,7 @@ export class SecurityArtifactAnalyzer {
       "reports/npm-audit.json",
       "audit.json",
       "artifacts/npm-audit.json",
-    ], ["reports", "artifacts", ".artifacts"], /(npm-)?audit.*\.json$/iu);
+    ], ["reports", "artifacts", ".artifacts"], NPM_AUDIT_FILE_PATTERN);
   }
 
   private async findTrivyFiles(projectRoot: string): Promise<string[]> {
@@ -49,29 +67,63 @@ export class SecurityArtifactAnalyzer {
       "reports/trivy.json",
       "reports/trivy-results.json",
       "artifacts/trivy.json",
-    ], ["reports", "artifacts", ".artifacts"], /trivy.*\.json$/iu);
+    ], ["reports", "artifacts", ".artifacts"], TRIVY_FILE_PATTERN);
   }
 
-  private async parseNpmAuditFile(filePath: string): Promise<SecurityToolSummary> {
-    const payload = JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
-    const counts = this.extractNpmAuditCounts(payload);
+  private async parseNpmAuditFile(filePath: string, warnings: string[]): Promise<SecurityToolSummary | null> {
+    const result = await readJsonArtifact(filePath);
+    if (!result.ok) {
+      warnings.push(formatArtifactWarning(filePath, result.error));
+      return null;
+    }
+    if (!this.looksLikeNpmAudit(result.value)) {
+      warnings.push(formatArtifactWarning(filePath, "npm audit の JSON 形式 (vulnerabilities / metadata.vulnerabilities / advisories) ではないため無視しました"));
+      return null;
+    }
 
     return {
       tool: "npm-audit",
       filePath,
-      ...counts,
+      ...this.extractNpmAuditCounts(result.value),
     };
   }
 
-  private async parseTrivyFile(filePath: string): Promise<SecurityToolSummary> {
-    const payload = JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
-    const counts = this.extractTrivyCounts(payload);
+  private async parseTrivyFile(filePath: string, warnings: string[]): Promise<SecurityToolSummary | null> {
+    const result = await readJsonArtifact(filePath);
+    if (!result.ok) {
+      warnings.push(formatArtifactWarning(filePath, result.error));
+      return null;
+    }
+    if (!this.looksLikeTrivy(result.value)) {
+      warnings.push(formatArtifactWarning(filePath, "Trivy の JSON 形式 (Results 配列) ではないため無視しました"));
+      return null;
+    }
 
     return {
       tool: "trivy",
       filePath,
-      ...counts,
+      ...this.extractTrivyCounts(result.value),
     };
+  }
+
+  private looksLikeNpmAudit(payload: unknown): boolean {
+    if (!isRecord(payload)) {
+      return false;
+    }
+    if (isRecord(payload.metadata) && isRecord(payload.metadata.vulnerabilities)) {
+      return true;
+    }
+    if (isRecord(payload.vulnerabilities)) {
+      return true;
+    }
+    return isRecord(payload.advisories);
+  }
+
+  private looksLikeTrivy(payload: unknown): boolean {
+    if (!isRecord(payload)) {
+      return false;
+    }
+    return Array.isArray(payload.Results) || Array.isArray(payload.results);
   }
 
   private extractNpmAuditCounts(payload: unknown): VulnerabilityCount {

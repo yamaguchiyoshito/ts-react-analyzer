@@ -49,7 +49,7 @@ export class FileScanner {
       cacheStats: { hits: 0, misses: 0 },
     };
 
-    const files = await this.recurseDirectory(absoluteRoot, result, new Set<string>());
+    const files = await this.recurseDirectory(absoluteRoot, absoluteRoot, result, new Set<string>());
 
     for (const filePath of files) {
       try {
@@ -69,6 +69,7 @@ export class FileScanner {
   }
 
   private async recurseDirectory(
+    rootPath: string,
     dirPath: string,
     result: ScanResult,
     visited: Set<string>,
@@ -90,10 +91,14 @@ export class FileScanner {
       const entries = await fs.readdir(dirPath, { withFileTypes: true });
       for (const entry of entries) {
         const fullPath = path.join(dirPath, entry.name);
+        // 除外パターンとスコープ判定はスキャンルートからの相対パス (スラッシュ区切り) に対して行う。
+        // 絶対パスに照合すると、プロジェクトが /tmp/build/app のような場所にあるだけで
+        // 既定の build 除外に全ファイルが巻き込まれてしまう。
+        const relativePath = this.toRelativePath(rootPath, fullPath);
         let isDirectory = entry.isDirectory();
         let isFile = entry.isFile();
 
-        if (this.isExcluded(fullPath)) {
+        if (this.isExcluded(relativePath)) {
           result.skipped.push({
             filePath: fullPath,
             reason: "Excluded pattern match",
@@ -122,7 +127,7 @@ export class FileScanner {
         }
 
         if (isDirectory) {
-          files.push(...(await this.recurseDirectory(fullPath, result, visited)));
+          files.push(...(await this.recurseDirectory(rootPath, fullPath, result, visited)));
           continue;
         }
 
@@ -140,7 +145,7 @@ export class FileScanner {
           continue;
         }
 
-        if (!shouldIncludeInAnalysisScope(fullPath, this.analysisScope)) {
+        if (!shouldIncludeInAnalysisScope(fullPath, this.analysisScope, rootPath)) {
           result.skipped.push({
             filePath: fullPath,
             reason: `Excluded by analysis scope (${this.analysisScope})`,
@@ -298,8 +303,12 @@ export class FileScanner {
     return /\.(tsx?|jsx?)$/u.test(filePath);
   }
 
-  private isExcluded(filePath: string): boolean {
-    return this.excludePatterns.some((pattern) => pattern.test(filePath));
+  private isExcluded(relativePath: string): boolean {
+    return this.excludePatterns.some((pattern) => pattern.test(relativePath));
+  }
+
+  private toRelativePath(rootPath: string, fullPath: string): string {
+    return path.relative(rootPath, fullPath).split(path.sep).join("/");
   }
 
   private toRegExp(pattern: string): RegExp {

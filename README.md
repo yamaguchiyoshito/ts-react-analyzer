@@ -34,6 +34,8 @@ node dist/src/cli.js init ./my-app
 node dist/src/cli.js analyze ./my-app
 
 # 2. コードを変更した後、悪化した箇所だけを確認する
+#    差分は analysis_diff.*、今回の解析結果は analysis_current_report.* に出力され、
+#    baseline (analysis_report.json) は上書きされないので何度でも同じ基準点と比較できます
 node dist/src/cli.js diff ./my-app --baseline ./my-app/analysis-reports/analysis_report.json
 
 # 3. 出荷前に品質レポートで審査する
@@ -70,5 +72,5 @@ npm test
 ## 注意
 
 - Node.js 標準 API を前提にしているため、古い Node では動きません
-- `diff` は baseline に `analyze` が出力した `*_report.json` を要求します
+- `diff` は baseline に `analyze` が出力した `*_report.json` を要求します。diff 自身の解析結果は `*_current_report.*` に書かれ、baseline は上書きされません
 - HTML レポート内の `file://` リンクの開き方は利用環境に依存します

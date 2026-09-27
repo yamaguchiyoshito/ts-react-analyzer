@@ -5,9 +5,9 @@ import { watch as watchFileSystem } from "node:fs";
 import readline from "node:readline/promises";
 import { parseArgs } from "node:util";
 
-import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, ManualQualityInputLoader, QualityDiffGenerator, QualityReportGenerator, ReportGenerator } from "./core/index.js";
+import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, ManualQualityInputError, ManualQualityInputLoader, QualityDiffGenerator, QualityReportGenerator, ReportGenerator, selectBlockingRegressionMetrics, validateQualityGateMetricIds } from "./core/index.js";
 import { shouldIncludeInAnalysisScope } from "./core/FileConventions.js";
-import type { AnalysisConfig, AnalysisDiffReport, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, OutputFormat, ParseIssue, PersistedAnalysisReport, QualityDiffReport, QualityMetricDiffEntry, QualityReport } from "./types/index.js";
+import type { AnalysisConfig, AnalysisDiffReport, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, OutputFormat, ParseIssue, PersistedAnalysisReport, QualityDiffReport, QualityMetricDiffEntry, QualityReport, SkippedFile } from "./types/index.js";
 
 interface RunArtifacts {
   results: AnalysisResult[];
@@ -237,14 +237,27 @@ async function loadBaselineReport<T>(baselinePath: string, createHint: string): 
   }
 }
 
-async function handleCommandError(error: unknown, logger: Logger, logMessage: string): Promise<number> {
+async function handleCommandError(
+  error: unknown,
+  logger: Logger,
+  logMessage: string,
+  options: { verbose?: boolean } = {},
+): Promise<number> {
+  const stack = error instanceof Error ? error.stack : undefined;
   if (error instanceof CliUserError) {
     console.error(`エラー: ${error.message}`);
-    logger.error(logMessage, { error: error.message.split("\n")[0] });
+    logger.error(logMessage, { error: error.message.split("\n")[0], stack });
   } else {
-    logger.error(logMessage, {
-      error: error instanceof Error ? error.message : String(error),
-    });
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`エラー: ${message}`);
+    if (!options.verbose) {
+      console.error(`  詳細 (スタックトレース) はログファイルに記録しました。--verbose を付けると標準エラーにも出力します。`);
+    }
+    // スタックトレースは常にログファイルへ残す。画面には --verbose のときだけ出す
+    logger.error(logMessage, { error: message, stack });
+  }
+  if (options.verbose && stack) {
+    console.error(stack);
   }
   await logger.close();
   return 1;
@@ -302,20 +315,81 @@ function printAnalyzeSummary(report: PersistedAnalysisReport, config: AnalysisCo
     lines.push(`  最優先ファイル: ${primary ? primary.displayPath ?? primary.path : "なし"}`);
     lines.push(`  優先改修候補: ${summary.topHotSpots.length} 件 / ${summary.cycleStatus}`);
   }
+  const excludedLine = formatExcludedSkipsLine(report.skippedFiles ?? [], report.projectRoot);
+  if (excludedLine) {
+    lines.push(excludedLine);
+  }
   printOutputFiles(lines, config.outputDir, listReportFiles(config.filePrefix, config.outputFormats, "analyze"), "まずこのファイルから読み始めてください");
   console.log(lines.join("\n"));
+}
+
+// 除外パターンでスキップしたディレクトリ/ファイルを 1 行で知らせる。
+// src/build/ のようにプロジェクト内部の階層が既定の除外に巻き込まれても気づけるよう、
+// ルート直下 (node_modules, dist など) より深い階層のパスを先に例示する。
+function formatExcludedSkipsLine(skippedFiles: SkippedFile[], projectRoot?: string): string | undefined {
+  const excluded = skippedFiles.filter((skipped) => skipped.reason === "Excluded pattern match");
+  if (excluded.length === 0) {
+    return undefined;
+  }
+
+  const toRelative = (filePath: string): string => {
+    if (projectRoot && path.isAbsolute(filePath)) {
+      const relativePath = path.relative(projectRoot, filePath);
+      if (relativePath && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)) {
+        return relativePath.split(path.sep).join("/");
+      }
+    }
+    return filePath.split(path.sep).join("/");
+  };
+  const relativePaths = excluded.map((skipped) => toRelative(skipped.filePath));
+  const nested = relativePaths.filter((relativePath) => relativePath.includes("/"));
+  const topLevel = relativePaths.filter((relativePath) => !relativePath.includes("/"));
+  const examples = [...nested, ...topLevel].slice(0, 3);
+  const suffix = excluded.length > examples.length ? " ..." : "";
+  return `  除外: ${excluded.length} 件のディレクトリ/ファイルを既定の除外設定でスキップしました (${examples.join(", ")}${suffix})`;
+}
+
+/** diff が今回の解析結果を書き出す接頭辞。baseline (`<prefix>_report.json`) を上書きしないよう別名にする */
+function diffCurrentPrefix(prefix: string): string {
+  return `${prefix}_current`;
+}
+
+function listDiffOutputFiles(config: AnalysisConfig): string[] {
+  return [
+    `${config.filePrefix}_diff.md`,
+    `${config.filePrefix}_diff.html`,
+    `${config.filePrefix}_diff.json`,
+    ...listReportFiles(diffCurrentPrefix(config.filePrefix), config.outputFormats, "analyze"),
+  ];
 }
 
 function printDiffSummary(diff: AnalysisDiffReport, config: AnalysisConfig): void {
   const lines: string[] = [""];
   lines.push(`✔ 差分解析が完了しました: 変更 ${diff.summary.changedFiles} / 追加 ${diff.summary.addedFiles} / 削除 ${diff.summary.removedFiles}`);
-  printOutputFiles(lines, config.outputDir, [
-    `${config.filePrefix}_diff.md`,
-    `${config.filePrefix}_diff.html`,
-    `${config.filePrefix}_diff.json`,
-  ], "まずこのファイルから読み始めてください");
+  printOutputFiles(lines, config.outputDir, listDiffOutputFiles(config), "まずこのファイルから読み始めてください");
+  lines.push(`  baseline (${diff.baselinePath}) は上書きされません。今回の解析結果は ${diffCurrentPrefix(config.filePrefix)}_report.* に出力されます`);
   console.log(lines.join("\n"));
 }
+
+/**
+ * baseline が diff 自身の出力ファイルと同じパスなら、比較元を壊してしまうため実行前に止める。
+ * (旧バージョンは `<prefix>_report.json` を diff が上書きし、2 回目以降の比較が前回実行との差分になっていた)
+ */
+function assertBaselineIsNotDiffOutput(baselinePath: string, config: AnalysisConfig): void {
+  const resolvedBaseline = path.resolve(baselinePath);
+  const collision = listDiffOutputFiles(config)
+    .map((file) => path.join(config.outputDir, file))
+    .find((candidate) => path.resolve(candidate) === resolvedBaseline);
+  if (collision) {
+    throw new CliUserError([
+      `baseline が diff の出力ファイルと同じパスです: ${resolvedBaseline}`,
+      "diff はこのファイルを上書きするため、比較元として使えません。",
+      "analyze が出力した <prefix>_report.json を --baseline に指定するか、--output / --prefix で出力先を分けてください。",
+    ].join("\n"));
+  }
+}
+
+type DiffBaselineSource = string | { path: string; report: PersistedAnalysisReport };
 
 function printQualitySummary(report: QualityReport, config: AnalysisConfig, mode: "collect" | "report" | "gate"): void {
   const lines: string[] = [""];
@@ -584,7 +658,26 @@ async function watchDiff(
   baselinePath: string,
   openReport: boolean,
 ): Promise<number> {
-  const initialCode = await diffProject(projectRoot, config, baselinePath, { openReport });
+  // baseline は最初に一度だけ読み込み、以後の再実行でも同じ内容と比較する
+  // (毎回ディスクから読み直すと、旧バージョンのように前回実行の出力と比較してしまう)
+  let baselineSource: DiffBaselineSource;
+  try {
+    baselineSource = {
+      path: baselinePath,
+      report: await loadBaselineReport<PersistedAnalysisReport>(
+        baselinePath,
+        "先に analyze を実行して baseline を作成するか、--baseline で既存の *_report.json を指定してください。",
+      ),
+    };
+  } catch (error) {
+    if (error instanceof CliUserError) {
+      console.error(`エラー: ${error.message}`);
+      return 1;
+    }
+    throw error;
+  }
+
+  const initialCode = await diffProject(projectRoot, config, baselineSource, { openReport });
   if (initialCode === 1) {
     // baseline 不在などの実行失敗は監視を始めても回復しないため終了する
     return 1;
@@ -604,7 +697,7 @@ async function watchDiff(
     running = true;
     try {
       console.log(`\n―― ${new Date().toISOString()} 変更を検知したため diff を再実行します ――`);
-      await diffProject(projectRoot, config, baselinePath, {});
+      await diffProject(projectRoot, config, baselineSource, {});
     } finally {
       running = false;
       if (pendingRerun) {
@@ -666,7 +759,7 @@ async function buildArtifacts(
     analysisScope: preferUnscopedScan ? "all" : config.analysisScope,
   }).scanProject(projectDir);
   const scopedParsedFiles = fullScanResult.parsed.filter((parsedFile) =>
-    shouldIncludeInAnalysisScope(parsedFile.filePath, config.analysisScope)
+    shouldIncludeInAnalysisScope(parsedFile.filePath, config.analysisScope, projectDir)
   );
   const scopedFilePaths = new Set(scopedParsedFiles.map((parsedFile) => parsedFile.filePath));
   const scanResult = {
@@ -685,7 +778,9 @@ async function buildArtifacts(
   const analysisCache = new AnalysisCache(config.cacheDir, projectDir, config.tsCompilerOptions);
   await analysisCache.initialize();
 
-  const dependencyAnalyzer = new DependencyAnalyzer(path.resolve(projectDir), config.tsCompilerOptions);
+  const dependencyAnalyzer = new DependencyAnalyzer(path.resolve(projectDir), config.tsCompilerOptions, {
+    pathMappings: config.pathMappings,
+  });
   const complexityAnalyzer = new ComplexityAnalyzer();
   const graphBuilder = new GraphBuilder();
   const results: AnalysisResult[] = [];
@@ -730,7 +825,9 @@ async function buildArtifacts(
 
     if (scopedFilePaths.has(parsedFile.filePath)) {
       for (const dependency of result.dependencies) {
-        if (!dependency.isExternal) {
+        // 型のみの import / export は実行時の依存を生まないため、循環検出の辺にしない
+        // (dependencies 一覧と件数には残る)
+        if (!dependency.isExternal && !dependency.isTypeOnly) {
           graphBuilder.addDependency(dependency.source, dependency.target, {
             type: dependency.type,
             isExternal: dependency.isExternal,
@@ -849,7 +946,7 @@ async function analyzeProject(
     openHtmlReportIfRequested(options.openReport, config, `${config.filePrefix}_report.html`, true);
     return 0;
   } catch (error) {
-    return handleCommandError(error, logger, "Analysis failed");
+    return handleCommandError(error, logger, "Analysis failed", { verbose: config.verbose });
   }
 }
 
@@ -887,32 +984,38 @@ async function graphProject(projectDir: string, config: AnalysisConfig): Promise
     ].join("\n"));
     return 0;
   } catch (error) {
-    return handleCommandError(error, logger, "Graph export failed");
+    return handleCommandError(error, logger, "Graph export failed", { verbose: config.verbose });
   }
 }
 
 async function diffProject(
   projectDir: string,
   config: AnalysisConfig,
-  baselinePath: string,
+  baselineSource: DiffBaselineSource,
   options: { openReport?: boolean } = {},
 ): Promise<number> {
   const logger = new Logger(config.verbose ? "DEBUG" : "INFO", config.logFile);
   await logger.initialize();
   const startTime = Date.now();
+  const baselinePath = typeof baselineSource === "string" ? baselineSource : baselineSource.path;
+  const currentPrefix = diffCurrentPrefix(config.filePrefix);
 
   try {
     logger.info("Diff started", { projectDir, baselinePath });
-    const baseline = await loadBaselineReport<PersistedAnalysisReport>(
-      baselinePath,
-      "先に analyze を実行して baseline を作成するか、--baseline で既存の *_report.json を指定してください。",
-    );
+    assertBaselineIsNotDiffOutput(baselinePath, config);
+    const baseline = typeof baselineSource === "string"
+      ? await loadBaselineReport<PersistedAnalysisReport>(
+          baselineSource,
+          "先に analyze を実行して baseline を作成するか、--baseline で既存の *_report.json を指定してください。",
+        )
+      : baselineSource.report;
     const artifacts = await buildArtifacts(projectDir, config, logger);
 
+    // 今回の解析結果は `<prefix>_current_report.*` に書き、baseline (`<prefix>_report.json`) は保持する
     const reportGenerator = new ReportGenerator();
     const currentReport = await reportGenerator.generateReports(artifacts.results, artifacts.graphMetrics, {
       outputDir: config.outputDir,
-      prefix: config.filePrefix,
+      prefix: currentPrefix,
       formats: config.outputFormats,
       complexityThreshold: config.complexityThreshold,
       executionTimeMs: Date.now() - startTime,
@@ -926,7 +1029,7 @@ async function diffProject(
       graphJson: artifacts.graphJson,
     });
 
-    const currentReportPath = path.join(config.outputDir, `${config.filePrefix}_report.json`);
+    const currentReportPath = path.join(config.outputDir, `${currentPrefix}_report.json`);
     const diffGenerator = new DiffGenerator();
     const diff = diffGenerator.compare(currentReport, baseline, baselinePath, currentReportPath, { projectRoot: projectDir });
     await diffGenerator.writeReports(diff, config.outputDir, config.filePrefix, {
@@ -974,7 +1077,7 @@ async function diffProject(
     printDiffSummary(diff, config);
     return 0;
   } catch (error) {
-    return handleCommandError(error, logger, "Diff failed");
+    return handleCommandError(error, logger, "Diff failed", { verbose: config.verbose });
   }
 }
 
@@ -1003,15 +1106,29 @@ async function qualityProject(
       : path.join(projectDir, "quality.manual.json");
     let manualInputs: ManualQualityMetricInput[] = [];
 
+    // ファイルが無いのは通常運用 (debug ログのみ)。あるのに読めないのは利用者の
+    // 修正が必要な状態なので、握りつぶさずにエラーとして終了する。
+    let manualInputExists = false;
     try {
       await fs.access(manualInputPath);
-      manualInputs = await new ManualQualityInputLoader().load(manualInputPath);
+      manualInputExists = true;
+    } catch {
+      logger.debug("Manual quality input not found", { manualInputPath });
+    }
+    if (manualInputExists) {
+      try {
+        manualInputs = await new ManualQualityInputLoader().load(manualInputPath);
+      } catch (error) {
+        if (error instanceof ManualQualityInputError) {
+          throw new CliUserError(error.message);
+        }
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new CliUserError(`手動品質入力ファイルを読み込めません: ${manualInputPath}\n${reason}`);
+      }
       logger.info("Manual quality input loaded", {
         manualInputPath,
         entries: manualInputs.length,
       });
-    } catch {
-      logger.debug("Manual quality input not found", { manualInputPath });
     }
 
     const qualityReportGenerator = new QualityReportGenerator();
@@ -1045,6 +1162,24 @@ async function qualityProject(
       // レポート書き出し前に gate 判定とベースライン比較を確定させ、
       // 「ゲート判定」「前回比」を md / html 本文へ反映する
       gate: (builtReport) => {
+        // 指標 ID の typo は「gate 対象なし」で素通りしてしまうため、レポートに
+        // 実在する ID と突き合わせて警告し、blocking が全滅なら利用者エラーにする
+        const metricIdValidation = validateQualityGateMetricIds(builtReport, config);
+        if (metricIdValidation.unknownBlockingMetricIds.length > 0) {
+          console.warn(`警告: 未知の指標 ID が --quality-gate-blocking-metrics に含まれています: ${metricIdValidation.unknownBlockingMetricIds.join(", ")}`);
+          logger.warn("Unknown quality gate blocking metric ids", { ids: metricIdValidation.unknownBlockingMetricIds });
+        }
+        if (metricIdValidation.unknownMonitoringMetricIds.length > 0) {
+          console.warn(`警告: 未知の指標 ID が --quality-gate-monitoring-metrics に含まれています: ${metricIdValidation.unknownMonitoringMetricIds.join(", ")}`);
+          logger.warn("Unknown quality gate monitoring metric ids", { ids: metricIdValidation.unknownMonitoringMetricIds });
+        }
+        if (mode === "gate" && metricIdValidation.blockingAllUnknown) {
+          throw new CliUserError([
+            `--quality-gate-blocking-metrics に指定した指標 ID がすべて未知です: ${config.qualityGateBlockingMetricIds.join(", ")}`,
+            "このままでは baseline 悪化の gate 対象が 1 件も無くなります。指標 ID は docs/quality.md の「指標 ID 一覧」か、レポート CSV の Metric ID 列を確認してください。",
+          ].join("\n"));
+        }
+
         failingAutomaticMetrics = builtReport.categories
           .flatMap((category) => category.metrics.map((metric) => ({ category: category.label, metric })))
           .filter(({ metric }) => metric.aggregation === "primary" && metric.automation === "automatic" && metric.verdict === "fail");
@@ -1175,11 +1310,17 @@ async function qualityProject(
       await logger.close();
       const offenders = blockingRegressionMetrics
         .slice(0, 3)
-        .map((metric) => `${metric.categoryLabel}/${metric.label} (${metric.baselineVerdict ?? "不明"} → ${metric.currentVerdict ?? "不明"})`)
+        .map((metric) => {
+          const evidenceLoss = metric.baselineAutomation === "automatic" && metric.currentAutomation === "manual";
+          return `${metric.categoryLabel}/${metric.label} (${metric.baselineVerdict ?? "不明"} → ${metric.currentVerdict ?? "不明"}${evidenceLoss ? "、証跡喪失" : ""})`;
+        })
         .join(", ");
+      const evidenceLossCount = blockingRegressionMetrics
+        .filter((metric) => metric.baselineAutomation === "automatic" && metric.currentAutomation === "manual")
+        .length;
       console.error([
         "",
-        `✖ quality gate: FAIL (終了コード 2) — baseline から判定が悪化した自動指標が ${blockingRegressionMetrics.length} 件あります`,
+        `✖ quality gate: FAIL (終了コード 2) — baseline から判定が悪化した、または証跡を失った自動指標が ${blockingRegressionMetrics.length} 件あります${evidenceLossCount > 0 ? ` (うち証跡喪失 ${evidenceLossCount} 件: 前回は実測できていた指標が今回 manual に落ちています)` : ""}`,
         `  上位: ${offenders}`,
         `  詳細: ${path.join(config.outputDir, `${config.filePrefix}_quality_diff.md`)}`,
       ].join("\n"));
@@ -1190,7 +1331,7 @@ async function qualityProject(
     printQualitySummary(report, config, mode);
     return 0;
   } catch (error) {
-    return handleCommandError(error, logger, "Quality analysis failed");
+    return handleCommandError(error, logger, "Quality analysis failed", { verbose: config.verbose });
   }
 }
 
@@ -1237,35 +1378,6 @@ function buildGraphWarnings(
   }
 
   return warnings;
-}
-
-function selectBlockingRegressionMetrics(
-  diff: QualityDiffReport,
-  config: AnalysisConfig,
-): QualityMetricDiffEntry[] {
-  const monitoringMetricIds = new Set(config.qualityGateMonitoringMetricIds);
-  const blockingMetricIds = new Set(config.qualityGateBlockingMetricIds);
-
-  return diff.metrics.filter((metric) => {
-    if ((metric.currentAggregation ?? metric.baselineAggregation ?? "primary") !== "primary") {
-      return false;
-    }
-    if (metric.trend !== "regressed" || metric.currentAutomation !== "automatic") {
-      return false;
-    }
-    // 同一判定内の数値悪化 (fail のまま件数増など) は差分レポートで可視化する
-    // のみとし、gate はドキュメントどおり判定の悪化 (pass->warn 等) だけで落とす
-    if (metric.baselineVerdict === metric.currentVerdict) {
-      return false;
-    }
-    if (monitoringMetricIds.has(metric.id)) {
-      return false;
-    }
-    if (blockingMetricIds.size > 0) {
-      return blockingMetricIds.has(metric.id);
-    }
-    return true;
-  });
 }
 
 async function main(): Promise<number> {
@@ -1342,6 +1454,60 @@ async function main(): Promise<number> {
   const tsConfigPath = path.join(projectRoot, "tsconfig.json");
   const dotEnvPath = path.join(projectRoot, ".env");
 
+  // 設定の組み立て (CLI / .env / 環境変数 / 設定ファイル) で値が不正なら、
+  // スタックトレースではなく理由を 1 行で示して終了する
+  let config: AnalysisConfig;
+  try {
+    config = buildConfig(parsed, configManager, { projectRoot, configPath, tsConfigPath, dotEnvPath }, { command, openReport });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`エラー: ${message}`);
+    if (parsed.values.verbose && error instanceof Error && error.stack) {
+      console.error(error.stack);
+    }
+    return 1;
+  }
+
+  if (command === "graph") {
+    return graphProject(projectRoot, config);
+  }
+  if (command === "diff") {
+    const baselinePath = typeof parsed.values.baseline === "string"
+      ? path.resolve(parsed.values.baseline)
+      : path.join(config.outputDir, `${config.filePrefix}_report.json`);
+    if (parsed.values.watch) {
+      return watchDiff(projectRoot, config, baselinePath, openReport);
+    }
+    return diffProject(projectRoot, config, baselinePath, { openReport });
+  }
+  if (command === "quality") {
+    if (!qualityMode) {
+      printHelp("quality");
+      return 1;
+    }
+    // report は collect の別名 (非推奨)。上で告知済み
+    const qualityCommandMode = qualityMode === "report" ? "collect" : qualityMode;
+    const baselinePath = qualityCommandMode === "diff"
+      ? typeof parsed.values.baseline === "string"
+        ? path.resolve(parsed.values.baseline)
+        : path.join(config.outputDir, `${config.filePrefix}_quality_report.json`)
+      : qualityCommandMode === "gate" && typeof parsed.values.baseline === "string"
+        ? path.resolve(parsed.values.baseline)
+      : undefined;
+    return qualityProject(projectRoot, config, qualityCommandMode, baselinePath, { openReport });
+  }
+
+  return analyzeProject(projectRoot, config, { openReport });
+}
+
+function buildConfig(
+  parsed: ReturnType<typeof parseCliArgs>,
+  configManager: ConfigManager,
+  paths: { projectRoot: string; configPath: string; tsConfigPath: string; dotEnvPath: string },
+  options: { command: string; openReport: boolean },
+): AnalysisConfig {
+  const { projectRoot, configPath, tsConfigPath, dotEnvPath } = paths;
+  const { command, openReport } = options;
   const cliConfig = configManager.loadFromCLI({
     output: typeof parsed.values.output === "string" ? parsed.values.output : undefined,
     format: typeof parsed.values.format === "string" ? parsed.values.format : undefined,
@@ -1394,6 +1560,18 @@ async function main(): Promise<number> {
   if (config.outputFormats.length === 0) {
     config.outputFormats = ["json", "markdown", "csv"];
   }
+  // --open は HTML レポートを前提とするため、--format に無ければこの実行に限り html を足す
+  // (diff の差分 HTML は --format に関係なく常に生成され、graph は HTML を持たない)
+  if (
+    openReport
+    && command !== "graph"
+    && command !== "diff"
+    && !config.outputFormats.includes("html")
+    && !config.outputFormats.includes("all")
+  ) {
+    config.outputFormats = [...config.outputFormats, "html"];
+    console.log("--open: --format に html が含まれていないため、この実行では html を追加して HTML レポートを生成します。");
+  }
 
   config.outputDir = path.resolve(projectRoot, config.outputDir);
   config.cacheDir = path.resolve(projectRoot, config.cacheDir);
@@ -1402,36 +1580,7 @@ async function main(): Promise<number> {
     config.manualInputPath = path.resolve(projectRoot, config.manualInputPath);
   }
 
-  if (command === "graph") {
-    return graphProject(projectRoot, config);
-  }
-  if (command === "diff") {
-    const baselinePath = typeof parsed.values.baseline === "string"
-      ? path.resolve(parsed.values.baseline)
-      : path.join(config.outputDir, `${config.filePrefix}_report.json`);
-    if (parsed.values.watch) {
-      return watchDiff(projectRoot, config, baselinePath, openReport);
-    }
-    return diffProject(projectRoot, config, baselinePath, { openReport });
-  }
-  if (command === "quality") {
-    if (!qualityMode) {
-      printHelp("quality");
-      return 1;
-    }
-    // report は collect の別名 (非推奨)。上で告知済み
-    const qualityCommandMode = qualityMode === "report" ? "collect" : qualityMode;
-    const baselinePath = qualityCommandMode === "diff"
-      ? typeof parsed.values.baseline === "string"
-        ? path.resolve(parsed.values.baseline)
-        : path.join(config.outputDir, `${config.filePrefix}_quality_report.json`)
-      : qualityCommandMode === "gate" && typeof parsed.values.baseline === "string"
-        ? path.resolve(parsed.values.baseline)
-      : undefined;
-    return qualityProject(projectRoot, config, qualityCommandMode, baselinePath, { openReport });
-  }
-
-  return analyzeProject(projectRoot, config, { openReport });
+  return config;
 }
 
 const exitCode = await main();

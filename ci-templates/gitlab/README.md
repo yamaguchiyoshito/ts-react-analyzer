@@ -68,7 +68,7 @@ variables:
 
 失敗したジョブの成果物 (artifacts) にレポートが入っています。
 
-- MR ゲートに落ちた → `<prefix>_diff.md` で「どのファイルが、どれだけ危険になったか」を確認 (→ [レポートの読み方](../../docs/guide.md#毎日--pr-ごとの使い方--悪化だけを見る))
+- MR ゲートに落ちた → `<prefix>_diff.md` で「どのファイルが、どれだけ危険になったか」を確認 (→ [レポートの読み方](../../docs/guide.md#毎日--pr-ごとの使い方--悪化だけを見る))。MR 時点の全体解析は `<prefix>_current_report.md` にあります (baseline の `<prefix>_report.json` は diff では上書きされません)
 - 出荷ゲートに落ちた → `<prefix>_quality_report.md` の `FAIL` と、`<prefix>_quality_diff.md` の悪化指標を確認 (→ [品質レポートの読み方](../../docs/quality.md))
 
 ## 補足

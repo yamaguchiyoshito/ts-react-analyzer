@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import ts from "typescript";
 
+import { isSolutionStyleConfig, resolveTsConfigLeaves, type ResolvedTsConfig } from "./TsConfigResolver.js";
+
 export interface TypeCheckIssue {
   filePath: string;
   line: number;
@@ -113,6 +115,65 @@ export class TypeCheckAnalyzer {
       { noEmit: true },
       resolvedTsConfigPath,
     );
+
+    // Vite / Next テンプレートの solution 型 tsconfig (files: [] + references) は自身に
+    // 検査対象を持たないため、references 先の末端設定をそれぞれ型検査して合算する
+    if (parsed.errors.length === 0 && isSolutionStyleConfig(parsed)) {
+      return this.analyzeSolutionTsConfig(projectRoot, resolvedTsConfigPath, parsed, options);
+    }
+
+    return this.analyzeParsedTsConfig(projectRoot, resolvedTsConfigPath, parsed, options, new Set<string>());
+  }
+
+  private analyzeSolutionTsConfig(
+    projectRoot: string,
+    resolvedTsConfigPath: string,
+    parsed: ts.ParsedCommandLine,
+    options: TypeCheckAnalyzerOptions,
+  ): TypeCheckSummary {
+    let leaves: ResolvedTsConfig[];
+    try {
+      leaves = resolveTsConfigLeaves(resolvedTsConfigPath, { noEmit: true }).leaves;
+    } catch (error) {
+      leaves = [];
+      options.onProgress?.("TypeScript project references resolution failed", {
+        tsConfigPath: resolvedTsConfigPath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    if (leaves.length === 0) {
+      return {
+        totalErrors: 0,
+        checkedFiles: 0,
+        issues: [],
+        tsConfigPath: resolvedTsConfigPath,
+        skippedReason: "references 先に型検査対象の tsconfig が見つからないため型検査をスキップしました。",
+        strictnessSummary: this.collectStrictnessSummary(parsed.options, resolvedTsConfigPath),
+      };
+    }
+
+    options.onProgress?.("TypeScript project references resolved", {
+      tsConfigPath: resolvedTsConfigPath,
+      leafTsConfigPaths: leaves.map((leaf) => leaf.tsConfigPath),
+    });
+
+    // 複数の末端設定に同じファイルが含まれる場合は最初の設定でだけ検査し、重複計上を避ける
+    const claimedFiles = new Set<string>();
+    const summaries = leaves.map((leaf) =>
+      this.analyzeParsedTsConfig(projectRoot, leaf.tsConfigPath, leaf.parsed, options, claimedFiles)
+    );
+    const merged = this.mergeSummaries(summaries, leaves.map((leaf) => leaf.tsConfigPath));
+    return { ...merged, tsConfigPath: resolvedTsConfigPath };
+  }
+
+  private analyzeParsedTsConfig(
+    projectRoot: string,
+    resolvedTsConfigPath: string,
+    parsed: ts.ParsedCommandLine,
+    options: TypeCheckAnalyzerOptions,
+    claimedFiles: Set<string>,
+  ): TypeCheckSummary {
     const strictnessSummary = this.collectStrictnessSummary(parsed.options, resolvedTsConfigPath);
 
     if (parsed.errors.length > 0) {
@@ -127,9 +188,17 @@ export class TypeCheckAnalyzer {
 
     const includedFilePathSet = this.createIncludedFilePathSet(options.includedFilePaths);
     const ownProjectFilePathSet = new Set(parsed.fileNames.map((fileName) => path.resolve(fileName)));
-    const rootNames = includedFilePathSet
-      ? parsed.fileNames.filter((fileName) => includedFilePathSet.has(path.resolve(fileName)))
-      : parsed.fileNames;
+    const rootNames = parsed.fileNames.filter((fileName) => {
+      const resolvedFileName = path.resolve(fileName);
+      if (includedFilePathSet && !includedFilePathSet.has(resolvedFileName)) {
+        return false;
+      }
+      if (claimedFiles.has(resolvedFileName)) {
+        return false;
+      }
+      claimedFiles.add(resolvedFileName);
+      return true;
+    });
 
     if (rootNames.length === 0) {
       return {
@@ -165,7 +234,26 @@ export class TypeCheckAnalyzer {
       incremental: Boolean(options.cacheDir),
       tsConfigPath: resolvedTsConfigPath,
     });
-    const rawDiagnostics = this.collectDiagnostics(rootNames, parsed, resolvedTsConfigPath, options);
+    // TypeScript 自体が非常に深い import 連鎖で RangeError (スタック溢れ) を投げることがある。
+    // その場合は quality 実行全体を落とさず、型検査だけをスキップ扱い (verdict manual) に落とす。
+    let rawDiagnostics: readonly ts.Diagnostic[];
+    try {
+      rawDiagnostics = this.collectDiagnostics(rootNames, parsed, resolvedTsConfigPath, options);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      options.onProgress?.("TypeScript type check failed", {
+        tsConfigPath: resolvedTsConfigPath,
+        error: message,
+      });
+      return {
+        totalErrors: 0,
+        checkedFiles: 0,
+        issues: [],
+        tsConfigPath: resolvedTsConfigPath,
+        skippedReason: `型検査の実行中にエラーが発生したため型検査をスキップしました (${message})。`,
+        strictnessSummary,
+      };
+    }
     const diagnostics = this.filterDiagnosticsForScope(
       rawDiagnostics.filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error),
       ownProjectFilePathSet,

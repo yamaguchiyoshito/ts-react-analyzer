@@ -1,4 +1,5 @@
 export * from "./AnalysisCache.js";
+export * from "./ArtifactJson.js";
 export * from "./BrowserAuditAnalyzer.js";
 export * from "./ComplexityAnalyzer.js";
 export * from "./ConfigManager.js";
@@ -11,9 +12,11 @@ export * from "./GraphBuilder.js";
 export * from "./Logger.js";
 export * from "./ManualQualityInputLoader.js";
 export * from "./QualityDiffGenerator.js";
+export * from "./QualityGate.js";
 export * from "./QualityReportGenerator.js";
 export * from "./ReportGenerator.js";
 export * from "./SecurityArtifactAnalyzer.js";
 export * from "./TestArtifactAnalyzer.js";
+export * from "./TsConfigResolver.js";
 export * from "./TypeCheckAnalyzer.js";
 export * from "./UiTestArtifactAnalyzer.js";

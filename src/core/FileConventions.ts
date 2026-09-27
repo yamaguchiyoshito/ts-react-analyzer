@@ -5,6 +5,12 @@ import type { AnalysisScope } from "../types/index.js";
 export interface FileTypeClassificationOptions {
   componentName?: string;
   hasChildren?: boolean;
+  /**
+   * 解析対象プロジェクトのルート。指定すると絶対パスをプロジェクト相対に変換してから分類する。
+   * CI の /home/runner/work/app/app や /home/me/tests/proj のような上位ディレクトリ名が
+   * Test / Fixture などの判定へ混入するのを防ぐ。
+   */
+  projectRoot?: string;
 }
 
 export interface FileTypePurposeDefinition {
@@ -152,21 +158,52 @@ const SOURCE_ONLY_EXCLUDED_FILE_TYPES = new Set([
 const classificationCache = new Map<string, string>();
 const CLASSIFICATION_CACHE_LIMIT = 100_000;
 
+function isAbsoluteLikePath(filePath: string): boolean {
+  return path.isAbsolute(filePath) || /^[A-Za-z]:[\\/]/u.test(filePath) || /^[\\/]{2}/u.test(filePath);
+}
+
+/**
+ * 分類・スコープ判定に使うパスをプロジェクト相対 (スラッシュ区切り) へ正規化する。
+ *
+ * - 相対パスはそのまま (区切りだけ統一して) 返す
+ * - projectRoot 配下の絶対パスは projectRoot からの相対パスへ変換する
+ * - projectRoot 外、または projectRoot 不明の絶対パスは basename だけを返す
+ *
+ * 最後のケースで親ディレクトリを捨てるのは、プロジェクトより上位のディレクトリ名
+ * (例: /home/me/tests/proj の "tests") を分類ヒューリスティックへ渡さないためである。
+ */
+export function toProjectRelativePath(filePath: string, projectRoot?: string): string {
+  const normalized = filePath.replace(/\\/gu, "/");
+  if (!isAbsoluteLikePath(filePath)) {
+    return normalized.replace(/^\.\//u, "");
+  }
+
+  if (projectRoot) {
+    const relativePath = path.relative(path.resolve(projectRoot), path.resolve(filePath));
+    if (relativePath && !relativePath.startsWith("..") && !isAbsoluteLikePath(relativePath)) {
+      return relativePath.split(path.sep).join("/");
+    }
+  }
+
+  return normalized.slice(normalized.lastIndexOf("/") + 1);
+}
+
 export function classifyFileType(filePath: string, options: FileTypeClassificationOptions = {}): string {
+  const relativePath = toProjectRelativePath(filePath, options.projectRoot);
   const cacheable = options.componentName === undefined && options.hasChildren === undefined;
   if (cacheable) {
-    const cached = classificationCache.get(filePath);
+    const cached = classificationCache.get(relativePath);
     if (cached !== undefined) {
       return cached;
     }
   }
 
-  const fileType = computeFileType(filePath, options);
+  const fileType = computeFileType(relativePath, options);
   if (cacheable) {
     if (classificationCache.size >= CLASSIFICATION_CACHE_LIMIT) {
       classificationCache.clear();
     }
-    classificationCache.set(filePath, fileType);
+    classificationCache.set(relativePath, fileType);
   }
   return fileType;
 }
@@ -302,12 +339,16 @@ function computeFileType(filePath: string, options: FileTypeClassificationOption
   return "Shared";
 }
 
-export function shouldIncludeInAnalysisScope(filePath: string, scope: AnalysisScope): boolean {
+export function shouldIncludeInAnalysisScope(
+  filePath: string,
+  scope: AnalysisScope,
+  projectRoot?: string,
+): boolean {
   if (scope === "all") {
     return true;
   }
 
-  return !SOURCE_ONLY_EXCLUDED_FILE_TYPES.has(classifyFileType(filePath));
+  return !SOURCE_ONLY_EXCLUDED_FILE_TYPES.has(classifyFileType(filePath, { projectRoot }));
 }
 
 function getPackageSourceSegments(filePath: string): string[] {

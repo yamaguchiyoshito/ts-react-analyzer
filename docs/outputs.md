@@ -23,6 +23,7 @@
 - リスク分布の 3 軸表示 (複雑度・構造・型安全性)
 - 型安全性の詳細 (`any`、assertion、non-null assertion、`ts-ignore`)
 - 依存分析 — 循環依存、SCC、weak cluster、PageRank、graph warnings
+  - 型のみの import / export (`import type { X }`、`import { type X }`、`export type { X } from`) は実行時の依存を生まないため、依存グラフの辺にせず循環依存の検出対象から除外する。依存一覧 (`<prefix>_dependencies.csv`、`<prefix>_report.json` の `dependencies`) と依存件数には残り、JSON では `isTypeOnly: true` で識別できる
 - 外部依存の文脈別集計 (runtime / storybook / test / dev)
 - 3x3 マトリクス要約と File Type 分布
 - ディレクトリ目的の定義表と、目的整合の改善提案 (→ [File Type とディレクトリ目的](file-types.md))
@@ -42,11 +43,15 @@
 | `<prefix>_diff.md` | 今回の変更の影響サマリー。changed files、hot spot delta、影響度スコア |
 | `<prefix>_diff.html` | 影響サブツリーの可視化。subtree の drill-down、優先度スコア、ソースリンク |
 | `<prefix>_diff.json` | 差分の完全データ。file diff、graph delta、impact subtree |
+| `<prefix>_current_report.md` / `.json` / `.html` | diff 実行時点の解析結果 (`analyze` と同じ内容)。`--format` に従います |
+| `<prefix>_current_files.csv` など | diff 実行時点の CSV (`--format` に csv を含む場合) |
+
+baseline に指定した `<prefix>_report.json` は diff では上書きされません。今回の状態は `<prefix>_current_*` に書かれるため、同じ基準点に対して繰り返し比較できます。
 
 ### diff レポートに載っている情報
 
 - added / removed / changed / unchanged の内訳
-- 複雑度差分、依存差分、warning 差分
+- 複雑度差分、依存差分、関数数差分、コード行数差分、warning 差分 (いずれかが変化したファイルを changed とみなします)
 - 変更の影響が波及するサブツリー (changed subtree)
 - 影響を受けるファイルの優先度スコア
 - root ごとの subtree metrics

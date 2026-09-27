@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { formatArtifactWarning, readTextArtifact } from "./ArtifactJson.js";
+
 export interface JUnitSummary {
   totalTests: number;
   passedTests: number;
@@ -32,6 +34,8 @@ export interface TestArtifactSummary {
   junit: JUnitSummary | null;
   coverage: CoverageSummary | null;
   vitest: VitestSummary | null;
+  /** 名前は一致したが読めなかった / 形式が違ったため無視した成果物 */
+  warnings: string[];
 }
 
 export class TestArtifactAnalyzer {
@@ -39,11 +43,13 @@ export class TestArtifactAnalyzer {
     const junitFiles = await this.findJUnitFiles(projectRoot);
     const coverageFiles = await this.findCoverageFiles(projectRoot);
     const vitest = await this.detectVitest(projectRoot);
+    const warnings: string[] = [];
 
     return {
-      junit: junitFiles.length > 0 ? await this.parseJUnitFiles(projectRoot, junitFiles) : null,
-      coverage: coverageFiles.length > 0 ? await this.parseCoverageFiles(projectRoot, coverageFiles) : null,
+      junit: junitFiles.length > 0 ? await this.parseJUnitFiles(projectRoot, junitFiles, warnings) : null,
+      coverage: coverageFiles.length > 0 ? await this.parseCoverageFiles(projectRoot, coverageFiles, warnings) : null,
       vitest,
+      warnings,
     };
   }
 
@@ -100,14 +106,27 @@ export class TestArtifactAnalyzer {
     return Array.from(files).sort();
   }
 
-  private async parseJUnitFiles(projectRoot: string, files: string[]): Promise<JUnitSummary> {
+  private async parseJUnitFiles(projectRoot: string, files: string[], warnings: string[]): Promise<JUnitSummary | null> {
     let totalTests = 0;
     let failedTests = 0;
     let skippedTests = 0;
     const executedTestFiles = new Set<string>();
+    const acceptedFiles: string[] = [];
 
     for (const filePath of files) {
-      const xml = await fs.readFile(filePath, "utf8");
+      const read = await readTextArtifact(filePath);
+      if (!read.ok) {
+        warnings.push(formatArtifactWarning(filePath, read.error));
+        continue;
+      }
+      const xml = read.value;
+      // ファイル名の (junit|result) 一致だけでは他ツールの XML も拾うため、
+      // JUnit 形式の証である <testsuite 要素を必須にする
+      if (!/<testsuite\b/iu.test(xml)) {
+        warnings.push(formatArtifactWarning(filePath, "JUnit 形式 (<testsuite>) ではないため無視しました"));
+        continue;
+      }
+      acceptedFiles.push(filePath);
       const suiteTags = Array.from(xml.matchAll(/<testsuite\b[^>]*>/gu));
       const testcases = this.extractJUnitTestCases(xml);
 
@@ -144,6 +163,10 @@ export class TestArtifactAnalyzer {
       }
     }
 
+    if (acceptedFiles.length === 0) {
+      return null;
+    }
+
     const passedTests = Math.max(0, totalTests - failedTests - skippedTests);
 
     return {
@@ -151,7 +174,7 @@ export class TestArtifactAnalyzer {
       passedTests,
       failedTests,
       skippedTests,
-      files,
+      files: acceptedFiles,
       executedTestFiles: Array.from(executedTestFiles).sort(),
     };
   }
@@ -180,11 +203,18 @@ export class TestArtifactAnalyzer {
     return cases;
   }
 
-  private async parseCoverageFiles(projectRoot: string, files: string[]): Promise<CoverageSummary> {
+  private async parseCoverageFiles(projectRoot: string, files: string[], warnings: string[]): Promise<CoverageSummary | null> {
     const sourceFiles = new Map<string, { lineFound: number; lineHit: number }>();
+    const acceptedFiles: string[] = [];
 
     for (const filePath of files) {
-      const content = await fs.readFile(filePath, "utf8");
+      const read = await readTextArtifact(filePath);
+      if (!read.ok) {
+        warnings.push(formatArtifactWarning(filePath, read.error));
+        continue;
+      }
+      acceptedFiles.push(filePath);
+      const content = read.value;
       let currentSourcePath: string | null = null;
       let currentLineFound = 0;
       let currentLineHit = 0;
@@ -227,6 +257,10 @@ export class TestArtifactAnalyzer {
       flushRecord();
     }
 
+    if (acceptedFiles.length === 0) {
+      return null;
+    }
+
     const summarizedSourceFiles = Array.from(sourceFiles.entries())
       .map(([filePath, summary]) => ({
         filePath,
@@ -242,7 +276,7 @@ export class TestArtifactAnalyzer {
       lineFound,
       lineHit,
       lineCoverage: lineFound > 0 ? (lineHit / lineFound) * 100 : null,
-      files,
+      files: acceptedFiles,
       sourceFiles: summarizedSourceFiles,
     };
   }

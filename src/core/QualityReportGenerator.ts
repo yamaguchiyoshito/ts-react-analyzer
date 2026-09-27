@@ -71,6 +71,61 @@ interface CategoryDescriptor {
   label: string;
 }
 
+interface PhaseFailure {
+  name: string;
+  message: string;
+}
+
+const PHASE_NAMES = {
+  browserAudits: "Quality phase: browser audits",
+  testArtifacts: "Quality phase: test artifacts",
+  uiTestArtifacts: "Quality phase: UI test artifacts",
+  apiArtifacts: "Quality phase: API artifacts",
+  securityArtifacts: "Quality phase: security artifacts",
+  dangerousHtml: "Quality phase: dangerous HTML scan",
+  i18nText: "Quality phase: i18n text scan",
+  secretScan: "Quality phase: secret scan",
+  visualConsumers: "Quality phase: visual consumer scan",
+  responsibility: "Quality phase: responsibility scan",
+  zodAdoption: "Quality phase: zod adoption scan",
+  ciDetection: "Quality phase: CI detection",
+  documentation: "Quality phase: documentation detection",
+  dependencySummary: "Quality phase: dependency summary",
+  typeCheck: "Quality phase: type check",
+  testPresence: "Quality phase: test presence scan",
+  workspaceSegments: "Quality phase: workspace segment summary",
+  featureSummaries: "Quality phase: feature summary",
+} as const;
+
+// フェーズが失敗したときに「収集失敗」へ落とす指標。フェーズの fallback 値は
+// 空の集計結果なので、そのまま判定すると 0 件 = pass に見えてしまう。
+const PHASE_METRIC_IDS: Record<string, string[]> = {
+  [PHASE_NAMES.browserAudits]: ["wcag_aa", "lighthouse_performance", "lcp", "tti"],
+  [PHASE_NAMES.testArtifacts]: ["unit_pass_rate", "coverage_rate"],
+  [PHASE_NAMES.uiTestArtifacts]: ["storybook_pass_rate", "e2e_pass_rate"],
+  [PHASE_NAMES.apiArtifacts]: ["openapi_contract", "timeout_retry", "msw_alignment"],
+  [PHASE_NAMES.securityArtifacts]: ["dependency_vulnerabilities"],
+  [PHASE_NAMES.dangerousHtml]: ["dangerous_html"],
+  [PHASE_NAMES.i18nText]: ["hardcoded_jsx_text"],
+  [PHASE_NAMES.secretScan]: ["secret_indicators"],
+  [PHASE_NAMES.visualConsumers]: ["design_system_usage_rate", "bespoke_ui_file_count"],
+  [PHASE_NAMES.responsibility]: ["high_responsibility_components"],
+  [PHASE_NAMES.zodAdoption]: ["zod_adoption"],
+  [PHASE_NAMES.ciDetection]: ["ci_presence"],
+  [PHASE_NAMES.documentation]: ["documentation_presence"],
+  [PHASE_NAMES.dependencySummary]: ["external_package_count"],
+  [PHASE_NAMES.typeCheck]: ["typescript_errors", "tsconfig_type_safety"],
+  [PHASE_NAMES.testPresence]: [
+    "matching_test_file_presence",
+    "route_test_file_presence",
+    "feature_test_file_presence",
+    "form_test_file_presence",
+    "ui_test_file_presence",
+  ],
+};
+
+const ARTIFACT_WARNING_EVIDENCE_LABEL = "取込警告";
+
 interface VisualConsumerSummary {
   total: number;
   designSystemUsers: number;
@@ -234,19 +289,36 @@ export class QualityReportGenerator {
     this.testPresenceSettings = this.cloneTestPresenceSettings(input.testPresenceSettings ?? DEFAULT_TEST_PRESENCE_SETTINGS);
     const strictQualityAnalysisResults = input.analysisResults.filter((result) => this.isStrictQualityCheckTargetFile(result.filePath));
     const strictQualityParsedFiles = input.parsedFiles.filter((parsedFile) => this.isStrictQualityCheckTargetFile(parsedFile.filePath));
+    // フェーズが 1 つ失敗しても残りの指標は報告する。失敗したフェーズは記録し、
+    // 依存する指標を後段で manual (収集失敗) に落とす。Promise.all 配下で
+    // 例外を素通しすると、成果物 1 つの破損でレポート全体が消える。
+    const phaseFailures: PhaseFailure[] = [];
     const runPhase = async <T>(
       name: string,
       task: () => Promise<T> | T,
+      fallback: () => T,
       metadata?: Record<string, unknown>,
     ): Promise<T> => {
       const startedAt = Date.now();
       onProgress?.(`${name} started`, metadata);
-      const result = await task();
-      onProgress?.(`${name} completed`, {
-        ...(metadata ?? {}),
-        durationMs: Date.now() - startedAt,
-      });
-      return result;
+      try {
+        const result = await task();
+        onProgress?.(`${name} completed`, {
+          ...(metadata ?? {}),
+          durationMs: Date.now() - startedAt,
+        });
+        return result;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        phaseFailures.push({ name, message });
+        onProgress?.(`${name} failed`, {
+          ...(metadata ?? {}),
+          durationMs: Date.now() - startedAt,
+          error: message,
+          ...(error instanceof Error && error.stack ? { stack: error.stack } : {}),
+        });
+        return fallback();
+      }
     };
     // 型検査は同期実行でイベントループを塞ぐため配列の最後に置き、
     // アーティファクト走査などの非同期 I/O を先に発行させる
@@ -267,37 +339,82 @@ export class QualityReportGenerator {
       externalPackageCount,
       rawTypeCheckSummary,
     ] = await Promise.all([
-      runPhase("Quality phase: browser audits", () => new BrowserAuditAnalyzer().analyzeProject(input.projectRoot)),
-      runPhase("Quality phase: test artifacts", () => new TestArtifactAnalyzer().analyzeProject(input.projectRoot)),
-      runPhase("Quality phase: UI test artifacts", () => new UiTestArtifactAnalyzer().analyzeProject(input.projectRoot)),
-      runPhase("Quality phase: API artifacts", () => new ApiArtifactAnalyzer().analyzeProject(input.projectRoot, input.parsedFiles)),
-      runPhase("Quality phase: security artifacts", () => new SecurityArtifactAnalyzer().analyzeProject(input.projectRoot)),
-      runPhase("Quality phase: dangerous HTML scan", () => this.collectDangerousHtml(strictQualityParsedFiles), { files: strictQualityParsedFiles.length }),
-      runPhase("Quality phase: i18n text scan", () => this.collectHardcodedJsxText(input.parsedFiles), { files: input.parsedFiles.length }),
-      runPhase("Quality phase: secret scan", () => this.collectSecretIndicators(strictQualityParsedFiles), { files: strictQualityParsedFiles.length }),
-      runPhase("Quality phase: visual consumer scan", () => this.collectVisualConsumers(input.analysisResults, input.parsedFiles), { files: input.analysisResults.length }),
-      runPhase("Quality phase: responsibility scan", () => this.collectHighResponsibilityComponents(strictQualityAnalysisResults), { files: strictQualityAnalysisResults.length }),
-      runPhase("Quality phase: zod adoption scan", () => this.collectZodAdoption(input.parsedFiles), { files: input.parsedFiles.length }),
-      runPhase("Quality phase: CI detection", () => this.collectCiPresence(input.projectRoot)),
-      runPhase("Quality phase: documentation detection", () => this.collectDocumentationPresence(input.projectRoot)),
-      runPhase("Quality phase: dependency summary", () => this.collectExternalPackageCount(input.analysisResults), { files: input.analysisResults.length }),
       runPhase(
-        "Quality phase: type check",
+        PHASE_NAMES.browserAudits,
+        () => new BrowserAuditAnalyzer().analyzeProject(input.projectRoot),
+        () => ({ axe: null, lighthouse: null, warnings: [] }),
+      ),
+      runPhase(
+        PHASE_NAMES.testArtifacts,
+        () => new TestArtifactAnalyzer().analyzeProject(input.projectRoot),
+        () => ({ junit: null, coverage: null, vitest: null, warnings: [] }),
+      ),
+      runPhase(
+        PHASE_NAMES.uiTestArtifacts,
+        () => new UiTestArtifactAnalyzer().analyzeProject(input.projectRoot),
+        () => ({ playwright: null, storybook: null, warnings: [] }),
+      ),
+      runPhase(
+        PHASE_NAMES.apiArtifacts,
+        () => new ApiArtifactAnalyzer().analyzeProject(input.projectRoot, input.parsedFiles),
+        () => ({
+          openApi: null,
+          msw: { apiFileCount: 0, handlerFiles: [], handlerCount: 0 },
+          timeoutRetry: { apiFileCount: 0, resilientFiles: [] },
+          warnings: [],
+        }),
+      ),
+      runPhase(
+        PHASE_NAMES.securityArtifacts,
+        () => new SecurityArtifactAnalyzer().analyzeProject(input.projectRoot),
+        () => ({ tools: [], warnings: [] }),
+      ),
+      runPhase(PHASE_NAMES.dangerousHtml, () => this.collectDangerousHtml(strictQualityParsedFiles), () => [], { files: strictQualityParsedFiles.length }),
+      runPhase(PHASE_NAMES.i18nText, () => this.collectHardcodedJsxText(input.parsedFiles), () => [], { files: input.parsedFiles.length }),
+      runPhase(PHASE_NAMES.secretScan, () => this.collectSecretIndicators(strictQualityParsedFiles), () => [], { files: strictQualityParsedFiles.length }),
+      runPhase(
+        PHASE_NAMES.visualConsumers,
+        () => this.collectVisualConsumers(input.analysisResults, input.parsedFiles),
+        () => ({ total: 0, designSystemUsers: 0, bespokeFiles: [], entries: [] }),
+        { files: input.analysisResults.length },
+      ),
+      runPhase(PHASE_NAMES.responsibility, () => this.collectHighResponsibilityComponents(strictQualityAnalysisResults), () => [], { files: strictQualityAnalysisResults.length }),
+      runPhase(PHASE_NAMES.zodAdoption, () => this.collectZodAdoption(input.parsedFiles), () => ({ totalFiles: 0, adoptedFiles: 0, rate: 0 }), { files: input.parsedFiles.length }),
+      runPhase(PHASE_NAMES.ciDetection, () => this.collectCiPresence(input.projectRoot), () => ({ hasCi: false, files: [] })),
+      runPhase(PHASE_NAMES.documentation, () => this.collectDocumentationPresence(input.projectRoot), () => ({ docsCount: 0, docFiles: [] })),
+      runPhase(PHASE_NAMES.dependencySummary, () => this.collectExternalPackageCount(input.analysisResults), () => 0, { files: input.analysisResults.length }),
+      runPhase(
+        PHASE_NAMES.typeCheck,
         () => new TypeCheckAnalyzer().analyzeProject(input.projectRoot, input.tsConfigPath, {
           includedFilePaths: strictQualityParsedFiles.map((parsedFile) => parsedFile.filePath),
           maxRootNames: input.maxTypeCheckRootNames ?? 5000,
           cacheDir: input.cacheDir,
           onProgress,
         }),
+        // 型検査が例外で落ちても manual に格下げするだけで、レポート全体は止めない
+        (): TypeCheckSummary => ({
+          totalErrors: 0,
+          checkedFiles: 0,
+          issues: [],
+          tsConfigPath: input.tsConfigPath,
+          skippedReason: "収集失敗: 型検査が例外で中断しました。",
+        }),
         { files: strictQualityParsedFiles.length },
       ),
+    ]);
+    this.reportArtifactWarnings(onProgress, [
+      [PHASE_NAMES.browserAudits, browserAuditSummary.warnings],
+      [PHASE_NAMES.testArtifacts, testArtifactSummary.warnings],
+      [PHASE_NAMES.uiTestArtifacts, uiTestArtifactSummary.warnings],
+      [PHASE_NAMES.apiArtifacts, apiArtifactSummary.warnings],
+      [PHASE_NAMES.securityArtifacts, securityArtifactSummary.warnings],
     ]);
     const typeCheckSummary = this.filterTypeCheckSummary(rawTypeCheckSummary);
     const typeEscapeStats = this.collectTypeEscapeStats(strictQualityAnalysisResults);
     const testPresenceResults = input.testEvidenceResults ?? input.analysisResults;
     const testPresenceParsedFiles = input.testEvidenceParsedFiles ?? input.parsedFiles;
     const testPresence = await runPhase(
-      "Quality phase: test presence scan",
+      PHASE_NAMES.testPresence,
       () => this.collectTestPresence(
         input.analysisResults,
         testPresenceResults,
@@ -306,16 +423,31 @@ export class QualityReportGenerator {
         testArtifactSummary.junit,
         uiTestArtifactSummary.playwright,
       ),
+      (): TestPresenceSummary => ({
+        targetFiles: 0,
+        matchedFiles: 0,
+        weightedTarget: 0,
+        weightedMatched: 0,
+        rate: 0,
+        buckets: [],
+        staticMatchedFiles: 0,
+        runtimeMatchedFiles: 0,
+        runtimeExplicitUnmatchedFiles: 0,
+        noEvidenceUnmatchedFiles: 0,
+        matches: [],
+      }),
       { files: testPresenceResults.length },
     );
     const workspaceSegments = await runPhase(
-      "Quality phase: workspace segment summary",
+      PHASE_NAMES.workspaceSegments,
       () => this.collectWorkspaceSegments(input.analysisResults, testPresence, visualConsumers, highResponsibilityComponents, hardcodedJsxText),
+      () => [],
       { files: input.analysisResults.length },
     );
     const featureSummaries = await runPhase(
-      "Quality phase: feature summary",
+      PHASE_NAMES.featureSummaries,
       () => this.collectFeatureSummaries(input.analysisResults, testPresence, visualConsumers, highResponsibilityComponents, hardcodedJsxText),
+      () => [],
       { files: input.analysisResults.length },
     );
 
@@ -362,6 +494,15 @@ export class QualityReportGenerator {
     for (const metric of this.buildDependencyMetrics(externalPackageCount, input.graphMetrics)) {
       pushMetric(metric);
     }
+
+    this.attachArtifactWarnings(categories, {
+      browserAudits: browserAuditSummary.warnings,
+      testArtifacts: testArtifactSummary.warnings,
+      uiTestArtifacts: uiTestArtifactSummary.warnings,
+      apiArtifacts: apiArtifactSummary.warnings,
+      securityArtifacts: securityArtifactSummary.warnings,
+    });
+    this.applyPhaseFailures(categories, phaseFailures);
 
     const categoryReports = QUALITY_CATEGORIES.map((category) => {
       const metrics = categories.get(category.id) ?? [];
@@ -3550,6 +3691,120 @@ export class QualityReportGenerator {
     summary: string,
   ): QualityMetricReport {
     return this.metric(category, id, label, "証跡未収集", threshold, "manual", summary, []);
+  }
+
+  private reportArtifactWarnings(
+    onProgress: ((message: string, metadata?: Record<string, unknown>) => void) | undefined,
+    entries: Array<[phase: string, warnings: string[]]>,
+  ): void {
+    for (const [phase, warnings] of entries) {
+      for (const warning of warnings) {
+        onProgress?.(`${phase} warning`, { warning });
+      }
+    }
+  }
+
+  /**
+   * 読めなかった / 形式が違った成果物を、その成果物が根拠になる指標の証跡に残す。
+   * 手動判定に留まった理由がレポートだけで分かるようにするため。
+   */
+  private attachArtifactWarnings(
+    categories: Map<QualityCategoryId, QualityMetricReport[]>,
+    warnings: {
+      browserAudits: string[];
+      testArtifacts: string[];
+      uiTestArtifacts: string[];
+      apiArtifacts: string[];
+      securityArtifacts: string[];
+    },
+  ): void {
+    const byMetricId = new Map<string, string[]>();
+    const add = (metricId: string, entries: string[]): void => {
+      if (entries.length === 0) {
+        return;
+      }
+      byMetricId.set(metricId, [...(byMetricId.get(metricId) ?? []), ...entries]);
+    };
+    const partition = (entries: string[], predicate: (entry: string) => boolean): [string[], string[]] => [
+      entries.filter((entry) => predicate(entry)),
+      entries.filter((entry) => !predicate(entry)),
+    ];
+
+    const [lighthouseWarnings, axeWarnings] = partition(warnings.browserAudits, (entry) => /lighthouse/iu.test(entry.split(":")[0] ?? entry));
+    add("wcag_aa", axeWarnings);
+    add("lighthouse_performance", lighthouseWarnings);
+    const [coverageWarnings, junitWarnings] = partition(warnings.testArtifacts, (entry) => /lcov/iu.test(entry.split(":")[0] ?? entry));
+    add("unit_pass_rate", junitWarnings);
+    add("coverage_rate", coverageWarnings);
+    const [storybookWarnings, playwrightWarnings] = partition(warnings.uiTestArtifacts, (entry) => /storybook/iu.test(entry.split(":")[0] ?? entry));
+    add("storybook_pass_rate", storybookWarnings);
+    add("e2e_pass_rate", playwrightWarnings);
+    add("openapi_contract", warnings.apiArtifacts);
+    add("dependency_vulnerabilities", warnings.securityArtifacts);
+
+    if (byMetricId.size === 0) {
+      return;
+    }
+
+    for (const [category, metrics] of categories) {
+      categories.set(category, metrics.map((metric) => {
+        const entries = byMetricId.get(metric.id);
+        if (!entries || entries.length === 0) {
+          return metric;
+        }
+        return {
+          ...metric,
+          summary: `${metric.summary} 取り込めなかった成果物が ${entries.length} 件あります (証跡「${ARTIFACT_WARNING_EVIDENCE_LABEL}」を参照)。`,
+          evidence: [
+            ...metric.evidence,
+            ...entries.map((entry) => this.noteEvidence(ARTIFACT_WARNING_EVIDENCE_LABEL, entry)),
+          ],
+        };
+      }));
+    }
+  }
+
+  /**
+   * 失敗したフェーズに依存する指標を「収集失敗」の manual に落とす。
+   * fallback の空集計で pass に見せないこと、baseline 比較で証跡喪失として
+   * 検出できることの両方を狙っている。
+   */
+  private applyPhaseFailures(
+    categories: Map<QualityCategoryId, QualityMetricReport[]>,
+    failures: PhaseFailure[],
+  ): void {
+    if (failures.length === 0) {
+      return;
+    }
+
+    const failureByMetricId = new Map<string, PhaseFailure>();
+    for (const failure of failures) {
+      for (const metricId of PHASE_METRIC_IDS[failure.name] ?? []) {
+        if (!failureByMetricId.has(metricId)) {
+          failureByMetricId.set(metricId, failure);
+        }
+      }
+    }
+
+    for (const [category, metrics] of categories) {
+      categories.set(category, metrics.map((metric) => {
+        const failure = failureByMetricId.get(metric.id);
+        if (!failure) {
+          return metric;
+        }
+        return {
+          ...metric,
+          actual: "収集失敗",
+          verdict: "manual",
+          automation: "manual",
+          summary: `収集失敗: ${failure.message}`,
+          evidence: [
+            this.noteEvidence("失敗フェーズ", failure.name),
+            this.noteEvidence("エラー", failure.message),
+          ],
+        } satisfies QualityMetricReport;
+      }));
+    }
   }
 
   private metric(
