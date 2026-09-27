@@ -1,26 +1,46 @@
-import type { CircularDep, EdgeMetadata, GraphJSON, GraphNode } from "../types/index.js";
+import type { CircularDep, DependencyType, EdgeMetadata, GraphEdge, GraphJSON, GraphNode } from "../types/index.js";
+
+interface EdgeRecord {
+  // source -> target を構成する依存文の本数
+  statementCount: number;
+  types: Set<DependencyType>;
+  // 依存文がすべて型のみなら true (一つでも実行時依存があれば false)
+  isTypeOnly: boolean;
+}
 
 export class GraphBuilder {
   private readonly nodes = new Map<string, GraphNode>();
-  private readonly edges = new Map<string, Set<string>>();
+  private readonly edges = new Map<string, Map<string, EdgeRecord>>();
   private readonly reverseEdges = new Map<string, Set<string>>();
   private stronglyConnected: string[][] | null = null;
   private weaklyConnected: string[][] | null = null;
 
-  addDependency(source: string, target: string, _metadata?: EdgeMetadata): void {
+  addDependency(source: string, target: string, metadata?: EdgeMetadata): void {
     this.ensureNode(source);
     this.ensureNode(target);
 
-    if (!this.edges.has(source)) {
-      this.edges.set(source, new Set<string>());
+    let targets = this.edges.get(source);
+    if (!targets) {
+      targets = new Map<string, EdgeRecord>();
+      this.edges.set(source, targets);
     }
 
-    const targets = this.edges.get(source);
-    if (!targets || targets.has(target)) {
+    const existing = targets.get(target);
+    if (existing) {
+      // 同じ辺への 2 本目以降の依存文: 種別と本数だけ積み上げる
+      existing.statementCount += 1;
+      if (metadata?.type) {
+        existing.types.add(metadata.type);
+      }
+      existing.isTypeOnly = existing.isTypeOnly && metadata?.isTypeOnly === true;
       return;
     }
 
-    targets.add(target);
+    targets.set(target, {
+      statementCount: 1,
+      types: new Set<DependencyType>(metadata?.type ? [metadata.type] : []),
+      isTypeOnly: metadata?.isTypeOnly === true,
+    });
     if (!this.reverseEdges.has(target)) {
       this.reverseEdges.set(target, new Set<string>());
     }
@@ -70,7 +90,7 @@ export class GraphBuilder {
 
     for (const node of this.nodes.keys()) {
       if (!visited.has(node)) {
-        iterativeDfs(node, (id) => this.edges.get(id) ?? [], (id) => finished.push(id));
+        iterativeDfs(node, (id) => this.targetsOf(id), (id) => finished.push(id));
       }
     }
 
@@ -101,7 +121,7 @@ export class GraphBuilder {
       undirected.set(node, new Set<string>());
     }
     for (const [source, targets] of this.edges) {
-      for (const target of targets) {
+      for (const target of targets.keys()) {
         undirected.get(source)?.add(target);
         undirected.get(target)?.add(source);
       }
@@ -132,6 +152,10 @@ export class GraphBuilder {
     return this.weaklyConnected;
   }
 
+  /**
+   * 循環依存を強連結成分 (SCC) 単位で 1 件ずつ返す。
+   * 60 ファイルが絡み合った塊も 1 件として数え、その規模は length / affectedFiles / edgeCount で表す。
+   */
   detectCycles(): CircularDep[] {
     const sccs = this.detectStronglyConnectedComponents();
     const cycles: CircularDep[] = [];
@@ -143,6 +167,7 @@ export class GraphBuilder {
           length: component.length,
           severity: this.calculateCycleSeverity(component.length),
           affectedFiles: component.length,
+          edgeCount: this.countInternalEdges(component),
         });
         continue;
       }
@@ -152,8 +177,9 @@ export class GraphBuilder {
         cycles.push({
           nodes: [onlyNode, onlyNode],
           length: 1,
-          severity: "critical",
+          severity: this.calculateCycleSeverity(1),
           affectedFiles: 1,
+          edgeCount: 1,
         });
       }
     }
@@ -209,29 +235,34 @@ export class GraphBuilder {
     const inDegree = new Map<string, number>(
       Array.from(this.nodes.entries()).map(([id, node]) => [id, node.inDegree]),
     );
+    // 隣接リストは一度だけ整列し、同じ入次数 0 の候補は名前順に取り出す (結果を決定的にする)
+    const sortedTargets = new Map<string, string[]>();
+    for (const [source, targets] of this.edges) {
+      sortedTargets.set(source, Array.from(targets.keys()).sort());
+    }
+
     const queue = Array.from(inDegree.entries())
       .filter(([, degree]) => degree === 0)
       .map(([id]) => id)
       .sort();
     const result: string[] = [];
 
-    while (queue.length > 0) {
-      const node = queue.shift();
-      if (!node) {
-        break;
-      }
+    // queue.shift() は先頭削除が O(V) になるため、読み出し位置だけを進める
+    let head = 0;
+    while (head < queue.length) {
+      const node = queue[head]!;
+      head += 1;
       result.push(node);
 
       const readyTargets: string[] = [];
-      for (const target of this.edges.get(node) ?? []) {
+      for (const target of sortedTargets.get(node) ?? []) {
         const nextDegree = (inDegree.get(target) ?? 0) - 1;
         inDegree.set(target, nextDegree);
         if (nextDegree === 0) {
           readyTargets.push(target);
         }
       }
-      // 追加分だけ整列して末尾へ (毎回の全体 sort による O(V^2 log V) を回避)
-      readyTargets.sort();
+      // 追加分は整列済み隣接リストの順に並ぶので、そのまま末尾へ
       queue.push(...readyTargets);
     }
 
@@ -239,15 +270,26 @@ export class GraphBuilder {
   }
 
   exportToJSON(): GraphJSON {
-    return {
-      nodes: Array.from(this.nodes.values()).sort((left, right) => left.id.localeCompare(right.id)),
-      edges: Array.from(this.edges.entries()).flatMap(([source, targets]) =>
-        Array.from(targets).sort().map((target) => ({
+    const edges: GraphEdge[] = [];
+    for (const [source, targets] of Array.from(this.edges.entries()).sort(([left], [right]) => left.localeCompare(right))) {
+      for (const target of Array.from(targets.keys()).sort()) {
+        const record = targets.get(target)!;
+        const edge: GraphEdge = {
           source,
           target,
-          weight: 1,
-        }))
-      ),
+          weight: record.statementCount,
+          types: Array.from(record.types).sort(),
+        };
+        if (record.isTypeOnly) {
+          edge.isTypeOnly = true;
+        }
+        edges.push(edge);
+      }
+    }
+
+    return {
+      nodes: Array.from(this.nodes.values()).sort((left, right) => left.id.localeCompare(right.id)),
+      edges,
     };
   }
 
@@ -257,18 +299,35 @@ export class GraphBuilder {
     dot += "  node [shape=box style=filled];\n";
 
     for (const [id, node] of Array.from(this.nodes.entries()).sort(([left], [right]) => left.localeCompare(right))) {
-      const label = id.split("/").pop() ?? id;
-      dot += `  "${id}" [label="${label}", fillcolor="${this.getNodeColor(node.inDegree)}"];\n`;
+      const label = GraphBuilder.basename(id);
+      dot += `  ${GraphBuilder.quoteDot(id)} [label=${GraphBuilder.quoteDot(label)}, fillcolor="${this.getNodeColor(node.inDegree)}"];\n`;
     }
 
     for (const [source, targets] of Array.from(this.edges.entries()).sort(([left], [right]) => left.localeCompare(right))) {
-      for (const target of Array.from(targets).sort()) {
-        dot += `  "${source}" -> "${target}";\n`;
+      for (const target of Array.from(targets.keys()).sort()) {
+        dot += `  ${GraphBuilder.quoteDot(source)} -> ${GraphBuilder.quoteDot(target)};\n`;
       }
     }
 
     dot += "}\n";
     return dot;
+  }
+
+  private targetsOf(id: string): Iterable<string> {
+    return this.edges.get(id)?.keys() ?? [];
+  }
+
+  private countInternalEdges(component: string[]): number {
+    const members = new Set(component);
+    let count = 0;
+    for (const source of component) {
+      for (const target of this.targetsOf(source)) {
+        if (members.has(target)) {
+          count += 1;
+        }
+      }
+    }
+    return count;
   }
 
   private ensureNode(id: string): void {
@@ -277,11 +336,17 @@ export class GraphBuilder {
     }
   }
 
+  /**
+   * 循環依存の重大度は絡み合っているファイル数 (SCC の規模) で決める。
+   * 2 ファイルの相互参照はどちらか一方の import を切れば解消できるが、
+   * 6 ファイル以上の塊は境界を引き直さないと解けないため重い。
+   * (docs/glossary.md「循環依存の重大度」と同じ規則)
+   */
   private calculateCycleSeverity(length: number): CircularDep["severity"] {
-    if (length <= 2) {
+    if (length >= 6) {
       return "critical";
     }
-    if (length <= 4) {
+    if (length >= 3) {
       return "high";
     }
     return "medium";
@@ -298,5 +363,21 @@ export class GraphBuilder {
       return "#ffe066";
     }
     return "#8ce99a";
+  }
+
+  /** `/` と `\` のどちらの区切りでも最後のパス要素をラベルにする */
+  private static basename(id: string): string {
+    const segments = id.split(/[\\/]/u).filter((segment) => segment.length > 0);
+    return segments[segments.length - 1] ?? id;
+  }
+
+  /** Graphviz の二重引用文字列として安全な形にする (`"` `\` と改行をエスケープ) */
+  private static quoteDot(value: string): string {
+    const escaped = value
+      .replace(/\\/gu, "\\\\")
+      .replace(/"/gu, "\\\"")
+      .replace(/\r/gu, "\\r")
+      .replace(/\n/gu, "\\n");
+    return `"${escaped}"`;
   }
 }

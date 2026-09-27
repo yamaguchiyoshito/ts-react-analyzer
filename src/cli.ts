@@ -776,7 +776,20 @@ async function buildArtifacts(
     fileCacheMisses: fullScanResult.cacheStats.misses,
   });
 
-  const analysisCache = new AnalysisCache(config.cacheDir, projectDir, config.tsCompilerOptions);
+  // 走査候補 (解析対象 + スコープ外で読み飛ばした候補 + 読めなかったファイル) の集合を指紋にする。
+  // 未変更ファイルでも、隣にファイルが増減・改名されると import の解決先が変わり得るため
+  const fileSetHash = AnalysisCache.computeFileSetHash(projectDir, [
+    ...fullScanResult.parsed.map((parsedFile) => parsedFile.filePath),
+    ...fullScanResult.skipped
+      .filter((entry) => !entry.isDirectory && entry.reason.startsWith("Excluded by analysis scope"))
+      .map((entry) => entry.filePath),
+    ...fullScanResult.errors.map((entry) => entry.filePath),
+  ]);
+  const analysisCache = new AnalysisCache(config.cacheDir, projectDir, config.tsCompilerOptions, {
+    enabled: config.enableCache,
+    fileSetHash,
+    tsConfigPath: config.tsConfigPath,
+  });
   await analysisCache.initialize();
 
   const dependencyAnalyzer = new DependencyAnalyzer(path.resolve(projectDir), config.tsCompilerOptions, {
