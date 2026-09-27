@@ -6,10 +6,20 @@
   "bin": {
     "ts-react-analyzer": "./dist/src/cli.js"
   },
+  "files": [
+    "dist/src",
+    "docs",
+    "ci-templates",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/tests/*.test.js",
-    "analyze": "node dist/src/cli.js analyze"
+    "analyze": "node dist/src/cli.js analyze",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "typescript": "^5.9.3"

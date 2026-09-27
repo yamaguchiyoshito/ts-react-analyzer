@@ -8,4 +8,10 @@ analysis.log
 tests/fixtures/sample-app/analysis.log
 tests/fixtures/sample-app/tmp-cli-report/
 tests/fixtures/sample-app/tmp-report-output/
+tests/fixtures/sample-app/tmp-quality-output/
+tests/fixtures/sample-app/tmp-cli-cache-output/
+tests/fixtures/sample-app/.cli-cache/
+tests/fixtures/**/.ts-analyzer-cache/
+tests/fixtures/**/analysis.log
 package-lock.json
+.claude/worktrees/
