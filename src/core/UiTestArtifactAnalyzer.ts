@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { formatArtifactWarning, readJsonArtifact } from "./ArtifactJson.js";
+
 export interface UiTestRunSummary {
   totalTests: number;
   passedTests: number;
@@ -13,6 +15,8 @@ export interface UiTestRunSummary {
 export interface UiTestArtifactSummary {
   playwright: UiTestRunSummary | null;
   storybook: UiTestRunSummary | null;
+  /** 名前は一致したが読めなかったため無視した成果物 */
+  warnings: string[];
 }
 
 interface PlaywrightLikeResult {
@@ -38,10 +42,12 @@ export class UiTestArtifactAnalyzer {
   async analyzeProject(projectRoot: string): Promise<UiTestArtifactSummary> {
     const playwrightFiles = await this.findPlaywrightFiles(projectRoot);
     const storybookFiles = await this.findStorybookFiles(projectRoot);
+    const warnings: string[] = [];
 
     return {
-      playwright: playwrightFiles.length > 0 ? await this.parsePlaywrightFiles(projectRoot, playwrightFiles) : null,
-      storybook: storybookFiles.length > 0 ? await this.parseStorybookFiles(storybookFiles) : null,
+      playwright: playwrightFiles.length > 0 ? await this.parsePlaywrightFiles(projectRoot, playwrightFiles, warnings) : null,
+      storybook: storybookFiles.length > 0 ? await this.parseStorybookFiles(storybookFiles, warnings) : null,
+      warnings,
     };
   }
 
@@ -95,16 +101,22 @@ export class UiTestArtifactAnalyzer {
     return Array.from(files).sort();
   }
 
-  private async parsePlaywrightFiles(projectRoot: string, files: string[]): Promise<UiTestRunSummary> {
+  private async parsePlaywrightFiles(projectRoot: string, files: string[], warnings: string[]): Promise<UiTestRunSummary | null> {
     let totalTests = 0;
     let passedTests = 0;
     let failedTests = 0;
     let skippedTests = 0;
     const executedTestFiles = new Set<string>();
+    const acceptedFiles: string[] = [];
 
     for (const filePath of files) {
-      const payload = JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
-      const tests = this.collectPlaywrightTests(payload);
+      const read = await readJsonArtifact(filePath);
+      if (!read.ok) {
+        warnings.push(formatArtifactWarning(filePath, read.error));
+        continue;
+      }
+      acceptedFiles.push(filePath);
+      const tests = this.collectPlaywrightTests(read.value);
 
       for (const test of tests) {
         totalTests += 1;
@@ -123,24 +135,35 @@ export class UiTestArtifactAnalyzer {
       }
     }
 
+    if (acceptedFiles.length === 0) {
+      return null;
+    }
+
     return {
       totalTests,
       passedTests,
       failedTests,
       skippedTests,
-      files,
+      files: acceptedFiles,
       executedTestFiles: Array.from(executedTestFiles).sort(),
     };
   }
 
-  private async parseStorybookFiles(files: string[]): Promise<UiTestRunSummary> {
+  private async parseStorybookFiles(files: string[], warnings: string[]): Promise<UiTestRunSummary | null> {
     let totalTests = 0;
     let passedTests = 0;
     let failedTests = 0;
     let skippedTests = 0;
+    const acceptedFiles: string[] = [];
 
     for (const filePath of files) {
-      const payload = JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
+      const read = await readJsonArtifact(filePath);
+      if (!read.ok) {
+        warnings.push(formatArtifactWarning(filePath, read.error));
+        continue;
+      }
+      acceptedFiles.push(filePath);
+      const payload = read.value;
       const summary = this.extractStorybookSummary(payload);
 
       if (summary) {
@@ -165,12 +188,16 @@ export class UiTestArtifactAnalyzer {
       }
     }
 
+    if (acceptedFiles.length === 0) {
+      return null;
+    }
+
     return {
       totalTests,
       passedTests,
       failedTests,
       skippedTests,
-      files,
+      files: acceptedFiles,
       executedTestFiles: [],
     };
   }

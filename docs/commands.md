@@ -94,7 +94,7 @@ node dist/src/cli.js quality diff <projectDir> --baseline <quality_report.json> 
 
 - `quality report` は `collect` の別名です (非推奨。実行すると collect への移行案内を表示します)
 - `gate` は自動判定 `FAIL` の親指標が 1 件でもあると終了コード `2` で失敗します
-- `gate --baseline <path>` は前回からの悪化 (例: `pass → warn`) も検知して失敗します
+- `gate --baseline <path>` は前回からの悪化 (例: `pass → warn`) と証跡の喪失 (前回は自動判定できていた指標が今回 `manual` に落ちた) も検知して失敗します
 - 判定の仕組みと手動証跡は [品質レポート](quality.md) を参照してください
 
 実用例:

@@ -10,10 +10,34 @@ interface ManualQualityInputFile {
 const ALLOWED_VERDICTS = new Set<QualityVerdict>(["pass", "partial", "warn", "fail", "manual", "not_applicable"]);
 const ALLOWED_EVIDENCE_TYPES = new Set<QualityEvidence["type"]>(["file", "metric", "note"]);
 
+/**
+ * 手動品質入力ファイルが存在するのに JSON として読めないときの利用者向けエラー。
+ * ファイル不存在 (ENOENT) はこのエラーにはせず、fs のエラーをそのまま投げる。
+ */
+export class ManualQualityInputError extends Error {
+  constructor(
+    message: string,
+    readonly inputPath: string,
+  ) {
+    super(message);
+    this.name = "ManualQualityInputError";
+  }
+}
+
 export class ManualQualityInputLoader {
   async load(inputPath: string): Promise<ManualQualityMetricInput[]> {
     const resolvedPath = path.resolve(inputPath);
-    const raw = JSON.parse(await fs.readFile(resolvedPath, "utf8")) as unknown;
+    const content = await fs.readFile(resolvedPath, "utf8");
+    let raw: unknown;
+    try {
+      raw = JSON.parse(content) as unknown;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new ManualQualityInputError(
+        `手動品質入力ファイルを JSON として解釈できません: ${resolvedPath}\n${reason}\nJSON の構文 (末尾カンマ・引用符・閉じ括弧) を確認してください。`,
+        resolvedPath,
+      );
+    }
     const directory = path.dirname(resolvedPath);
 
     return this.normalize(raw, directory);

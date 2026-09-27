@@ -42,12 +42,20 @@
 
 JUnit XML がなく Vitest だけが検出された場合、Unit テスト通過率は「Vitest検出 / 結果未収集」の表示になります。通過率まで自動判定したい場合は JUnit XML を残してください。
 
+実績ファイルは **ファイル名と中身の両方** で判定します。
+
+- ファイル名は先頭一致です。`npm-audit.json` / `audit-report.json` は npm audit として扱いますが、`lighthouse-audit.json` や `a11y-audit.json` は扱いません。axe も `axe.json` / `axe-results.json` などに限り、`taxes.json` のような部分一致は拾いません
+- 中身も確認します。npm audit は `vulnerabilities` / `metadata.vulnerabilities` / `advisories`、Trivy は `Results` 配列、axe は `violations` 配列、Lighthouse は `categories` と `audits`、JUnit XML は `<testsuite>` 要素が必要です
+- 名前は一致しても読めない (JSON が壊れている・切り詰められている) か形式が違うファイルは無視し、対応する指標は手動判定 (manual) のままになります。無視した理由は該当指標の証跡「取込警告」とログ (`Quality phase: ... warning`) に残ります。1 ファイルの破損でレポート全体が失敗することはありません
+- 収集フェーズ自体が例外で落ちた場合も、他の指標はそのまま報告し、落ちたフェーズに依存する指標だけを `収集失敗: <理由>` の manual にします
+
 ## quality gate が失敗する条件
 
 `quality gate` は次のとき終了コード `2` で失敗します。判定結果と阻害指標は `*_quality_report.md` の「要点」先頭に「ゲート判定: × FAIL（阻害指標一覧）」として出力されるため、ログを見なくてもレポートだけで原因が分かります。
 
 1. 自動判定 `FAIL` の親指標が 1 件でもある
 2. `--baseline` 指定時、親指標の自動判定が前回より悪化した (`pass → warn` や `warn → fail`)
+3. `--baseline` 指定時、前回は自動判定できていた親指標が今回 `manual` (証跡待ち) に落ちた — **証跡の喪失**。例: 前回はあった `coverage/lcov.info` や `reports/npm-audit.json` が今回は生成されていない、または壊れていて読めない。判定スコア上は改善に見えても gate は落とします (monitoring に入れた指標は除く)
 
 ### baseline 悪化の扱いを指標ごとに変える
 
@@ -56,6 +64,7 @@ JUnit XML がなく Vitest だけが検出された場合、Unit テスト通過
 - `--quality-gate-blocking-metrics <ids>` — ここに入れた指標の悪化で gate を落とします。**空 (未指定) の場合は、すべての自動指標の悪化が gate 対象** です
 - `--quality-gate-monitoring-metrics <ids>` — ここに入れた指標は、悪化しても差分レポートに出すだけで gate は落としません
 - 両方に同じ指標を入れた場合は monitoring が優先されます
+- レポートに存在しない指標 ID を指定すると `警告: 未知の指標 ID ...` を表示します。`--quality-gate-blocking-metrics` の指標 ID が **すべて** 未知の場合は typo とみなし、「gate 対象なし」で素通りさせずに終了コード `1` で失敗します
 
 例: ドキュメント整備は悪化しても出荷は止めない、という運用:
 
@@ -75,7 +84,7 @@ node dist/src/cli.js quality gate ./my-app \
 - **判定が warn / fail のままの数値悪化** — 例: 型エラー 108 件 → 110 件。「FAIL のまま少しずつ腐る」変化も悪化として数えます
 - **証跡の喪失** — 実測できていた指標が manual (証跡待ち) に落ちた場合。改善扱いにはなりません
 
-なお `quality gate --baseline` が終了コード `2` で落とすのは判定の悪化だけです。同一判定内の数値悪化は差分レポートでの可視化に留まります。
+なお `quality gate --baseline` が終了コード `2` で落とすのは判定の悪化と証跡の喪失だけです。同一判定内の数値悪化は差分レポートでの可視化に留まります。
 
 ## 指標 ID 一覧
 
