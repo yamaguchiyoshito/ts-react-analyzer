@@ -11,6 +11,7 @@ import type {
   ExtractionResult,
   ImportedItem,
 } from "../types/index.js";
+import { parseTsConfig, resolveTsConfigLeaves, type TsConfigResolution } from "./TsConfigResolver.js";
 
 interface ResolveResult {
   target: string;
@@ -23,11 +24,20 @@ interface ResolutionContext {
   hash: string;
 }
 
+export interface DependencyAnalyzerOptions {
+  // 設定 (pathMappings) 由来のエイリアス表。tsconfig の paths で解決できなかった場合の予備として使う
+  pathMappings?: Record<string, string[]>;
+  // pathMappings の相対置換先を解決する基準ディレクトリ。省略時は projectRoot
+  pathMappingsBaseDir?: string;
+}
+
 export class DependencyAnalyzer {
   private readonly compilerOptions: ts.CompilerOptions;
   private readonly compilerOptionsHash: string;
   private readonly projectRoot: string;
   private readonly host: ts.ModuleResolutionHost;
+  private readonly pathMappings: Record<string, string[]>;
+  private readonly pathMappingsBaseDir: string;
   // node_modules 探索を全ファイルで共有する TypeScript 標準の解決キャッシュ。
   // これが無いと N ファイルが import する同じパッケージを N 回探索する。
   private readonly moduleResolutionCache: ts.ModuleResolutionCache;
@@ -36,11 +46,17 @@ export class DependencyAnalyzer {
   private readonly resolutionCache = new Map<string, ResolveResult>();
   private readonly nearestTsConfigCache = new Map<string, string | null>();
   private readonly resolutionContextCache = new Map<string, ResolutionContext>();
+  // 最寄り tsconfig ごとの references 追跡結果。solution 型 tsconfig の末端選択に使う
+  private readonly tsConfigResolutionCache = new Map<string, TsConfigResolution>();
 
-  constructor(projectRoot: string, compilerOptions: ts.CompilerOptions) {
+  constructor(projectRoot: string, compilerOptions: ts.CompilerOptions, options: DependencyAnalyzerOptions = {}) {
     this.projectRoot = path.resolve(projectRoot);
     this.compilerOptions = compilerOptions;
     this.compilerOptionsHash = this.hash(this.stableStringify(compilerOptions));
+    this.pathMappings = { ...(options.pathMappings ?? {}) };
+    this.pathMappingsBaseDir = options.pathMappingsBaseDir
+      ? path.resolve(this.projectRoot, options.pathMappingsBaseDir)
+      : this.projectRoot;
     this.host = ts.sys;
     this.moduleResolutionCache = ts.createModuleResolutionCache(
       this.projectRoot,
@@ -174,6 +190,9 @@ export class DependencyAnalyzer {
       modulePath,
       range: this.createRange(node, node.getSourceFile()),
     };
+    if (this.isTypeOnlyImportClause(node.importClause)) {
+      dependency.isTypeOnly = true;
+    }
 
     const barrel = !resolved.isExternal && this.isBarrelFile(resolved.target)
       ? {
@@ -220,17 +239,47 @@ export class DependencyAnalyzer {
       this.trackReExport(fromFile, resolved.target);
     }
 
-    return {
-      dependencies: [{
-        source: fromFile,
-        target: resolved.target,
-        type: "export",
-        isExternal: resolved.isExternal,
-        exported,
-        modulePath,
-        range: this.createRange(node, node.getSourceFile()),
-      }],
+    const dependency: Dependency = {
+      source: fromFile,
+      target: resolved.target,
+      type: "export",
+      isExternal: resolved.isExternal,
+      exported,
+      modulePath,
+      range: this.createRange(node, node.getSourceFile()),
     };
+    if (this.isTypeOnlyExportDeclaration(node)) {
+      dependency.isTypeOnly = true;
+    }
+
+    return { dependencies: [dependency] };
+  }
+
+  // `import type { X }` / `import type * as X` / `import { type X, type Y }` は実行時の依存を生まない。
+  // default import や値の named import が 1 つでも混ざれば値依存として扱う。
+  private isTypeOnlyImportClause(importClause: ts.ImportClause): boolean {
+    if (importClause.isTypeOnly) {
+      return true;
+    }
+    if (importClause.name) {
+      return false;
+    }
+    const namedBindings = importClause.namedBindings;
+    if (!namedBindings || !ts.isNamedImports(namedBindings) || namedBindings.elements.length === 0) {
+      return false;
+    }
+    return namedBindings.elements.every((element) => element.isTypeOnly);
+  }
+
+  // `export type { X } from` / `export type * from` / `export { type X } from` を型のみ再エクスポートとみなす。
+  private isTypeOnlyExportDeclaration(node: ts.ExportDeclaration): boolean {
+    if (node.isTypeOnly) {
+      return true;
+    }
+    if (!node.exportClause || !ts.isNamedExports(node.exportClause) || node.exportClause.elements.length === 0) {
+      return false;
+    }
+    return node.exportClause.elements.every((element) => element.isTypeOnly);
   }
 
   private extractDynamicImport(node: ts.CallExpression, fromFile: string): Dependency | null {
@@ -300,11 +349,21 @@ export class DependencyAnalyzer {
 
     if (this.matchesConfiguredPathAlias(modulePath, context.compilerOptions.paths ?? {})) {
       const aliasResult = {
-        target: this.resolveAliasFallback(modulePath, context),
+        target: this.resolveAliasFallback(modulePath, context.compilerOptions.paths ?? {}, this.resolveBaseDir(context)),
         isExternal: false,
       } satisfies ResolveResult;
       this.resolutionCache.set(cacheKey, aliasResult);
       return aliasResult;
+    }
+
+    // tsconfig の paths で解決できない場合は、設定ファイル由来の pathMappings を予備のエイリアス表として使う
+    if (this.matchesConfiguredPathAlias(modulePath, this.pathMappings)) {
+      const mappingResult = {
+        target: this.resolveAliasFallback(modulePath, this.pathMappings, this.pathMappingsBaseDir),
+        isExternal: false,
+      } satisfies ResolveResult;
+      this.resolutionCache.set(cacheKey, mappingResult);
+      return mappingResult;
     }
 
     const externalResult = this.createExternalResolution(modulePath);
@@ -361,14 +420,42 @@ export class DependencyAnalyzer {
       };
     }
 
-    const cached = this.resolutionContextCache.get(tsConfigPath);
+    const selectedConfigPath = this.selectConfigPathForFile(tsConfigPath, filePath);
+    const cached = this.resolutionContextCache.get(selectedConfigPath);
     if (cached) {
       return cached;
     }
 
-    const loaded = this.loadResolutionContext(tsConfigPath);
-    this.resolutionContextCache.set(tsConfigPath, loaded);
+    const loaded = this.loadResolutionContext(selectedConfigPath);
+    this.resolutionContextCache.set(selectedConfigPath, loaded);
     return loaded;
+  }
+
+  // 最寄りの tsconfig が solution 型 (files 空 + references) なら、そのファイルを含む末端設定を選ぶ。
+  // 含む設定が無ければ paths を持つ最初の末端設定、それも無ければ元の tsconfig をそのまま使う。
+  private selectConfigPathForFile(tsConfigPath: string, filePath: string): string {
+    let resolution = this.tsConfigResolutionCache.get(tsConfigPath);
+    if (!resolution) {
+      try {
+        resolution = resolveTsConfigLeaves(tsConfigPath);
+      } catch {
+        resolution = { isSolution: false, leaves: [] };
+      }
+      this.tsConfigResolutionCache.set(tsConfigPath, resolution);
+    }
+
+    if (!resolution.isSolution || resolution.leaves.length === 0) {
+      return tsConfigPath;
+    }
+
+    const resolvedFilePath = path.resolve(filePath);
+    const owner = resolution.leaves.find((leaf) => leaf.fileNameSet.has(resolvedFilePath));
+    if (owner) {
+      return owner.tsConfigPath;
+    }
+
+    const withPaths = resolution.leaves.find((leaf) => Object.keys(leaf.parsed.options.paths ?? {}).length > 0);
+    return withPaths?.tsConfigPath ?? tsConfigPath;
   }
 
   private findNearestTsConfig(filePath: string): string | undefined {
@@ -414,8 +501,8 @@ export class DependencyAnalyzer {
   private loadResolutionContext(tsConfigPath: string): ResolutionContext {
     const configDir = path.dirname(tsConfigPath);
     try {
-      const readResult = ts.readConfigFile(tsConfigPath, ts.sys.readFile);
-      if (readResult.error) {
+      const { config } = parseTsConfig(tsConfigPath);
+      if (!config) {
         return {
           compilerOptions: this.compilerOptions,
           configDir,
@@ -423,21 +510,13 @@ export class DependencyAnalyzer {
         };
       }
 
-      const parsed = ts.parseJsonConfigFileContent(
-        readResult.config,
-        ts.sys,
-        configDir,
-        undefined,
-        tsConfigPath,
-      );
-
       return {
         compilerOptions: {
           ...this.compilerOptions,
-          ...parsed.options,
+          ...config.parsed.options,
         },
         configDir,
-        hash: this.hash(`${tsConfigPath}:${this.stableStringify(parsed.options)}`),
+        hash: this.hash(`${tsConfigPath}:${this.stableStringify(config.parsed.options)}`),
       };
     } catch {
       return {
@@ -519,10 +598,9 @@ export class DependencyAnalyzer {
     return Object.keys(paths).some((pattern) => this.matchPathAliasPattern(modulePath, pattern) !== null);
   }
 
-  private resolveAliasFallback(modulePath: string, context: ResolutionContext): string {
-    const baseDir = this.resolveBaseDir(context);
+  private resolveAliasFallback(modulePath: string, paths: Record<string, string[]>, baseDir: string): string {
     let fallbackTarget: string | null = null;
-    for (const [pattern, replacements] of Object.entries(context.compilerOptions.paths ?? {})) {
+    for (const [pattern, replacements] of Object.entries(paths)) {
       const wildcardValue = this.matchPathAliasPattern(modulePath, pattern);
       if (wildcardValue === null) {
         continue;

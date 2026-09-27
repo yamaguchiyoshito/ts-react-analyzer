@@ -168,6 +168,9 @@ export interface Dependency {
   modulePath: string;
   imported?: ImportedItem[];
   exported?: ExportedItem[];
+  // `import type` / `export type` / 全 specifier が `type` 付きの import。
+  // 実行時の依存を生まないため、依存グラフ (循環検出) には辺として載せない
+  isTypeOnly?: boolean;
   range: DependencyRange;
 }
 

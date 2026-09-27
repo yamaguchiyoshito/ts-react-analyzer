@@ -23,6 +23,7 @@
 - リスク分布の 3 軸表示 (複雑度・構造・型安全性)
 - 型安全性の詳細 (`any`、assertion、non-null assertion、`ts-ignore`)
 - 依存分析 — 循環依存、SCC、weak cluster、PageRank、graph warnings
+  - 型のみの import / export (`import type { X }`、`import { type X }`、`export type { X } from`) は実行時の依存を生まないため、依存グラフの辺にせず循環依存の検出対象から除外する。依存一覧 (`<prefix>_dependencies.csv`、`<prefix>_report.json` の `dependencies`) と依存件数には残り、JSON では `isTypeOnly: true` で識別できる
 - 外部依存の文脈別集計 (runtime / storybook / test / dev)
 - 3x3 マトリクス要約と File Type 分布
 - ディレクトリ目的の定義表と、目的整合の改善提案 (→ [File Type とディレクトリ目的](file-types.md))

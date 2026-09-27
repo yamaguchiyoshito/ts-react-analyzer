@@ -15,5 +15,6 @@ export * from "./QualityReportGenerator.js";
 export * from "./ReportGenerator.js";
 export * from "./SecurityArtifactAnalyzer.js";
 export * from "./TestArtifactAnalyzer.js";
+export * from "./TsConfigResolver.js";
 export * from "./TypeCheckAnalyzer.js";
 export * from "./UiTestArtifactAnalyzer.js";

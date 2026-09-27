@@ -3,6 +3,7 @@ import path from "node:path";
 import ts from "typescript";
 
 import type { AnalysisConfig, AnalysisScope, OutputFormat, QualityProfile, TestPresenceSettings } from "../types/index.js";
+import { pickPrimaryLeaf, resolveTsConfigLeaves } from "./TsConfigResolver.js";
 
 const EXCLUDE_GROUP_PATTERNS: Record<string, string[]> = {
   dependencies: [
@@ -71,18 +72,19 @@ export class ConfigManager {
       return {};
     }
 
-    const readResult = ts.readConfigFile(tsConfigPath, ts.sys.readFile);
-    if (readResult.error) {
-      throw new Error(ts.flattenDiagnosticMessageText(readResult.error.messageText, "\n"));
+    const resolution = resolveTsConfigLeaves(tsConfigPath);
+    if (!resolution.root) {
+      throw new Error(
+        resolution.readError
+          ? ts.flattenDiagnosticMessageText(resolution.readError.messageText, "\n")
+          : `tsconfig を読み込めませんでした: ${tsConfigPath}`,
+      );
     }
 
-    const parsed = ts.parseJsonConfigFileContent(
-      readResult.config,
-      ts.sys,
-      path.dirname(tsConfigPath),
-      undefined,
-      tsConfigPath,
-    );
+    // Vite / Next テンプレートの solution 型 tsconfig (files: [] + references) は自身に
+    // compilerOptions を持たないため、references 先の末端設定から実際のオプションを採用する
+    const effective = (resolution.isSolution ? pickPrimaryLeaf(resolution) : undefined) ?? resolution.root;
+    const parsed = effective.parsed;
 
     return {
       tsConfigPath,
