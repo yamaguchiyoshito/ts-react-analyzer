@@ -44,9 +44,11 @@ node dist/src/cli.js diff ./target-app \
 
 1. `current_diff.md` — 今回の変更で何が悪化したか
 2. `current_diff.html` — 影響範囲をグラフで確認
-3. `current_report.md` — 全体のサマリー
-4. `current_files.csv` — 負債候補の横比較
-5. `current_dependencies.csv` — 依存の根拠確認
+3. `current_current_report.md` — 全体のサマリー (diff 時点の解析結果は `<prefix>_current_report.*` に出ます)
+4. `current_current_files.csv` — 負債候補の横比較
+5. `current_current_dependencies.csv` — 依存の根拠確認
+
+baseline に指定した `baseline_report.json` は diff では上書きされないので、同じ基準点に対して何度でも比較できます。
 
 差分を先に見るのは、単に絶対値が大きいだけのファイルと、今回の変更で危険になったファイルを混ぜないためです。
 
