@@ -40,7 +40,12 @@ variables:
   TSRA_IMPACT_THRESHOLD: "50"           # MR ゲートを厳しくする
   TSRA_SETUP_CMD: "npm ci"              # 型エラー数を正しく測りたい場合
   TSRA_QUALITY_MONITORING_METRICS: "documentation_presence"  # ドキュメント整備の悪化では出荷を止めない
+  TSRA_REPO_REF: "v0.3.0"               # ツールのバージョンを固定する (タグが無ければコミット SHA)
 ```
+
+### 4. ツールのバージョンを固定する (推奨)
+
+`TSRA_REPO_REF` の既定値は `master` で、テンプレートを取り込んだ時点の最新版が毎回使われます。判定基準が予告なく変わると困る本番のパイプラインでは、**タグ (例: `v0.3.0`) またはコミット SHA (完全形) に固定** し、更新は意図したタイミングで行ってください。ブランチ・タグ・SHA のどれでも同じ書き方で指定できます。
 
 ## 変数一覧
 
@@ -54,15 +59,15 @@ variables:
 | `TSRA_SETUP_CMD` | (空) | 解析前に `TSRA_PROJECT_DIR` で実行するコマンド (例: `npm ci`) |
 | `TSRA_NODE_IMAGE` | `node:22` | ジョブの実行イメージ |
 | `TSRA_REPO_URL` | このリポジトリ | ts-react-analyzer の取得元 |
-| `TSRA_REPO_REF` | `master` | 取得するブランチまたはタグ |
+| `TSRA_REPO_REF` | `master` | 取得するブランチ・タグ・コミット SHA。**本番運用ではタグか SHA に固定してください** (`master` は予告なく変わります) |
 
 ## baseline はどう受け渡されるか
 
 1. デフォルトブランチに push すると `tsra:baseline` がレポートを生成し、ジョブ成果物 (artifacts) として 90 日保存します
-2. MR の `tsra:diff` は、ターゲットブランチの最新 `tsra:baseline` 成果物から `*_report.json` を取得して比較します
+2. MR の `tsra:diff` は、ターゲットブランチの最新 `tsra:baseline` 成果物から `*_report.json` を取得して比較します (`release/1.2` のようにスラッシュを含むブランチ名やパスも URL エンコードして取得します)
 3. `tsra:quality-gate` も同様に、前回の `*_quality_report.json` を取得して悪化を検知します
 
-**初回 (baseline がまだ無いとき) は失敗しません。** 現状解析だけを実行して成功し、デフォルトブランチで `tsra:baseline` が一度成功すると次の MR から差分ゲートが有効になります。
+**初回 (baseline がまだ無いとき、HTTP 404) は失敗しません。** 現状解析だけを実行して成功し、デフォルトブランチで `tsra:baseline` が一度成功すると次の MR から差分ゲートが有効になります。404 以外 (権限不足など) で取得に失敗した場合も現状解析にフォールバックしますが、ジョブログに `警告: baseline の取得に失敗しました (HTTP ...)` と URL を出すので、静かにゲートが無効になることはありません。
 
 ## ゲートに落ちたときの見方
 
@@ -76,3 +81,6 @@ variables:
 - 解析キャッシュ (`.ts-analyzer-cache`) は GitLab の cache に載せているため、2 回目以降の実行は速くなります
 - TypeScript の型エラー数を品質レポートで正しく測るには、依存パッケージが必要です。`TSRA_SETUP_CMD: "npm ci"` を指定してください (未指定でも他の解析は動きます)
 - ジョブは既定の `test` ステージで動きます。ステージを分けたい場合は同名ジョブを定義して `stage:` を上書きしてください
+- `script` は bash を前提にしています (`node:*` イメージの既定シェル)。Alpine 系など `sh` しか無いイメージを `TSRA_NODE_IMAGE` に指定する場合は bash を追加してください
+- ログを静かにしたい場合は各 `node "$TSRA_CLI" ...` に `--quiet` を足してください。進行ログ (`[INFO]`) が消え、結果サマリーと警告・エラーだけが残ります
+- GitHub Actions を使っている場合は [ci-templates/github](../github/README.md) を参照してください

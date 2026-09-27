@@ -6,15 +6,41 @@ import { createGzip } from "node:zlib";
 
 import type { LogEntry, LogLevel } from "../types/index.js";
 
+export interface LoggerConsoleOptions {
+  /**
+   * true のとき INFO / DEBUG を画面 (標準出力) に出さない。
+   * ログファイルへの書き込みと、WARN / ERROR の標準エラー出力は変わらない。
+   */
+  quiet?: boolean;
+}
+
 export class Logger {
+  // CLI の --quiet はプロセス全体の設定なので、個々の Logger を生成する箇所を
+  // 変えずに済むよう既定値をクラス側に持つ (コンストラクタ引数で個別に上書き可)
+  private static defaultConsoleOptions: Required<LoggerConsoleOptions> = { quiet: false };
+
   private readonly logFile: string;
   private readonly level: LogLevel;
+  private readonly quiet: boolean;
   private readonly buffer: LogEntry[] = [];
   private readonly bufferSize = 100;
 
-  constructor(level: LogLevel = "INFO", logFile = "./analysis.log") {
+  constructor(level: LogLevel = "INFO", logFile = "./analysis.log", consoleOptions: LoggerConsoleOptions = {}) {
     this.level = level;
     this.logFile = logFile;
+    this.quiet = consoleOptions.quiet ?? Logger.defaultConsoleOptions.quiet;
+  }
+
+  /** 以後に生成される Logger の画面出力の既定値を変える (CLI の --quiet 用) */
+  static configureConsole(options: LoggerConsoleOptions): void {
+    Logger.defaultConsoleOptions = {
+      quiet: options.quiet ?? Logger.defaultConsoleOptions.quiet,
+    };
+  }
+
+  /** ログの書き込み先ファイル (エラー時の案内に使う) */
+  get logFilePath(): string {
+    return this.logFile;
   }
 
   async initialize(): Promise<void> {
@@ -59,10 +85,24 @@ export class Logger {
     };
 
     this.buffer.push(entry);
-    console.log(this.format(entry));
+    this.printToConsole(entry);
 
     if (this.buffer.length >= this.bufferSize) {
       void this.flushBuffer();
+    }
+  }
+
+  // WARN / ERROR は標準エラー、INFO / DEBUG は標準出力へ。
+  // 人向けのサマリー (✔ ...) は標準出力に出るため、--quiet では INFO / DEBUG だけを抑止し、
+  // 警告と失敗は画面に残す。ログファイルの内容と形式は quiet の有無で変わらない。
+  private printToConsole(entry: LogEntry): void {
+    const line = this.format(entry);
+    if (entry.level === "WARN" || entry.level === "ERROR") {
+      console.error(line);
+      return;
+    }
+    if (!this.quiet) {
+      console.log(line);
     }
   }
 

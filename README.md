@@ -1,5 +1,7 @@
 # ts-react-analyzer
 
+English version: [README.en.md](README.en.md)
+
 React / TypeScript プロジェクトの「直すべき場所」を短時間で見つけるための静的解析 CLI です。  
 `.ts` / `.tsx` / `.js` / `.jsx` を解析します。
 
@@ -12,14 +14,27 @@ React / TypeScript プロジェクトの「直すべき場所」を短時間で�
 
 ## 必要環境
 
-- Node.js 22 以上を推奨
+- Node.js 20 以上 (22 以上を推奨)。20 未満で起動すると理由を表示して終了コード `1` で止まります
 - npm または pnpm
 
 ## インストール
 
+このリポジトリを clone してビルドします。
+
 ```bash
 npm install
 npm run build
+```
+
+以降の例は `node dist/src/cli.js <コマンド>` の形で書いています。`dist/src/cli.js` には shebang が付いているので、コマンドとして登録して `ts-react-analyzer <コマンド>` と打つこともできます。
+
+```bash
+# ビルド済みのこのディレクトリをグローバルコマンドとして登録する
+npm install -g .
+ts-react-analyzer analyze ./my-app
+
+# または、解析対象プロジェクトの devDependencies に入れて npx で呼ぶ
+npx ts-react-analyzer analyze .
 ```
 
 ## 5 分で試す
@@ -46,6 +61,8 @@ node dist/src/cli.js quality gate ./my-app
 レポートは既定で `<my-app>/analysis-reports/` に出力されます。  
 まず `analysis_report.md` を開くと、優先対応 Top 5 と改善提案から読み始められます。`--open` を付けると HTML レポートがブラウザで開きます。
 
+CI などで進行ログ (`[INFO] ...`) が邪魔な場合は `--quiet` (`-q`) を付けてください。結果サマリーと警告・エラーだけが画面に残り、ログファイル (`<my-app>/analysis.log`) には従来どおりすべて記録されます。`-h` でヘルプ、`-v` でバージョンを表示します。
+
 ## ドキュメント
 
 | 知りたいこと | ドキュメント |
@@ -58,6 +75,7 @@ node dist/src/cli.js quality gate ./my-app
 | 品質レポート・quality gate・手動証跡の仕様・指標 ID 一覧 | [品質レポート](docs/quality.md) |
 | 表示記号 (○△×・クラスタコード・↗↘) とスケールの定義 | [用語集](docs/glossary.md) |
 | GitLab CI への組み込みテンプレート | [ci-templates/gitlab](ci-templates/gitlab/README.md) |
+| GitHub Actions への組み込みテンプレート | [ci-templates/github](ci-templates/github/README.md) |
 
 ## 開発者向け
 
@@ -71,6 +89,7 @@ npm test
 
 ## 注意
 
-- Node.js 標準 API を前提にしているため、古い Node では動きません
+- Node.js 標準 API を前提にしているため、Node.js 20 未満では動きません (起動時にバージョンを確認して止まります)
+- 引数なしで起動するとヘルプを表示して終了コード `1` になります (`--help` は `0`)。終了コードの一覧は [コマンドリファレンス](docs/commands.md#終了コード) を参照してください
 - `diff` は baseline に `analyze` が出力した `*_report.json` を要求します。diff 自身の解析結果は `*_current_report.*` に書かれ、baseline は上書きされません
 - HTML レポート内の `file://` リンクの開き方は利用環境に依存します
