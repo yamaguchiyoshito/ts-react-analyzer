@@ -765,7 +765,9 @@ async function buildArtifacts(
   const analysisCache = new AnalysisCache(config.cacheDir, projectDir, config.tsCompilerOptions);
   await analysisCache.initialize();
 
-  const dependencyAnalyzer = new DependencyAnalyzer(path.resolve(projectDir), config.tsCompilerOptions);
+  const dependencyAnalyzer = new DependencyAnalyzer(path.resolve(projectDir), config.tsCompilerOptions, {
+    pathMappings: config.pathMappings,
+  });
   const complexityAnalyzer = new ComplexityAnalyzer();
   const graphBuilder = new GraphBuilder();
   const results: AnalysisResult[] = [];
@@ -810,7 +812,9 @@ async function buildArtifacts(
 
     if (scopedFilePaths.has(parsedFile.filePath)) {
       for (const dependency of result.dependencies) {
-        if (!dependency.isExternal) {
+        // 型のみの import / export は実行時の依存を生まないため、循環検出の辺にしない
+        // (dependencies 一覧と件数には残る)
+        if (!dependency.isExternal && !dependency.isTypeOnly) {
           graphBuilder.addDependency(dependency.source, dependency.target, {
             type: dependency.type,
             isExternal: dependency.isExternal,
