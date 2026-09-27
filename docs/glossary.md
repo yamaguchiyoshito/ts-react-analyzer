@@ -58,6 +58,18 @@ JSON / CSV の機械可読値は小文字の英語 (`pass` / `warn` / `fail` / `
 
 severity とリスクは「どこから直すか」の優先順位付け、判定は「出荷してよいか」の合否です。尺度としては独立しており、相互変換はしません。
 
+## 循環依存の重大度
+
+循環依存 (`graph.cycles`) は強連結成分 (SCC) ごとに 1 件と数え、その件の重大度は **絡み合っているファイル数** (`length` = `affectedFiles`) で決めます。hot spot の severity とは別の尺度です。
+
+| SCC の規模 | severity | 意味 |
+|------------|----------|------|
+| 6 ファイル以上 | critical | 境界を引き直さないと解けない塊。1 本の import を切っても残りが循環し続ける |
+| 3〜5 ファイル | high | 複数ファイルにまたがる循環。どの辺を切るか設計判断が要る |
+| 2 ファイル以下 | medium | 相互参照 (または自己参照)。どちらか一方の import を切れば解消できる |
+
+各件には SCC 内部で閉じている辺の本数 `edgeCount` も付きます。ファイル数に対して `edgeCount` が多いほど密に絡み合っており、同じ severity でも解消コストが高いと読んでください。循環依存の件数 (`cycleCount`、「循環依存 N 件」) は SCC の数なので、60 ファイルの塊でも 1 件です。規模は `largestStronglyConnectedComponentSize` と各件の `length` / `edgeCount` で確認してください。
+
 ## score の算出
 
 hot spot の score は次の合算です (各行の内訳はレポートの「score の内訳」に出力されます)。

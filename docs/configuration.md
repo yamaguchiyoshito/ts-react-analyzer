@@ -86,7 +86,7 @@ quality gate の blocking / monitoring 指定の意味は [品質レポート](q
 
 除外パターン (既定グループも `excludePatterns` も) は、解析対象ディレクトリ (`projectDir`) からの**プロジェクト相対パス**にスラッシュ区切りで照合されます (例: `src/components/Button.tsx`、ディレクトリなら `src/build`)。プロジェクトより上位のディレクトリ名は照合対象にならないため、`/tmp/build/app` のような場所にあるプロジェクトでも既定の `build` 除外には巻き込まれません。逆に `src/build/` のようなプロジェクト内部のディレクトリは既定の `build` 除外に一致するので、必要なら `--exclude-groups` で該当グループを外してください。
 
-さらに除外したい場合は `--exclude-patterns` か `analyzer.config.json` の `excludePatterns` を使ってください (例: `^src/legacy/`)。
+さらに除外したい場合は `--exclude-patterns` か `analyzer.config.json` の `excludePatterns` を使ってください (例: `^src/legacy/`)。パターンは JavaScript の正規表現で、Windows でも区切りは `/` で書いてください (`\\` 区切りには一致しません)。正規表現として不正なパターンは文字列そのままの一致として扱われ、その旨がスキャン結果の `warnings` に記録されます。
 
 ## キャッシュ
 

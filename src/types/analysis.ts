@@ -145,6 +145,8 @@ export interface ScanResult {
   parsed: ParsedFile[];
   skipped: SkippedFile[];
   errors: ScanError[];
+  // 解析は続行できるが利用者に知らせるべき事象 (無効な除外パターンなど)
+  warnings: string[];
   cacheStats: CacheStats;
 }
 
@@ -205,8 +207,11 @@ export interface ExtractionResult {
 export interface CircularDep {
   nodes: string[];
   length: number;
+  // 強連結成分 (SCC) の規模で判定する: 6 ファイル以上 = critical / 3〜5 = high / 2 以下 = medium
   severity: "critical" | "high" | "medium";
   affectedFiles: number;
+  // SCC 内部で閉じている辺の本数 (ファイル数に対して多いほど絡み合いが強い)
+  edgeCount: number;
 }
 
 export interface ParameterMetric {
@@ -328,6 +333,18 @@ export interface GraphNode {
 export interface EdgeMetadata {
   type?: DependencyType;
   isExternal?: boolean;
+  isTypeOnly?: boolean;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+  // source -> target の依存文の本数
+  weight: number;
+  // 辺を構成する依存文の種別 (重複なし、整列済み)
+  types: DependencyType[];
+  // 辺を構成する依存文がすべて型のみだった場合に true
+  isTypeOnly?: boolean;
 }
 
 export interface GraphMetrics {
@@ -345,7 +362,7 @@ export interface GraphMetrics {
 
 export interface GraphJSON {
   nodes: GraphNode[];
-  edges: Array<{ source: string; target: string; weight: number }>;
+  edges: GraphEdge[];
 }
 
 export interface GenerationOptions {
