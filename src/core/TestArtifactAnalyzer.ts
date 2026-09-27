@@ -127,8 +127,11 @@ export class TestArtifactAnalyzer {
         continue;
       }
       acceptedFiles.push(filePath);
-      const suiteTags = Array.from(xml.matchAll(/<testsuite\b[^>]*>/gu));
-      const testcases = this.extractJUnitTestCases(xml);
+      // CDATA / system-out / system-err / コメント内に現れる "<failure" や "</testcase>" は
+      // 出力ログの一部であって結果ではないため、構造を解析する前に中身を取り除く
+      const sanitizedXml = this.stripJUnitOpaqueContent(xml);
+      const suiteTags = Array.from(sanitizedXml.matchAll(/<testsuite\b[^>]*>/gu));
+      const testcases = this.extractJUnitTestCases(sanitizedXml);
 
       if (testcases.length > 0) {
         totalTests += testcases.length;
@@ -158,8 +161,8 @@ export class TestArtifactAnalyzer {
       }
 
       if (suiteTags.length === 0 && testcases.length === 0) {
-        failedTests += Array.from(xml.matchAll(/<(failure|error)\b/gu)).length;
-        skippedTests += Array.from(xml.matchAll(/<skipped\b/gu)).length;
+        failedTests += Array.from(sanitizedXml.matchAll(/<(failure|error)\b/gu)).length;
+        skippedTests += Array.from(sanitizedXml.matchAll(/<skipped\b/gu)).length;
       }
     }
 
@@ -177,6 +180,14 @@ export class TestArtifactAnalyzer {
       files: acceptedFiles,
       executedTestFiles: Array.from(executedTestFiles).sort(),
     };
+  }
+
+  private stripJUnitOpaqueContent(xml: string): string {
+    return xml
+      .replace(/<!\[CDATA\[[\s\S]*?\]\]>/gu, "")
+      .replace(/<!--[\s\S]*?-->/gu, "")
+      .replace(/<system-out\b[^>]*>[\s\S]*?<\/system-out>/giu, "<system-out></system-out>")
+      .replace(/<system-err\b[^>]*>[\s\S]*?<\/system-err>/giu, "<system-err></system-err>");
   }
 
   private extractJUnitTestCases(xml: string): Array<{ raw: string; body: string }> {
@@ -224,10 +235,17 @@ export class TestArtifactAnalyzer {
           return;
         }
 
-        const existing = sourceFiles.get(currentSourcePath) ?? { lineFound: 0, lineHit: 0 };
-        existing.lineFound += currentLineFound;
-        existing.lineHit += currentLineHit;
-        sourceFiles.set(currentSourcePath, existing);
+        // coverage/lcov.info と lcov.info の両方が同じ SF を持つ場合 (あるいは同一ファイル内で
+        // 同じ SF レコードが繰り返される場合) に LF/LH を足し込むと行数が倍になるため、
+        // 同じ SF は 1 レコードとして扱い、より情報量の多い方 (LF が大きい → LH が大きい) を採る
+        const existing = sourceFiles.get(currentSourcePath);
+        if (
+          !existing
+          || currentLineFound > existing.lineFound
+          || (currentLineFound === existing.lineFound && currentLineHit > existing.lineHit)
+        ) {
+          sourceFiles.set(currentSourcePath, { lineFound: currentLineFound, lineHit: currentLineHit });
+        }
       };
 
       for (const line of content.split(/\r?\n/u)) {
@@ -348,14 +366,28 @@ export class TestArtifactAnalyzer {
     };
   }
 
+  // 属性値は "..." と '...' の両方を受け付ける。`tests=` が `skippedtests=` の一部に
+  // 一致しないよう、属性名の直前が名前文字でないことを要求する
+  private extractAttribute(tag: string, attribute: string): string | null {
+    const match = new RegExp(`(?<![\\w:.-])${attribute}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "u").exec(tag);
+    if (!match) {
+      return null;
+    }
+    return match[1] ?? match[2] ?? null;
+  }
+
   private extractIntegerAttribute(tag: string, attribute: string): number {
-    const match = new RegExp(`${attribute}="(\\d+)"`, "u").exec(tag);
-    return match ? Number.parseInt(match[1] ?? "0", 10) : 0;
+    const value = this.extractAttribute(tag, attribute);
+    if (value === null) {
+      return 0;
+    }
+    const parsed = Number.parseInt(value.trim(), 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
   }
 
   private extractStringAttribute(tag: string, attribute: string): string | null {
-    const match = new RegExp(`${attribute}="([^"]+)"`, "u").exec(tag);
-    return match?.[1]?.trim() ? match[1].trim() : null;
+    const value = this.extractAttribute(tag, attribute)?.trim();
+    return value ? value : null;
   }
 
   private resolveArtifactSourcePath(projectRoot: string, artifactFilePath: string, sourcePath: string): string {
