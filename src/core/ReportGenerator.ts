@@ -266,7 +266,7 @@ export class ReportGenerator {
       this.generateTypeSafetySection(),
       this.generateDependencyAnalysisSection(),
       this.generateFileTypeDistributionSection(),
-      this.generateDirectoryPurposeSection(),
+      this.generateDirectoryPurposeSection(options.complexityThreshold),
       this.generateMatrixClusterSection(),
       this.generateComponentsSection(),
       this.generateScanSection(options.skippedFiles ?? [], options.scanErrors ?? [], options.parseIssues ?? []),
@@ -559,7 +559,7 @@ export class ReportGenerator {
     return markdown;
   }
 
-  private generateDirectoryPurposeSection(): string {
+  private generateDirectoryPurposeSection(complexityThreshold?: number): string {
     if (this.analysisResults.length === 0) {
       return "## ディレクトリ目的と改善提案\n\nディレクトリごとの目的定義と、目的と実装内容のずれを確認します。\n\n解析対象ファイルはありません。\n\n";
     }
@@ -587,7 +587,7 @@ export class ReportGenerator {
     }
     markdown += "\n";
 
-    const audit = auditDirectoryPurposes(this.analysisResults, (filePath) => this.toDisplayPath(filePath));
+    const audit = auditDirectoryPurposes(this.analysisResults, (filePath) => this.toDisplayPath(filePath), { complexityThreshold });
     markdown += "### 目的に沿った改善提案\n\n";
     if (audit.findings.length === 0) {
       markdown += "目的と実装内容の不整合は検出されませんでした。\n\n";
@@ -1097,7 +1097,9 @@ export class ReportGenerator {
         ...decisionSummary,
         topHotSpots: decisionSummary.topHotSpots.map((item) => ({ ...item, path: rel(item.path) })),
       },
-      directoryPurposeAudit: auditDirectoryPurposes(this.analysisResults, (filePath) => this.toDisplayPath(filePath)),
+      directoryPurposeAudit: auditDirectoryPurposes(this.analysisResults, (filePath) => this.toDisplayPath(filePath), {
+        complexityThreshold: options.complexityThreshold,
+      }),
     };
 
     return report;

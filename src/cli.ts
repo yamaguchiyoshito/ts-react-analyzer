@@ -859,6 +859,11 @@ async function buildArtifacts(
     fileCacheHits: fullScanResult.cacheStats.hits,
     fileCacheMisses: fullScanResult.cacheStats.misses,
   });
+  // 不正な除外正規表現など、スキャン時の警告は黙って読み替えずに利用者へ知らせる
+  for (const warning of fullScanResult.warnings ?? []) {
+    logger.warn("Scan warning", { warning });
+    console.warn(`警告: ${warning}`);
+  }
 
   // 走査候補 (解析対象 + スコープ外で読み飛ばした候補 + 読めなかったファイル) の集合を指紋にする。
   // 未変更ファイルでも、隣にファイルが増減・改名されると import の解決先が変わり得るため
