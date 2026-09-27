@@ -6,7 +6,7 @@ import { watch as watchFileSystem } from "node:fs";
 import readline from "node:readline/promises";
 import { parseArgs } from "node:util";
 
-import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, ManualQualityInputError, ManualQualityInputLoader, QualityDiffGenerator, QualityReportGenerator, ReportGenerator, selectBlockingRegressionMetrics, validateQualityGateMetricIds } from "./core/index.js";
+import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, ManualQualityInputError, ManualQualityInputLoader, QualityDiffGenerator, QualityReportGenerator, REPORT_SCHEMA_VERSION, ReportGenerator, selectBlockingRegressionMetrics, validateQualityGateMetricIds } from "./core/index.js";
 import { shouldIncludeInAnalysisScope } from "./core/FileConventions.js";
 import type { AnalysisConfig, AnalysisDiffReport, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, OutputFormat, ParseIssue, PersistedAnalysisReport, QualityDiffReport, QualityMetricDiffEntry, QualityReport, SkippedFile } from "./types/index.js";
 
@@ -244,7 +244,62 @@ async function printVersion(): Promise<void> {
   }
 }
 
-async function loadBaselineReport<T>(baselinePath: string, createHint: string): Promise<T> {
+type BaselineReportKind = "analysis" | "quality";
+
+const BASELINE_REPORT_DESCRIPTIONS: Record<BaselineReportKind, string> = {
+  analysis: "analyze が出力した *_report.json",
+  quality: "quality collect が出力した *_quality_report.json",
+};
+
+function looksLikeAnalysisReport(record: Record<string, unknown>): boolean {
+  return Array.isArray(record.files) && typeof record.statistics === "object" && record.statistics !== null;
+}
+
+function looksLikeQualityReport(record: Record<string, unknown>): boolean {
+  return Array.isArray(record.categories) && typeof record.summary === "object" && record.summary !== null;
+}
+
+/**
+ * baseline JSON がこのコマンドの期待するレポート種別かを検証する。品質レポートを
+ * analyze の diff に渡すなど取り違えたとき、比較処理の奥で TypeError になる前に
+ * 利用者向けのメッセージで止める。schemaVersion が無い旧ファイルは受け入れ、
+ * このツールより新しい版だけを拒否する。
+ */
+function assertBaselineReportShape(parsed: unknown, kind: BaselineReportKind, baselinePath: string): void {
+  const expected = BASELINE_REPORT_DESCRIPTIONS[kind];
+  const record = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? parsed as Record<string, unknown>
+    : undefined;
+  const matches = record
+    ? (kind === "analysis" ? looksLikeAnalysisReport(record) : looksLikeQualityReport(record))
+    : false;
+  if (!record || !matches) {
+    const otherKind: BaselineReportKind = kind === "analysis" ? "quality" : "analysis";
+    const looksLikeOther = record
+      ? (otherKind === "analysis" ? looksLikeAnalysisReport(record) : looksLikeQualityReport(record))
+      : false;
+    const detail = looksLikeOther
+      ? `指定されたファイルは ${BASELINE_REPORT_DESCRIPTIONS[otherKind]} のようです。`
+      : "このコマンドが比較できるレポート JSON を --baseline に指定してください。";
+    throw new CliUserError(`baseline は ${expected} ではありません: ${baselinePath}\n${detail}`);
+  }
+
+  const schemaVersion = record.schemaVersion;
+  if (schemaVersion === undefined) {
+    return;
+  }
+  if (typeof schemaVersion !== "number" || !Number.isInteger(schemaVersion) || schemaVersion < 1) {
+    throw new CliUserError(`baseline の schemaVersion が不正です (${String(schemaVersion)}): ${baselinePath}`);
+  }
+  if (schemaVersion > REPORT_SCHEMA_VERSION) {
+    throw new CliUserError([
+      `baseline のスキーマ版 ${schemaVersion} はこのツールが扱える版 ${REPORT_SCHEMA_VERSION} より新しいため読み込めません: ${baselinePath}`,
+      "ts-react-analyzer を baseline を作成したバージョン以上に更新してください。",
+    ].join("\n"));
+  }
+}
+
+async function loadBaselineReport<T>(baselinePath: string, kind: BaselineReportKind, createHint: string): Promise<T> {
   let content: string;
   try {
     content = await fs.readFile(baselinePath, "utf8");
@@ -254,13 +309,16 @@ async function loadBaselineReport<T>(baselinePath: string, createHint: string): 
     }
     throw error;
   }
+  let parsed: unknown;
   try {
-    return JSON.parse(content) as T;
+    parsed = JSON.parse(content);
   } catch {
     throw new CliUserError(
       `baseline を JSON として読み込めませんでした: ${baselinePath}\nこのツールが出力したレポート JSON を指定してください。`,
     );
   }
+  assertBaselineReportShape(parsed, kind, baselinePath);
+  return parsed as T;
 }
 
 async function handleCommandError(
@@ -692,6 +750,7 @@ async function watchDiff(
       path: baselinePath,
       report: await loadBaselineReport<PersistedAnalysisReport>(
         baselinePath,
+        "analysis",
         "先に analyze を実行して baseline を作成するか、--baseline で既存の *_report.json を指定してください。",
       ),
     };
@@ -800,6 +859,11 @@ async function buildArtifacts(
     fileCacheHits: fullScanResult.cacheStats.hits,
     fileCacheMisses: fullScanResult.cacheStats.misses,
   });
+  // 不正な除外正規表現など、スキャン時の警告は黙って読み替えずに利用者へ知らせる
+  for (const warning of fullScanResult.warnings ?? []) {
+    logger.warn("Scan warning", { warning });
+    console.warn(`警告: ${warning}`);
+  }
 
   // 走査候補 (解析対象 + スコープ外で読み飛ばした候補 + 読めなかったファイル) の集合を指紋にする。
   // 未変更ファイルでも、隣にファイルが増減・改名されると import の解決先が変わり得るため
@@ -1045,6 +1109,7 @@ async function diffProject(
     const baseline = typeof baselineSource === "string"
       ? await loadBaselineReport<PersistedAnalysisReport>(
           baselineSource,
+          "analysis",
           "先に analyze を実行して baseline を作成するか、--baseline で既存の *_report.json を指定してください。",
         )
       : baselineSource.report;
@@ -1136,6 +1201,7 @@ async function qualityProject(
     const baselineReport = (mode === "diff" || mode === "gate") && baselinePath
       ? await loadBaselineReport<QualityReport>(
           baselinePath,
+          "quality",
           "先に quality collect を実行して baseline を作成するか、--baseline で既存の *_quality_report.json を指定してください。",
         )
       : undefined;

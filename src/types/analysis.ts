@@ -454,6 +454,8 @@ export interface DirectoryPurposeAuditReport {
 }
 
 export interface PersistedAnalysisReport {
+  /** レポート JSON のスキーマ版 (現在 1)。旧バージョンが出力したファイルには無い */
+  schemaVersion?: number;
   timestamp: string;
   executionTimeMs: number;
   projectRoot?: string;
@@ -682,6 +684,8 @@ export interface QualityGateRenderContext {
 }
 
 export interface QualityReport {
+  /** レポート JSON のスキーマ版 (現在 1)。旧バージョンが出力したファイルには無い */
+  schemaVersion?: number;
   timestamp: string;
   executionTimeMs: number;
   projectRoot: string;

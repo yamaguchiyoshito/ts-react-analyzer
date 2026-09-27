@@ -5,6 +5,17 @@ import { pathToFileURL } from "node:url";
 import { CLUSTER_CODES, describeClusterAxes, describeClusterMeaning, formatClusterWithLabel, getClusterWeight, isHighComplexityCluster } from "./ClusterCodes.js";
 import { auditDirectoryPurposes } from "./DirectoryPurposeAuditor.js";
 import { classifyFileType, getFileTypePurpose, KNOWN_FILE_TYPES } from "./FileConventions.js";
+import {
+  collectTestTargetKeys,
+  escapeHtml,
+  escapeMarkdownCell,
+  hasMatchingTestFile,
+  REPORT_BASE_CSS,
+  REPORT_SCHEMA_VERSION,
+  serializeForHtmlScript,
+  toCsvRow,
+  toDisplayPath,
+} from "./ReportUtils.js";
 import type {
   AnalysisResult,
   CacheStats,
@@ -12,7 +23,6 @@ import type {
   Dependency,
   FunctionMetrics,
   GenerationOptions,
-  GraphJSON,
   GraphMetrics,
   HookInfo,
   HotSpotReportItem,
@@ -256,7 +266,7 @@ export class ReportGenerator {
       this.generateTypeSafetySection(),
       this.generateDependencyAnalysisSection(),
       this.generateFileTypeDistributionSection(),
-      this.generateDirectoryPurposeSection(),
+      this.generateDirectoryPurposeSection(options.complexityThreshold),
       this.generateMatrixClusterSection(),
       this.generateComponentsSection(),
       this.generateScanSection(options.skippedFiles ?? [], options.scanErrors ?? [], options.parseIssues ?? []),
@@ -359,7 +369,7 @@ export class ReportGenerator {
     markdown += "| 順位 | ファイル | severity | 主因 | score | 複雑度 | 依存 | any | Hooks | クラスタ | 推奨対応 |\n";
     markdown += "|------|----------|----------|------|-------|----------|------|-----|-------|----------|----------|\n";
     hotSpots.forEach((item, index) => {
-      markdown += `| ${index + 1} | ${item.displayPath} | ${this.getHotSpotSeverity(item.score)} | ${this.getPrimaryRiskAxisLabel(item.path)} | ${item.score} | ${item.complexity} | ${this.formatDependencyBreakdown(item.path, item.dependencies)} | ${item.anyCount} | ${item.hooks} | ${item.cluster} | ${item.action} |\n`;
+      markdown += `| ${index + 1} | ${escapeMarkdownCell(item.displayPath)} | ${this.getHotSpotSeverity(item.score)} | ${this.getPrimaryRiskAxisLabel(item.path)} | ${item.score} | ${item.complexity} | ${this.formatDependencyBreakdown(item.path, item.dependencies)} | ${item.anyCount} | ${item.hooks} | ${item.cluster} | ${escapeMarkdownCell(item.action)} |\n`;
     });
     markdown += "\n";
 
@@ -549,7 +559,7 @@ export class ReportGenerator {
     return markdown;
   }
 
-  private generateDirectoryPurposeSection(): string {
+  private generateDirectoryPurposeSection(complexityThreshold?: number): string {
     if (this.analysisResults.length === 0) {
       return "## ディレクトリ目的と改善提案\n\nディレクトリごとの目的定義と、目的と実装内容のずれを確認します。\n\n解析対象ファイルはありません。\n\n";
     }
@@ -577,7 +587,7 @@ export class ReportGenerator {
     }
     markdown += "\n";
 
-    const audit = auditDirectoryPurposes(this.analysisResults, (filePath) => this.toDisplayPath(filePath));
+    const audit = auditDirectoryPurposes(this.analysisResults, (filePath) => this.toDisplayPath(filePath), { complexityThreshold });
     markdown += "### 目的に沿った改善提案\n\n";
     if (audit.findings.length === 0) {
       markdown += "目的と実装内容の不整合は検出されませんでした。\n\n";
@@ -612,11 +622,11 @@ export class ReportGenerator {
           continue;
         }
         renderedAggregates.add(finding.rule);
-        markdown += `| ${ruleCount} ファイル（例: ${finding.filePath}） | ${finding.fileType} | ${finding.severity} | ${finding.issue} ほか同種 ${ruleCount - 1} 件 | ${finding.suggestion} 全対象は JSON の \`directoryPurposeAudit\` を参照してください |\n`;
+        markdown += `| ${ruleCount} ファイル（例: ${escapeMarkdownCell(finding.filePath)}） | ${finding.fileType} | ${finding.severity} | ${escapeMarkdownCell(finding.issue)} ほか同種 ${ruleCount - 1} 件 | ${escapeMarkdownCell(finding.suggestion)} 全対象は JSON の \`directoryPurposeAudit\` を参照してください |\n`;
         renderedRows += 1;
         continue;
       }
-      markdown += `| ${finding.filePath} | ${finding.fileType} | ${finding.severity} | ${finding.issue} | ${finding.suggestion} |\n`;
+      markdown += `| ${escapeMarkdownCell(finding.filePath)} | ${finding.fileType} | ${finding.severity} | ${escapeMarkdownCell(finding.issue)} | ${escapeMarkdownCell(finding.suggestion)} |\n`;
       renderedRows += 1;
     }
     markdown += "\n";
@@ -681,7 +691,7 @@ export class ReportGenerator {
     markdown += "| ファイル | any | assertions | unsafe | double | non-null | ts-ignore | score |\n";
     markdown += "|----------|-----|------------|--------|--------|----------|-----------|-------|\n";
     for (const item of worstFiles) {
-      markdown += `| ${item.path} | ${item.anyCount} | ${item.assertionCount} | ${item.unsafeAssertionCount} | ${item.doubleAssertionCount} | ${item.nonNullAssertionCount} | ${item.tsIgnoreCount} | ${item.score} |\n`;
+      markdown += `| ${escapeMarkdownCell(item.path)} | ${item.anyCount} | ${item.assertionCount} | ${item.unsafeAssertionCount} | ${item.doubleAssertionCount} | ${item.nonNullAssertionCount} | ${item.tsIgnoreCount} | ${item.score} |\n`;
     }
     markdown += "\n";
 
@@ -794,7 +804,7 @@ export class ReportGenerator {
       markdown += "| 観点 | ファイル | 指標 | 含意 |\n";
       markdown += "|------|----------|------|------|\n";
       for (const row of structureRows) {
-        markdown += `| ${row.aspect} | ${row.file} | ${row.metric} | ${row.implication} |\n`;
+        markdown += `| ${row.aspect} | ${escapeMarkdownCell(row.file)} | ${row.metric} | ${row.implication} |\n`;
       }
       markdown += "\n";
     } else {
@@ -848,7 +858,7 @@ export class ReportGenerator {
       markdown += "| コンポーネント | ファイル | Hooks数 | 主な Hooks |\n";
       markdown += "|----------------|----------|---------|------------|\n";
       for (const component of hookHeavy) {
-        markdown += `| ${component.name} | ${component.file} | ${component.hookCount} | ${this.summarizeHookUsage(component.hooksUsed)} |\n`;
+        markdown += `| ${escapeMarkdownCell(component.name)} | ${escapeMarkdownCell(component.file)} | ${component.hookCount} | ${escapeMarkdownCell(this.summarizeHookUsage(component.hooksUsed))} |\n`;
       }
       markdown += "\n";
     }
@@ -1039,6 +1049,7 @@ export class ReportGenerator {
     // added/removed 判定になり比較が成立しない。
     const rel = (filePath: string): string => this.toDisplayPath(filePath);
     const report: PersistedAnalysisReport = {
+      schemaVersion: REPORT_SCHEMA_VERSION,
       timestamp: new Date().toISOString(),
       executionTimeMs: this.executionTime,
       projectRoot: this.projectRoot,
@@ -1086,7 +1097,9 @@ export class ReportGenerator {
         ...decisionSummary,
         topHotSpots: decisionSummary.topHotSpots.map((item) => ({ ...item, path: rel(item.path) })),
       },
-      directoryPurposeAudit: auditDirectoryPurposes(this.analysisResults, (filePath) => this.toDisplayPath(filePath)),
+      directoryPurposeAudit: auditDirectoryPurposes(this.analysisResults, (filePath) => this.toDisplayPath(filePath), {
+        complexityThreshold: options.complexityThreshold,
+      }),
     };
 
     return report;
@@ -1098,14 +1111,14 @@ export class ReportGenerator {
       .map((result) => {
         const risk = this.getRiskLevel(result.complexity.overallComplexity);
         const cluster = this.classifySizeComplexityCluster(result.complexity.codeLines, result.complexity.overallComplexity);
-        return `<tr class="${risk}" data-file="${this.escapeHtml(result.filePath)}" data-risk="${risk}"><td><a href="${this.toFileHref(result.filePath)}">${this.escapeHtml(this.toDisplayPath(result.filePath))}</a></td><td>${result.complexity.totalLines}</td><td>${result.complexity.overallComplexity}</td><td>${result.complexity.components.length}</td><td title="${this.escapeHtml(describeClusterAxes(cluster))}">${cluster}</td><td>${riskLabels[risk] ?? risk}</td></tr>`;
+        return `<tr class="${risk}" data-file="${escapeHtml(result.filePath)}" data-risk="${risk}"><td><a href="${this.toFileHref(result.filePath)}">${escapeHtml(this.toDisplayPath(result.filePath))}</a></td><td>${result.complexity.totalLines}</td><td>${result.complexity.overallComplexity}</td><td>${result.complexity.components.length}</td><td title="${escapeHtml(describeClusterAxes(cluster))}">${cluster}</td><td>${riskLabels[risk] ?? risk}</td></tr>`;
       })
       .join("\n");
     // md 版の中核である優先対応 Top 5 を HTML でも先頭に出し、両者の結論を揃える
     const decisionSummary = this.buildDecisionSummary(options.complexityThreshold);
     const hotSpotRows = decisionSummary.topHotSpots
       .map((item, index) =>
-        `<tr><td>${index + 1}</td><td><a href="${this.toFileHref(item.path)}">${this.escapeHtml(item.displayPath)}</a></td><td>${this.escapeHtml(this.getHotSpotSeverity(item.score))}</td><td>${this.escapeHtml(this.getPrimaryRiskAxisLabel(item.path))}</td><td>${item.score}</td><td>${this.escapeHtml(item.action)}</td></tr>`)
+        `<tr><td>${index + 1}</td><td><a href="${this.toFileHref(item.path)}">${escapeHtml(item.displayPath)}</a></td><td>${escapeHtml(this.getHotSpotSeverity(item.score))}</td><td>${escapeHtml(this.getPrimaryRiskAxisLabel(item.path))}</td><td>${item.score}</td><td>${escapeHtml(item.action)}</td></tr>`)
       .join("\n");
     const hotSpotSection = decisionSummary.topHotSpots.length > 0
       ? `<h2>優先対応 Top 5</h2>
@@ -1138,25 +1151,19 @@ export class ReportGenerator {
   <meta charset="utf-8" />
   <title>TypeScript/React 静的解析レポート</title>
   <style>
-    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 24px; color: #1f2937; }
-    h1, h2 { margin-bottom: 8px; }
+${REPORT_BASE_CSS}
     .meta { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px; }
-    .card { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px; }
     #graph-shell { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 16px; margin: 20px 0 32px; }
     #graph { min-height: 520px; border: 1px solid #cbd5e1; border-radius: 8px; background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%); position: relative; overflow: hidden; }
     #graph-empty { display: none; padding: 16px; color: #64748b; }
     #inspector { border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px; background: #f8fafc; }
-    table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-    th, td { border: 1px solid #cbd5e1; padding: 8px; text-align: left; }
-    th { background: #e2e8f0; }
+    table { margin: 16px 0 0; }
     tr.high { background: #fee2e2; }
     tr.medium { background: #fef3c7; }
     tr.low { background: #dcfce7; }
-    code { background: #e5e7eb; padding: 0 4px; border-radius: 4px; }
     .toolbar { display: flex; gap: 8px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
     .toolbar input[type="search"], .toolbar select { border: 1px solid #94a3b8; border-radius: 6px; padding: 6px 10px; font: inherit; }
     .toolbar .hint { font-size: 12px; color: #64748b; }
-    button { border: 1px solid #94a3b8; background: white; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
     details.criteria { margin: 12px 0; border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 12px; background: #f8fafc; }
     details.criteria summary { cursor: pointer; font-weight: 600; }
     #file-table th { cursor: pointer; user-select: none; }
@@ -1165,8 +1172,6 @@ export class ReportGenerator {
     .legend .low::before { background: #8ce99a; }
     .legend .medium::before { background: #ffe066; }
     .legend .high::before { background: #ff6b6b; }
-    a { color: #0f766e; text-decoration: none; }
-    a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -1233,7 +1238,7 @@ export class ReportGenerator {
     </tbody>
   </table>
   <script>
-    const graphData = ${this.serializeForScript(graphData)};
+    const graphData = ${serializeForHtmlScript(graphData)};
     const tableRows = Array.from(document.querySelectorAll("tbody tr[data-file]"));
     const selectionName = document.getElementById("selection-name");
     const selectionMeta = document.getElementById("selection-meta");
@@ -1374,14 +1379,7 @@ export class ReportGenerator {
   }
 
   private toCsvString(rows: string[][]): string {
-    return rows.map((row) =>
-      row.map((cell) => {
-        if (cell.includes(",") || cell.includes("\"") || cell.includes("\n")) {
-          return `"${cell.replace(/"/gu, "\"\"")}"`;
-        }
-        return cell;
-      }).join(",")
-    ).join("\n");
+    return rows.map((row) => toCsvRow(row)).join("\n");
   }
 
   private getRiskLevel(complexity: number): "low" | "medium" | "high" {
@@ -1408,18 +1406,6 @@ export class ReportGenerator {
     return warnings;
   }
 
-  private escapeHtml(value: string): string {
-    return value
-      .replace(/&/gu, "&amp;")
-      .replace(/</gu, "&lt;")
-      .replace(/>/gu, "&gt;")
-      .replace(/"/gu, "&quot;");
-  }
-
-  private serializeForScript(value: GraphJSON): string {
-    return JSON.stringify(value).replace(/</gu, "\\u003c");
-  }
-
   private toFileHref(filePath: string): string {
     return pathToFileURL(filePath).href;
   }
@@ -1431,15 +1417,7 @@ export class ReportGenerator {
       return cached;
     }
 
-    const normalized = filePath.split(path.sep).join("/");
-    let displayPath = normalized;
-    if (this.projectRoot && path.isAbsolute(filePath)) {
-      const relativePath = path.relative(this.projectRoot, filePath);
-      if (relativePath && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)) {
-        displayPath = relativePath.split(path.sep).join("/");
-      }
-    }
-
+    const displayPath = toDisplayPath(filePath, this.projectRoot);
     this.displayPathCache.set(filePath, displayPath);
     return displayPath;
   }
@@ -1453,67 +1431,16 @@ export class ReportGenerator {
       return true;
     }
 
-    const sourceKeys = this.buildSourceMatchKeys(filePath);
-    return sourceKeys.some((key) => testTargets.has(key));
+    return hasMatchingTestFile(filePath, testTargets, this.projectRoot);
   }
 
   private collectTestTargetKeys(): Set<string> {
-    const targets = new Set<string>();
-
-    for (const result of this.analysisResults) {
-      if (this.classifyFileType(result.filePath) !== "Test") {
-        continue;
-      }
-
-      for (const key of this.buildTestTargetKeys(result.filePath)) {
-        targets.add(key);
-      }
-    }
-
-    return targets;
-  }
-
-  private buildSourceMatchKeys(filePath: string): string[] {
-    const normalized = this.normalizeMatchPath(filePath);
-    const keys = new Set<string>([normalized]);
-
-    if (normalized.startsWith("src/")) {
-      keys.add(normalized.slice(4));
-    } else if (!normalized.startsWith("/") && normalized.length > 0) {
-      keys.add(`src/${normalized}`);
-    }
-
-    return Array.from(keys).filter(Boolean);
-  }
-
-  private buildTestTargetKeys(filePath: string): string[] {
-    const withoutExt = this.toDisplayPath(filePath)
-      .split(path.sep)
-      .join("/")
-      .replace(/\.[cm]?[jt]sx?$/iu, "");
-    const normalizedPath = withoutExt
-      .split("/")
-      .filter((segment) => segment !== "__tests__" && segment !== "tests" && segment !== "test")
-      .join("/")
-      .replace(/\.(test|spec)$/iu, "")
-      .toLowerCase();
-    const keys = new Set<string>([normalizedPath]);
-
-    if (normalizedPath.startsWith("src/")) {
-      keys.add(normalizedPath.slice(4));
-    } else if (!normalizedPath.startsWith("/") && normalizedPath.length > 0) {
-      keys.add(`src/${normalizedPath}`);
-    }
-
-    return Array.from(keys).filter(Boolean);
-  }
-
-  private normalizeMatchPath(filePath: string): string {
-    return this.toDisplayPath(filePath)
-      .split(path.sep)
-      .join("/")
-      .replace(/\.[cm]?[jt]sx?$/iu, "")
-      .toLowerCase();
+    return collectTestTargetKeys(
+      this.analysisResults
+        .filter((result) => this.classifyFileType(result.filePath) === "Test")
+        .map((result) => result.filePath),
+      this.projectRoot,
+    );
   }
 
   private classifySizeComplexityCluster(codeLines: number, complexity: number): string {
