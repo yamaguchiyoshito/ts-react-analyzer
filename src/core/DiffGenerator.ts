@@ -3,6 +3,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { normalizeClusterCode } from "./ClusterCodes.js";
+import { diffStrings, escapeHtml, escapeMarkdownCell, REPORT_BASE_CSS, serializeForHtmlScript, toDisplayPath } from "./ReportUtils.js";
 
 import type {
   AnalysisDiffReport,
@@ -60,7 +61,7 @@ export class DiffGenerator {
         cycleDelta: (current.graph.cycles?.length ?? 0) - (baseline.graph.cycles?.length ?? 0),
         dependencyDelta: current.graph.totalDependencies - baseline.graph.totalDependencies,
         externalDependencyDelta: (current.graph.externalDependencies ?? 0) - (baseline.graph.externalDependencies ?? 0),
-        warningDelta: this.diffStrings(current.graph.warnings ?? [], baseline.graph.warnings ?? []),
+        warningDelta: diffStrings(current.graph.warnings ?? [], baseline.graph.warnings ?? []),
       },
       hotSpotDelta: this.buildHotSpotDelta(current, baseline),
       impact: this.buildImpactSection(
@@ -81,16 +82,7 @@ export class DiffGenerator {
       return report;
     }
 
-    const rel = (filePath: string): string => {
-      if (!path.isAbsolute(filePath)) {
-        return filePath.split(path.sep).join("/");
-      }
-      const relative = path.relative(root, filePath);
-      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
-        return filePath.split(path.sep).join("/");
-      }
-      return relative.split(path.sep).join("/");
-    };
+    const rel = (filePath: string): string => toDisplayPath(filePath, root);
 
     return {
       ...report,
@@ -153,7 +145,7 @@ export class DiffGenerator {
     // 丸めや平均化で相殺され、関数を丸ごと足しても 0 のままになることがある)
     const functionCountDelta = (current?.complexity.functions.length ?? 0) - (baseline?.complexity.functions.length ?? 0);
     const codeLinesDelta = (current?.complexity.codeLines ?? 0) - (baseline?.complexity.codeLines ?? 0);
-    const warningDelta = this.diffStrings(current?.warnings ?? [], baseline?.warnings ?? []);
+    const warningDelta = diffStrings(current?.warnings ?? [], baseline?.warnings ?? []);
     const status = complexityDelta !== 0
       || dependencyDelta !== 0
       || functionCountDelta !== 0
@@ -171,14 +163,6 @@ export class DiffGenerator {
       codeLinesDelta,
       warningDelta,
     };
-  }
-
-  private diffStrings(current: string[], baseline: string[]): string[] {
-    const currentSet = new Set(current);
-    const baselineSet = new Set(baseline);
-    const added = current.filter((item) => !baselineSet.has(item)).map((item) => `+${item}`);
-    const removed = baseline.filter((item) => !currentSet.has(item)).map((item) => `-${item}`);
-    return [...added, ...removed];
   }
 
   private toMarkdown(diff: AnalysisDiffReport, options: DiffRenderOptions = {}): string {
@@ -217,7 +201,7 @@ export class DiffGenerator {
       markdown += "|----------|--------|---------|-------|------|----------|----------|\n";
       for (const item of diff.hotSpotDelta.changed.slice(0, 10)) {
         const drivers = (item.complexityDriverDelta?.length ?? 0) > 0 ? `drivers=${item.complexityDriverDelta!.join(", ")}` : "—";
-        markdown += `| ${item.currentDisplayPath} | ${this.formatSigned(item.scoreDelta)} | ${this.formatSigned(item.complexityDelta)} | ${this.formatSigned(item.dependencyDelta)} | ${this.formatSigned(item.anyDelta)} | ${item.clusterBefore} → ${item.clusterAfter} | ${drivers} |\n`;
+        markdown += `| ${escapeMarkdownCell(item.currentDisplayPath)} | ${this.formatSigned(item.scoreDelta)} | ${this.formatSigned(item.complexityDelta)} | ${this.formatSigned(item.dependencyDelta)} | ${this.formatSigned(item.anyDelta)} | ${item.clusterBefore} → ${item.clusterAfter} | ${escapeMarkdownCell(drivers)} |\n`;
       }
       markdown += "\n";
     }
@@ -250,7 +234,7 @@ export class DiffGenerator {
         const reasons = item.reasons.length > 0
           ? item.reasons.map((reason) => IMPACT_REASON_LABELS[reason] ?? reason).join("、")
           : "—";
-        markdown += `| ${display(item.path)} | ${item.score} | ${item.distance} | ${item.inboundDegree} | ${item.outboundDegree} | ${item.complexityPressure} | ${reasons} |\n`;
+        markdown += `| ${escapeMarkdownCell(display(item.path))} | ${item.score} | ${item.distance} | ${item.inboundDegree} | ${item.outboundDegree} | ${item.complexityPressure} | ${escapeMarkdownCell(reasons)} |\n`;
       }
       markdown += "\n";
     }
@@ -265,7 +249,7 @@ export class DiffGenerator {
     markdown += "|----------|------|---------|-------|---------|-------|----------|\n";
     for (const file of changedFiles) {
       const warnings = file.warningDelta.length > 0 ? file.warningDelta.join("、") : "—";
-      markdown += `| ${display(file.path)} | ${statusLabel[file.status] ?? file.status} | ${this.formatSigned(file.complexityDelta)} | ${this.formatSigned(file.dependencyDelta)} | ${this.formatSigned(file.functionCountDelta)} | ${this.formatSigned(file.codeLinesDelta)} | ${warnings} |\n`;
+      markdown += `| ${escapeMarkdownCell(display(file.path))} | ${statusLabel[file.status] ?? file.status} | ${this.formatSigned(file.complexityDelta)} | ${this.formatSigned(file.dependencyDelta)} | ${this.formatSigned(file.functionCountDelta)} | ${this.formatSigned(file.codeLinesDelta)} | ${escapeMarkdownCell(warnings)} |\n`;
     }
 
     return markdown;
@@ -306,15 +290,7 @@ export class DiffGenerator {
   }
 
   private toRenderDisplayPath(filePath: string, projectRoot?: string): string {
-    const normalized = filePath.split(path.sep).join("/");
-    if (!projectRoot || !path.isAbsolute(filePath)) {
-      return normalized;
-    }
-    const relative = path.relative(projectRoot, filePath);
-    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
-      return normalized;
-    }
-    return relative.split(path.sep).join("/");
+    return toDisplayPath(filePath, projectRoot);
   }
 
   private toHtml(diff: AnalysisDiffReport, options: DiffRenderOptions = {}): string {
@@ -334,37 +310,37 @@ export class DiffGenerator {
       .filter((file) => file.status !== "unchanged")
       .map((file) => {
         const warningDelta = file.warningDelta.length > 0 ? file.warningDelta.join(", ") : "";
-        return `<tr class="${file.status}" data-file="${this.escapeHtml(file.path)}"><td><a href="${this.toFileHref(toAbsolute(file.path))}">${this.escapeHtml(this.toRenderDisplayPath(file.path, options.projectRoot))}</a></td><td>${file.status}</td><td>${file.complexityDelta}</td><td>${file.dependencyDelta}</td><td>${file.functionCountDelta}</td><td>${file.codeLinesDelta}</td><td>${this.escapeHtml(warningDelta)}</td></tr>`;
+        return `<tr class="${file.status}" data-file="${escapeHtml(file.path)}"><td><a href="${this.toFileHref(toAbsolute(file.path))}">${escapeHtml(this.toRenderDisplayPath(file.path, options.projectRoot))}</a></td><td>${file.status}</td><td>${file.complexityDelta}</td><td>${file.dependencyDelta}</td><td>${file.functionCountDelta}</td><td>${file.codeLinesDelta}</td><td>${escapeHtml(warningDelta)}</td></tr>`;
       })
       .join("\n");
     const warningDelta = diff.graphDelta.warningDelta.length > 0
-      ? diff.graphDelta.warningDelta.map((warning) => `<li>${this.escapeHtml(warning)}</li>`).join("")
+      ? diff.graphDelta.warningDelta.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")
       : "<li>Warning Delta: none</li>";
     const hotSpotChanged = diff.hotSpotDelta.changed.length > 0
       ? `<ul>${diff.hotSpotDelta.changed.slice(0, 10).map((item) =>
-        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${this.escapeHtml(item.currentDisplayPath)}</a> scoreDelta=${item.scoreDelta} complexityDelta=${item.complexityDelta} dependencyDelta=${item.dependencyDelta} anyDelta=${item.anyDelta} cluster=${this.escapeHtml(item.clusterBefore)} → ${this.escapeHtml(item.clusterAfter)}${this.renderHtmlDriverMeta(item.complexityDriverDelta)}</li>`
+        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${escapeHtml(item.currentDisplayPath)}</a> scoreDelta=${item.scoreDelta} complexityDelta=${item.complexityDelta} dependencyDelta=${item.dependencyDelta} anyDelta=${item.anyDelta} cluster=${escapeHtml(item.clusterBefore)} → ${escapeHtml(item.clusterAfter)}${this.renderHtmlDriverMeta(item.complexityDriverDelta)}</li>`
       ).join("")}</ul>`
       : "<p>No changed hot spots.</p>";
     const hotSpotAdded = diff.hotSpotDelta.added.length > 0
       ? `<ul>${diff.hotSpotDelta.added.slice(0, 10).map((item) =>
-        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${this.escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${this.escapeHtml(normalizeClusterCode(item.cluster))}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
+        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${escapeHtml(normalizeClusterCode(item.cluster))}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
       ).join("")}</ul>`
       : "<p>No added hot spots.</p>";
     const hotSpotRemoved = diff.hotSpotDelta.removed.length > 0
       ? `<ul>${diff.hotSpotDelta.removed.slice(0, 10).map((item) =>
-        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${this.escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${this.escapeHtml(normalizeClusterCode(item.cluster))}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
+        `<li><a href="${this.toFileHref(toAbsolute(item.path))}">${escapeHtml(item.displayPath)}</a> score=${item.score} cluster=${escapeHtml(normalizeClusterCode(item.cluster))}${this.renderHtmlDriverMeta(item.complexityDrivers)}</li>`
       ).join("")}</ul>`
       : "<p>No removed hot spots.</p>";
-    const impactGraph = this.serializeForHtmlScript(diff.impact.graph);
-    const subtreeData = this.serializeForHtmlScript(diff.impact.subtrees);
-    const subtreeMetricsData = this.serializeForHtmlScript(diff.impact.subtrees);
-    const prioritizedData = this.serializeForHtmlScript(diff.impact.prioritizedFiles);
-    const changedIds = this.serializeForHtmlScript(Array.from(changedSet));
-    const impactedIds = this.serializeForHtmlScript(Array.from(impactedSet));
+    const impactGraph = serializeForHtmlScript(diff.impact.graph);
+    const subtreeData = serializeForHtmlScript(diff.impact.subtrees);
+    const subtreeMetricsData = serializeForHtmlScript(diff.impact.subtrees);
+    const prioritizedData = serializeForHtmlScript(diff.impact.prioritizedFiles);
+    const changedIds = serializeForHtmlScript(Array.from(changedSet));
+    const impactedIds = serializeForHtmlScript(Array.from(impactedSet));
     const focusOptions = [
       `<option value="__all__">All Changed Files</option>`,
       ...diff.impact.subtrees.map((subtree) =>
-        `<option value="${this.escapeHtml(subtree.root)}">${this.escapeHtml(subtree.root)}</option>`
+        `<option value="${escapeHtml(subtree.root)}">${escapeHtml(subtree.root)}</option>`
       ),
     ].join("");
     const impactedList = diff.impact.impactedFiles.length > 0
@@ -377,13 +353,11 @@ export class DiffGenerator {
   <meta charset="utf-8" />
   <title>Analysis Diff Report</title>
   <style>
-    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 24px; color: #111827; background: #f8fafc; }
-    h1, h2 { margin-bottom: 8px; }
+${REPORT_BASE_CSS}
+    body { background: #f8fafc; }
     .meta { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
-    .card { background: white; border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px; }
-    table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; }
-    th, td { border: 1px solid #cbd5e1; padding: 8px; text-align: left; vertical-align: top; }
-    th { background: #e2e8f0; }
+    .card { background: white; }
+    table { margin: 0; border-radius: 8px; overflow: hidden; }
     tr.added { background: #dcfce7; }
     tr.removed { background: #fee2e2; }
     tr.changed { background: #fef3c7; }
@@ -397,19 +371,16 @@ export class DiffGenerator {
     .impact-entry:first-child { border-top: 0; padding-top: 0; }
     .impact-score { display: inline-block; min-width: 48px; font-weight: 700; color: #0f766e; }
     .impact-meta { color: #475569; font-size: 12px; }
-    a { color: #0f766e; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    code { background: #e2e8f0; border-radius: 4px; padding: 0 4px; }
     ul { margin: 0; padding-left: 18px; }
   </style>
 </head>
 <body>
   <h1>Analysis Diff Report</h1>
-  <div class="card" style="margin-bottom:16px;font-weight:600">${this.escapeHtml(verdictText)}</div>
+  <div class="card" style="margin-bottom:16px;font-weight:600">${escapeHtml(verdictText)}</div>
   <div class="meta">
-    <div class="card"><strong>Baseline</strong><br /><code>${this.escapeHtml(diff.baselinePath)}</code></div>
-    <div class="card"><strong>Current</strong><br /><a href="${this.toFileHref(toAbsolute(diff.currentPath))}"><code>${this.escapeHtml(diff.currentPath)}</code></a></div>
-    <div class="card"><strong>Generated At</strong><br />${this.escapeHtml(diff.generatedAt)}</div>
+    <div class="card"><strong>Baseline</strong><br /><code>${escapeHtml(diff.baselinePath)}</code></div>
+    <div class="card"><strong>Current</strong><br /><a href="${this.toFileHref(toAbsolute(diff.currentPath))}"><code>${escapeHtml(diff.currentPath)}</code></a></div>
+    <div class="card"><strong>Generated At</strong><br />${escapeHtml(diff.generatedAt)}</div>
     <div class="card"><strong>Changed Files</strong><br />${diff.summary.changedFiles}</div>
     <div class="card"><strong>Added / Removed</strong><br />${diff.summary.addedFiles} / ${diff.summary.removedFiles}</div>
     <div class="card"><strong>Complexity Delta</strong><br />${diff.summary.complexityDelta.toFixed(2)}</div>
@@ -576,7 +547,7 @@ export class DiffGenerator {
       }
     }
 
-    const projectRootForHref = ${this.serializeForHtmlScript(options.projectRoot ?? "")};
+    const projectRootForHref = ${serializeForHtmlScript(options.projectRoot ?? "")};
     function toHref(filePath) {
       const absolute = projectRootForHref && !filePath.startsWith("/") && !/^[A-Za-z]:/.test(filePath)
         ? projectRootForHref.replace(/[/\\]+$/, "") + "/" + filePath
@@ -898,7 +869,7 @@ export class DiffGenerator {
     if (!drivers || drivers.length === 0) {
       return "";
     }
-    return `<div class="impact-meta">drivers=${this.escapeHtml(drivers.join(", "))}</div>`;
+    return `<div class="impact-meta">drivers=${escapeHtml(drivers.join(", "))}</div>`;
   }
 
   private mergeNodes(currentNodes: GraphNode[], baselineNodes: GraphNode[]): GraphNode[] {
@@ -1136,19 +1107,6 @@ export class DiffGenerator {
   private formatImpactMetric(value: number): string {
     const rounded = Number(value.toFixed(2));
     return Number.isInteger(rounded) ? String(rounded) : String(rounded);
-  }
-
-  private escapeHtml(value: string): string {
-    return value
-      .replace(/&/gu, "&amp;")
-      .replace(/</gu, "&lt;")
-      .replace(/>/gu, "&gt;")
-      .replace(/"/gu, "&quot;");
-  }
-
-  private serializeForHtmlScript(value: unknown): string {
-    // </script> や <!-- を含む値がスクリプトを閉じないよう、JSON 内の < を必ずエスケープする
-    return JSON.stringify(value).replace(/</gu, "\\u003c");
   }
 
   private toFileHref(filePath: string): string {

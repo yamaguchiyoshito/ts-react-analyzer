@@ -15,6 +15,7 @@ export * from "./QualityDiffGenerator.js";
 export * from "./QualityGate.js";
 export * from "./QualityReportGenerator.js";
 export * from "./ReportGenerator.js";
+export * from "./ReportUtils.js";
 export * from "./SecurityArtifactAnalyzer.js";
 export * from "./TestArtifactAnalyzer.js";
 export * from "./TsConfigResolver.js";
