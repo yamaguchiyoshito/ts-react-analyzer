@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import type { ParsedFile } from "../types/index.js";
+import { formatArtifactWarning, readJsonArtifact } from "./ArtifactJson.js";
 
 export interface OpenApiSummary {
   specFiles: string[];
@@ -24,6 +25,8 @@ export interface ApiArtifactSummary {
   openApi: OpenApiSummary | null;
   msw: MswSummary;
   timeoutRetry: TimeoutRetrySummary;
+  /** 名前は一致したが読めなかったため無視した成果物 */
+  warnings: string[];
 }
 
 export class ApiArtifactAnalyzer {
@@ -32,8 +35,11 @@ export class ApiArtifactAnalyzer {
   async analyzeProject(projectRoot: string, parsedFiles: ParsedFile[]): Promise<ApiArtifactSummary> {
     this.projectRoot = path.resolve(projectRoot);
     const specFiles = await this.findOpenApiSpecFiles(projectRoot);
-    const diffFiles = await this.findOpenApiDiffFiles(projectRoot);
-    const breakingChanges = diffFiles.length > 0 ? await this.parseBreakingChanges(diffFiles) : null;
+    const candidateDiffFiles = await this.findOpenApiDiffFiles(projectRoot);
+    const warnings: string[] = [];
+    const parsedDiff = await this.parseBreakingChanges(candidateDiffFiles, warnings);
+    const diffFiles = parsedDiff.acceptedFiles;
+    const breakingChanges = diffFiles.length > 0 ? parsedDiff.breakingChanges : null;
 
     return {
       openApi: specFiles.length > 0 || diffFiles.length > 0
@@ -45,6 +51,7 @@ export class ApiArtifactAnalyzer {
         : null,
       msw: this.collectMswSummary(parsedFiles),
       timeoutRetry: this.collectTimeoutRetrySummary(parsedFiles),
+      warnings,
     };
   }
 
@@ -71,15 +78,24 @@ export class ApiArtifactAnalyzer {
     ], ["reports", "artifacts", ".artifacts", "contracts"], /openapi.+(diff|validation).+\.json$/iu);
   }
 
-  private async parseBreakingChanges(files: string[]): Promise<number> {
+  private async parseBreakingChanges(
+    files: string[],
+    warnings: string[],
+  ): Promise<{ breakingChanges: number; acceptedFiles: string[] }> {
     let breakingChanges = 0;
+    const acceptedFiles: string[] = [];
 
     for (const filePath of files) {
-      const payload = JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
-      breakingChanges += this.extractBreakingChanges(payload);
+      const read = await readJsonArtifact(filePath);
+      if (!read.ok) {
+        warnings.push(formatArtifactWarning(filePath, read.error));
+        continue;
+      }
+      acceptedFiles.push(filePath);
+      breakingChanges += this.extractBreakingChanges(read.value);
     }
 
-    return breakingChanges;
+    return { breakingChanges, acceptedFiles };
   }
 
   private extractBreakingChanges(payload: unknown): number {

@@ -5,9 +5,9 @@ import { watch as watchFileSystem } from "node:fs";
 import readline from "node:readline/promises";
 import { parseArgs } from "node:util";
 
-import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, ManualQualityInputLoader, QualityDiffGenerator, QualityReportGenerator, ReportGenerator } from "./core/index.js";
+import { AnalysisCache, ComplexityAnalyzer, ConfigManager, DependencyAnalyzer, DiffGenerator, FileScanner, GraphBuilder, Logger, ManualQualityInputError, ManualQualityInputLoader, QualityDiffGenerator, QualityReportGenerator, ReportGenerator, selectBlockingRegressionMetrics, validateQualityGateMetricIds } from "./core/index.js";
 import { shouldIncludeInAnalysisScope } from "./core/FileConventions.js";
-import type { AnalysisConfig, AnalysisDiffReport, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, OutputFormat, ParseIssue, PersistedAnalysisReport, QualityDiffReport, QualityMetricDiffEntry, QualityReport } from "./types/index.js";
+import type { AnalysisConfig, AnalysisDiffReport, AnalysisResult, CacheStats, GraphJSON, GraphMetrics, IncrementalStats, ManualQualityMetricInput, OutputFormat, ParseIssue, PersistedAnalysisReport, QualityDiffReport, QualityReport } from "./types/index.js";
 
 interface RunArtifacts {
   results: AnalysisResult[];
@@ -237,14 +237,27 @@ async function loadBaselineReport<T>(baselinePath: string, createHint: string): 
   }
 }
 
-async function handleCommandError(error: unknown, logger: Logger, logMessage: string): Promise<number> {
+async function handleCommandError(
+  error: unknown,
+  logger: Logger,
+  logMessage: string,
+  options: { verbose?: boolean } = {},
+): Promise<number> {
+  const stack = error instanceof Error ? error.stack : undefined;
   if (error instanceof CliUserError) {
     console.error(`エラー: ${error.message}`);
-    logger.error(logMessage, { error: error.message.split("\n")[0] });
+    logger.error(logMessage, { error: error.message.split("\n")[0], stack });
   } else {
-    logger.error(logMessage, {
-      error: error instanceof Error ? error.message : String(error),
-    });
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`エラー: ${message}`);
+    if (!options.verbose) {
+      console.error(`  詳細 (スタックトレース) はログファイルに記録しました。--verbose を付けると標準エラーにも出力します。`);
+    }
+    // スタックトレースは常にログファイルへ残す。画面には --verbose のときだけ出す
+    logger.error(logMessage, { error: message, stack });
+  }
+  if (options.verbose && stack) {
+    console.error(stack);
   }
   await logger.close();
   return 1;
@@ -849,7 +862,7 @@ async function analyzeProject(
     openHtmlReportIfRequested(options.openReport, config, `${config.filePrefix}_report.html`, true);
     return 0;
   } catch (error) {
-    return handleCommandError(error, logger, "Analysis failed");
+    return handleCommandError(error, logger, "Analysis failed", { verbose: config.verbose });
   }
 }
 
@@ -887,7 +900,7 @@ async function graphProject(projectDir: string, config: AnalysisConfig): Promise
     ].join("\n"));
     return 0;
   } catch (error) {
-    return handleCommandError(error, logger, "Graph export failed");
+    return handleCommandError(error, logger, "Graph export failed", { verbose: config.verbose });
   }
 }
 
@@ -974,7 +987,7 @@ async function diffProject(
     printDiffSummary(diff, config);
     return 0;
   } catch (error) {
-    return handleCommandError(error, logger, "Diff failed");
+    return handleCommandError(error, logger, "Diff failed", { verbose: config.verbose });
   }
 }
 
@@ -1003,15 +1016,29 @@ async function qualityProject(
       : path.join(projectDir, "quality.manual.json");
     let manualInputs: ManualQualityMetricInput[] = [];
 
+    // ファイルが無いのは通常運用 (debug ログのみ)。あるのに読めないのは利用者の
+    // 修正が必要な状態なので、握りつぶさずにエラーとして終了する。
+    let manualInputExists = false;
     try {
       await fs.access(manualInputPath);
-      manualInputs = await new ManualQualityInputLoader().load(manualInputPath);
+      manualInputExists = true;
+    } catch {
+      logger.debug("Manual quality input not found", { manualInputPath });
+    }
+    if (manualInputExists) {
+      try {
+        manualInputs = await new ManualQualityInputLoader().load(manualInputPath);
+      } catch (error) {
+        if (error instanceof ManualQualityInputError) {
+          throw new CliUserError(error.message);
+        }
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new CliUserError(`手動品質入力ファイルを読み込めません: ${manualInputPath}\n${reason}`);
+      }
       logger.info("Manual quality input loaded", {
         manualInputPath,
         entries: manualInputs.length,
       });
-    } catch {
-      logger.debug("Manual quality input not found", { manualInputPath });
     }
 
     const qualityReportGenerator = new QualityReportGenerator();
@@ -1045,6 +1072,24 @@ async function qualityProject(
       // レポート書き出し前に gate 判定とベースライン比較を確定させ、
       // 「ゲート判定」「前回比」を md / html 本文へ反映する
       gate: (builtReport) => {
+        // 指標 ID の typo は「gate 対象なし」で素通りしてしまうため、レポートに
+        // 実在する ID と突き合わせて警告し、blocking が全滅なら利用者エラーにする
+        const metricIdValidation = validateQualityGateMetricIds(builtReport, config);
+        if (metricIdValidation.unknownBlockingMetricIds.length > 0) {
+          console.warn(`警告: 未知の指標 ID が --quality-gate-blocking-metrics に含まれています: ${metricIdValidation.unknownBlockingMetricIds.join(", ")}`);
+          logger.warn("Unknown quality gate blocking metric ids", { ids: metricIdValidation.unknownBlockingMetricIds });
+        }
+        if (metricIdValidation.unknownMonitoringMetricIds.length > 0) {
+          console.warn(`警告: 未知の指標 ID が --quality-gate-monitoring-metrics に含まれています: ${metricIdValidation.unknownMonitoringMetricIds.join(", ")}`);
+          logger.warn("Unknown quality gate monitoring metric ids", { ids: metricIdValidation.unknownMonitoringMetricIds });
+        }
+        if (mode === "gate" && metricIdValidation.blockingAllUnknown) {
+          throw new CliUserError([
+            `--quality-gate-blocking-metrics に指定した指標 ID がすべて未知です: ${config.qualityGateBlockingMetricIds.join(", ")}`,
+            "このままでは baseline 悪化の gate 対象が 1 件も無くなります。指標 ID は docs/quality.md の「指標 ID 一覧」か、レポート CSV の Metric ID 列を確認してください。",
+          ].join("\n"));
+        }
+
         failingAutomaticMetrics = builtReport.categories
           .flatMap((category) => category.metrics.map((metric) => ({ category: category.label, metric })))
           .filter(({ metric }) => metric.aggregation === "primary" && metric.automation === "automatic" && metric.verdict === "fail");
@@ -1175,11 +1220,17 @@ async function qualityProject(
       await logger.close();
       const offenders = blockingRegressionMetrics
         .slice(0, 3)
-        .map((metric) => `${metric.categoryLabel}/${metric.label} (${metric.baselineVerdict ?? "不明"} → ${metric.currentVerdict ?? "不明"})`)
+        .map((metric) => {
+          const evidenceLoss = metric.baselineAutomation === "automatic" && metric.currentAutomation === "manual";
+          return `${metric.categoryLabel}/${metric.label} (${metric.baselineVerdict ?? "不明"} → ${metric.currentVerdict ?? "不明"}${evidenceLoss ? "、証跡喪失" : ""})`;
+        })
         .join(", ");
+      const evidenceLossCount = blockingRegressionMetrics
+        .filter((metric) => metric.baselineAutomation === "automatic" && metric.currentAutomation === "manual")
+        .length;
       console.error([
         "",
-        `✖ quality gate: FAIL (終了コード 2) — baseline から判定が悪化した自動指標が ${blockingRegressionMetrics.length} 件あります`,
+        `✖ quality gate: FAIL (終了コード 2) — baseline から判定が悪化した、または証跡を失った自動指標が ${blockingRegressionMetrics.length} 件あります${evidenceLossCount > 0 ? ` (うち証跡喪失 ${evidenceLossCount} 件: 前回は実測できていた指標が今回 manual に落ちています)` : ""}`,
         `  上位: ${offenders}`,
         `  詳細: ${path.join(config.outputDir, `${config.filePrefix}_quality_diff.md`)}`,
       ].join("\n"));
@@ -1190,7 +1241,7 @@ async function qualityProject(
     printQualitySummary(report, config, mode);
     return 0;
   } catch (error) {
-    return handleCommandError(error, logger, "Quality analysis failed");
+    return handleCommandError(error, logger, "Quality analysis failed", { verbose: config.verbose });
   }
 }
 
@@ -1237,35 +1288,6 @@ function buildGraphWarnings(
   }
 
   return warnings;
-}
-
-function selectBlockingRegressionMetrics(
-  diff: QualityDiffReport,
-  config: AnalysisConfig,
-): QualityMetricDiffEntry[] {
-  const monitoringMetricIds = new Set(config.qualityGateMonitoringMetricIds);
-  const blockingMetricIds = new Set(config.qualityGateBlockingMetricIds);
-
-  return diff.metrics.filter((metric) => {
-    if ((metric.currentAggregation ?? metric.baselineAggregation ?? "primary") !== "primary") {
-      return false;
-    }
-    if (metric.trend !== "regressed" || metric.currentAutomation !== "automatic") {
-      return false;
-    }
-    // 同一判定内の数値悪化 (fail のまま件数増など) は差分レポートで可視化する
-    // のみとし、gate はドキュメントどおり判定の悪化 (pass->warn 等) だけで落とす
-    if (metric.baselineVerdict === metric.currentVerdict) {
-      return false;
-    }
-    if (monitoringMetricIds.has(metric.id)) {
-      return false;
-    }
-    if (blockingMetricIds.size > 0) {
-      return blockingMetricIds.has(metric.id);
-    }
-    return true;
-  });
 }
 
 async function main(): Promise<number> {
@@ -1342,6 +1364,58 @@ async function main(): Promise<number> {
   const tsConfigPath = path.join(projectRoot, "tsconfig.json");
   const dotEnvPath = path.join(projectRoot, ".env");
 
+  // 設定の組み立て (CLI / .env / 環境変数 / 設定ファイル) で値が不正なら、
+  // スタックトレースではなく理由を 1 行で示して終了する
+  let config: AnalysisConfig;
+  try {
+    config = buildConfig(parsed, configManager, { projectRoot, configPath, tsConfigPath, dotEnvPath });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`エラー: ${message}`);
+    if (parsed.values.verbose && error instanceof Error && error.stack) {
+      console.error(error.stack);
+    }
+    return 1;
+  }
+
+  if (command === "graph") {
+    return graphProject(projectRoot, config);
+  }
+  if (command === "diff") {
+    const baselinePath = typeof parsed.values.baseline === "string"
+      ? path.resolve(parsed.values.baseline)
+      : path.join(config.outputDir, `${config.filePrefix}_report.json`);
+    if (parsed.values.watch) {
+      return watchDiff(projectRoot, config, baselinePath, openReport);
+    }
+    return diffProject(projectRoot, config, baselinePath, { openReport });
+  }
+  if (command === "quality") {
+    if (!qualityMode) {
+      printHelp("quality");
+      return 1;
+    }
+    // report は collect の別名 (非推奨)。上で告知済み
+    const qualityCommandMode = qualityMode === "report" ? "collect" : qualityMode;
+    const baselinePath = qualityCommandMode === "diff"
+      ? typeof parsed.values.baseline === "string"
+        ? path.resolve(parsed.values.baseline)
+        : path.join(config.outputDir, `${config.filePrefix}_quality_report.json`)
+      : qualityCommandMode === "gate" && typeof parsed.values.baseline === "string"
+        ? path.resolve(parsed.values.baseline)
+      : undefined;
+    return qualityProject(projectRoot, config, qualityCommandMode, baselinePath, { openReport });
+  }
+
+  return analyzeProject(projectRoot, config, { openReport });
+}
+
+function buildConfig(
+  parsed: ReturnType<typeof parseCliArgs>,
+  configManager: ConfigManager,
+  paths: { projectRoot: string; configPath: string; tsConfigPath: string; dotEnvPath: string },
+): AnalysisConfig {
+  const { projectRoot, configPath, tsConfigPath, dotEnvPath } = paths;
   const cliConfig = configManager.loadFromCLI({
     output: typeof parsed.values.output === "string" ? parsed.values.output : undefined,
     format: typeof parsed.values.format === "string" ? parsed.values.format : undefined,
@@ -1402,36 +1476,7 @@ async function main(): Promise<number> {
     config.manualInputPath = path.resolve(projectRoot, config.manualInputPath);
   }
 
-  if (command === "graph") {
-    return graphProject(projectRoot, config);
-  }
-  if (command === "diff") {
-    const baselinePath = typeof parsed.values.baseline === "string"
-      ? path.resolve(parsed.values.baseline)
-      : path.join(config.outputDir, `${config.filePrefix}_report.json`);
-    if (parsed.values.watch) {
-      return watchDiff(projectRoot, config, baselinePath, openReport);
-    }
-    return diffProject(projectRoot, config, baselinePath, { openReport });
-  }
-  if (command === "quality") {
-    if (!qualityMode) {
-      printHelp("quality");
-      return 1;
-    }
-    // report は collect の別名 (非推奨)。上で告知済み
-    const qualityCommandMode = qualityMode === "report" ? "collect" : qualityMode;
-    const baselinePath = qualityCommandMode === "diff"
-      ? typeof parsed.values.baseline === "string"
-        ? path.resolve(parsed.values.baseline)
-        : path.join(config.outputDir, `${config.filePrefix}_quality_report.json`)
-      : qualityCommandMode === "gate" && typeof parsed.values.baseline === "string"
-        ? path.resolve(parsed.values.baseline)
-      : undefined;
-    return qualityProject(projectRoot, config, qualityCommandMode, baselinePath, { openReport });
-  }
-
-  return analyzeProject(projectRoot, config, { openReport });
+  return config;
 }
 
 const exitCode = await main();

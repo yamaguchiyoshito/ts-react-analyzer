@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { formatArtifactWarning, readJsonArtifact } from "./ArtifactJson.js";
+
 export interface AxeSummary {
   totalViolations: number;
   criticalCount: number;
@@ -21,7 +23,13 @@ export interface LighthouseSummary {
 export interface BrowserAuditSummary {
   axe: AxeSummary | null;
   lighthouse: LighthouseSummary | null;
+  /** 名前は一致したが読めなかった / 形式が違ったため無視した成果物 */
+  warnings: string[];
 }
+
+// basename 先頭一致。`axe.*\.json` だと taxes.json のような無関係なファイルも拾う。
+const AXE_FILE_PATTERN = /^axe([-.][\w.-]*)?\.json$/iu;
+const LIGHTHOUSE_FILE_PATTERN = /^lighthouse([-.][\w.-]*)?\.json$/iu;
 
 interface AxeLikeViolation {
   impact?: string;
@@ -53,10 +61,12 @@ export class BrowserAuditAnalyzer {
   async analyzeProject(projectRoot: string): Promise<BrowserAuditSummary> {
     const axeFiles = await this.findAxeFiles(projectRoot);
     const lighthouseFiles = await this.findLighthouseFiles(projectRoot);
+    const warnings: string[] = [];
 
     return {
-      axe: axeFiles.length > 0 ? await this.parseAxeFiles(axeFiles) : null,
-      lighthouse: lighthouseFiles.length > 0 ? await this.parseLighthouseFiles(lighthouseFiles) : null,
+      axe: axeFiles.length > 0 ? await this.parseAxeFiles(axeFiles, warnings) : null,
+      lighthouse: lighthouseFiles.length > 0 ? await this.parseLighthouseFiles(lighthouseFiles, warnings) : null,
+      warnings,
     };
   }
 
@@ -68,7 +78,7 @@ export class BrowserAuditAnalyzer {
       "reports/axe-results.json",
       "test-results/axe.json",
       "artifacts/axe.json",
-    ], ["reports", "test-results", "artifacts", ".artifacts"], /axe.*\.json$/iu);
+    ], ["reports", "test-results", "artifacts", ".artifacts"], AXE_FILE_PATTERN);
   }
 
   private async findLighthouseFiles(projectRoot: string): Promise<string[]> {
@@ -79,7 +89,7 @@ export class BrowserAuditAnalyzer {
       "reports/lighthouse-report.json",
       "test-results/lighthouse.json",
       "artifacts/lighthouse.json",
-    ], ["reports", "test-results", "artifacts", ".artifacts"], /lighthouse.*\.json$/iu);
+    ], ["reports", "test-results", "artifacts", ".artifacts"], LIGHTHOUSE_FILE_PATTERN);
   }
 
   private async findFiles(
@@ -111,17 +121,27 @@ export class BrowserAuditAnalyzer {
     return Array.from(files).sort();
   }
 
-  private async parseAxeFiles(files: string[]): Promise<AxeSummary> {
+  private async parseAxeFiles(files: string[], warnings: string[]): Promise<AxeSummary | null> {
     let totalViolations = 0;
     let criticalCount = 0;
     let seriousCount = 0;
     let moderateCount = 0;
     let minorCount = 0;
     let incompleteCount = 0;
+    const acceptedFiles: string[] = [];
 
     for (const filePath of files) {
-      const payload = JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
-      const results = this.collectAxeResults(payload);
+      const read = await readJsonArtifact(filePath);
+      if (!read.ok) {
+        warnings.push(formatArtifactWarning(filePath, read.error));
+        continue;
+      }
+      const results = this.collectAxeResults(read.value);
+      if (results.length === 0) {
+        warnings.push(formatArtifactWarning(filePath, "axe の JSON 形式 (violations 配列) ではないため無視しました"));
+        continue;
+      }
+      acceptedFiles.push(filePath);
 
       for (const result of results) {
         for (const violation of result.violations ?? []) {
@@ -149,6 +169,10 @@ export class BrowserAuditAnalyzer {
       }
     }
 
+    if (acceptedFiles.length === 0) {
+      return null;
+    }
+
     return {
       totalViolations,
       criticalCount,
@@ -156,18 +180,28 @@ export class BrowserAuditAnalyzer {
       moderateCount,
       minorCount,
       incompleteCount,
-      files,
+      files: acceptedFiles,
     };
   }
 
-  private async parseLighthouseFiles(files: string[]): Promise<LighthouseSummary> {
+  private async parseLighthouseFiles(files: string[], warnings: string[]): Promise<LighthouseSummary | null> {
     let performanceScore: number | null = null;
     let lcpSeconds: number | null = null;
     let ttiSeconds: number | null = null;
+    const acceptedFiles: string[] = [];
 
     for (const filePath of files) {
-      const payload = JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
-      const reports = this.collectLighthouseResults(payload);
+      const read = await readJsonArtifact(filePath);
+      if (!read.ok) {
+        warnings.push(formatArtifactWarning(filePath, read.error));
+        continue;
+      }
+      const reports = this.collectLighthouseResults(read.value);
+      if (reports.length === 0) {
+        warnings.push(formatArtifactWarning(filePath, "Lighthouse の JSON 形式 (categories / audits) ではないため無視しました"));
+        continue;
+      }
+      acceptedFiles.push(filePath);
 
       for (const report of reports) {
         const score = typeof report.categories?.performance?.score === "number"
@@ -198,11 +232,15 @@ export class BrowserAuditAnalyzer {
       }
     }
 
+    if (acceptedFiles.length === 0) {
+      return null;
+    }
+
     return {
       performanceScore,
       lcpSeconds,
       ttiSeconds,
-      files,
+      files: acceptedFiles,
     };
   }
 

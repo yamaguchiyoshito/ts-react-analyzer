@@ -41,6 +41,37 @@ const EXCLUDE_GROUP_PATTERNS: Record<string, string[]> = {
   ],
 };
 
+const VALID_OUTPUT_FORMATS: ReadonlySet<OutputFormat> = new Set<OutputFormat>(["csv", "markdown", "json", "html", "all"]);
+
+// analyzer.config.json で受け付ける最上位キー。typo (例: "excludePattern") を
+// 黙って無視すると設定が効いていないことに気づけないため、未知のキーは警告する。
+const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set<keyof AnalysisConfig>([
+  "analysisScope",
+  "qualityProfile",
+  "testPresenceSettings",
+  "excludeGroups",
+  "excludePatterns",
+  "outputFormats",
+  "outputDir",
+  "filePrefix",
+  "complexityThreshold",
+  "impactScoreThreshold",
+  "failOnImpactThreshold",
+  "maxFileSizeBytes",
+  "verbose",
+  "enableCache",
+  "cacheDir",
+  "logFile",
+  "manualInputPath",
+  "qualityGateBlockingMetricIds",
+  "qualityGateMonitoringMetricIds",
+  "maxTypeCheckRootNames",
+  "tsConfigPath",
+  "projectRoot",
+  "tsCompilerOptions",
+  "pathMappings",
+]);
+
 export class ConfigManager {
   private readonly defaults: AnalysisConfig;
 
@@ -62,8 +93,24 @@ export class ConfigManager {
     }
 
     const content = fs.readFileSync(configPath, "utf8");
-    const parsed = JSON.parse(content) as Partial<AnalysisConfig>;
-    return parsed;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content) as unknown;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`設定ファイルを JSON として解釈できません: ${configPath}\n${reason}`);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`設定ファイルの最上位は JSON オブジェクトである必要があります: ${configPath}`);
+    }
+
+    const record = parsed as Record<string, unknown>;
+    const unknownKeys = Object.keys(record).filter((key) => !KNOWN_CONFIG_KEYS.has(key));
+    if (unknownKeys.length > 0) {
+      console.warn(`警告: ${configPath} に未知の設定キーがあります (無視されます): ${unknownKeys.join(", ")}`);
+    }
+    this.validateFileConfig(record, configPath);
+    return record as Partial<AnalysisConfig>;
   }
 
   loadFromTSConfig(tsConfigPath: string): Partial<AnalysisConfig> {
@@ -99,10 +146,10 @@ export class ConfigManager {
     const cliConfig: Partial<AnalysisConfig> = {};
 
     if (typeof args.analysisScope === "string") {
-      cliConfig.analysisScope = this.normalizeAnalysisScope(args.analysisScope);
+      cliConfig.analysisScope = this.requireAnalysisScope("--analysis-scope", args.analysisScope);
     }
     if (typeof args.qualityProfile === "string") {
-      cliConfig.qualityProfile = this.normalizeQualityProfile(args.qualityProfile);
+      cliConfig.qualityProfile = this.requireQualityProfile("--quality-profile", args.qualityProfile);
     }
     if (typeof args.excludeGroups === "string") {
       cliConfig.excludeGroups = args.excludeGroups.split(",").map((value) => value.trim()).filter(Boolean);
@@ -111,7 +158,7 @@ export class ConfigManager {
       cliConfig.outputDir = args.output;
     }
     if (typeof args.format === "string") {
-      cliConfig.outputFormats = args.format.split(",").map((value) => value.trim()) as OutputFormat[];
+      cliConfig.outputFormats = this.parseOutputFormats("--format", args.format);
     }
     if (typeof args.prefix === "string") {
       cliConfig.filePrefix = args.prefix;
@@ -120,13 +167,13 @@ export class ConfigManager {
       cliConfig.excludePatterns = args.excludePatterns.split(",").map((value) => value.trim());
     }
     if (typeof args.complexityThreshold === "string") {
-      cliConfig.complexityThreshold = Number.parseInt(args.complexityThreshold, 10);
+      cliConfig.complexityThreshold = this.parseNonNegativeInteger("--complexity-threshold", args.complexityThreshold);
     }
     if (typeof args.impactScoreThreshold === "string") {
-      cliConfig.impactScoreThreshold = Number.parseInt(args.impactScoreThreshold, 10);
+      cliConfig.impactScoreThreshold = this.parseNonNegativeInteger("--impact-threshold", args.impactScoreThreshold);
     }
     if (typeof args.maxFileSize === "string") {
-      cliConfig.maxFileSizeBytes = Number.parseInt(args.maxFileSize, 10);
+      cliConfig.maxFileSizeBytes = this.parseNonNegativeInteger("--max-file-size", args.maxFileSize);
     }
     if (typeof args.cacheDir === "string") {
       cliConfig.cacheDir = args.cacheDir;
@@ -156,7 +203,7 @@ export class ConfigManager {
         .filter(Boolean);
     }
     if (typeof args.maxTypeCheckRootNames === "string") {
-      cliConfig.maxTypeCheckRootNames = Number.parseInt(args.maxTypeCheckRootNames, 10);
+      cliConfig.maxTypeCheckRootNames = this.parseNonNegativeInteger("--max-typecheck-root-names", args.maxTypeCheckRootNames);
     }
 
     return cliConfig;
@@ -192,10 +239,10 @@ export class ConfigManager {
     const envConfig: Partial<AnalysisConfig> = {};
 
     if (env.ANALYZER_ANALYSIS_SCOPE) {
-      envConfig.analysisScope = this.normalizeAnalysisScope(env.ANALYZER_ANALYSIS_SCOPE);
+      envConfig.analysisScope = this.requireAnalysisScope("ANALYZER_ANALYSIS_SCOPE", env.ANALYZER_ANALYSIS_SCOPE);
     }
     if (env.ANALYZER_QUALITY_PROFILE) {
-      envConfig.qualityProfile = this.normalizeQualityProfile(env.ANALYZER_QUALITY_PROFILE);
+      envConfig.qualityProfile = this.requireQualityProfile("ANALYZER_QUALITY_PROFILE", env.ANALYZER_QUALITY_PROFILE);
     }
     if (env.ANALYZER_EXCLUDE_GROUPS) {
       envConfig.excludeGroups = env.ANALYZER_EXCLUDE_GROUPS.split(",").map((value) => value.trim()).filter(Boolean);
@@ -204,7 +251,7 @@ export class ConfigManager {
       envConfig.outputDir = env.ANALYZER_OUTPUT_DIR;
     }
     if (env.ANALYZER_FORMATS) {
-      envConfig.outputFormats = env.ANALYZER_FORMATS.split(",").map((value) => value.trim()) as OutputFormat[];
+      envConfig.outputFormats = this.parseOutputFormats("ANALYZER_FORMATS", env.ANALYZER_FORMATS);
     }
     if (env.ANALYZER_PREFIX) {
       envConfig.filePrefix = env.ANALYZER_PREFIX;
@@ -216,13 +263,13 @@ export class ConfigManager {
       envConfig.cacheDir = env.ANALYZER_CACHE_DIR;
     }
     if (env.ANALYZER_MAX_FILE_SIZE) {
-      envConfig.maxFileSizeBytes = Number.parseInt(env.ANALYZER_MAX_FILE_SIZE, 10);
+      envConfig.maxFileSizeBytes = this.parseNonNegativeInteger("ANALYZER_MAX_FILE_SIZE", env.ANALYZER_MAX_FILE_SIZE);
     }
     if (env.ANALYZER_COMPLEXITY_THRESHOLD) {
-      envConfig.complexityThreshold = Number.parseInt(env.ANALYZER_COMPLEXITY_THRESHOLD, 10);
+      envConfig.complexityThreshold = this.parseNonNegativeInteger("ANALYZER_COMPLEXITY_THRESHOLD", env.ANALYZER_COMPLEXITY_THRESHOLD);
     }
     if (env.ANALYZER_IMPACT_SCORE_THRESHOLD) {
-      envConfig.impactScoreThreshold = Number.parseInt(env.ANALYZER_IMPACT_SCORE_THRESHOLD, 10);
+      envConfig.impactScoreThreshold = this.parseNonNegativeInteger("ANALYZER_IMPACT_SCORE_THRESHOLD", env.ANALYZER_IMPACT_SCORE_THRESHOLD);
     }
     if (env.ANALYZER_FAIL_ON_IMPACT_THRESHOLD) {
       envConfig.failOnImpactThreshold = env.ANALYZER_FAIL_ON_IMPACT_THRESHOLD === "true";
@@ -246,7 +293,7 @@ export class ConfigManager {
         .filter(Boolean);
     }
     if (env.ANALYZER_MAX_TYPECHECK_ROOT_NAMES) {
-      envConfig.maxTypeCheckRootNames = Number.parseInt(env.ANALYZER_MAX_TYPECHECK_ROOT_NAMES, 10);
+      envConfig.maxTypeCheckRootNames = this.parseNonNegativeInteger("ANALYZER_MAX_TYPECHECK_ROOT_NAMES", env.ANALYZER_MAX_TYPECHECK_ROOT_NAMES);
     }
 
     return envConfig;
@@ -437,6 +484,81 @@ export class ConfigManager {
       return value;
     }
     return undefined;
+  }
+
+  // ---- 入力値の検証 ------------------------------------------------------
+  // Number.parseInt の NaN や未知の列挙値を黙って通すと、`--impact-threshold abc
+  // --fail-on-impact` が何も警告せず exit 0 になる。値が不正なら理由を添えて失敗する。
+
+  private requireAnalysisScope(optionName: string, value: string): AnalysisScope {
+    const normalized = this.normalizeAnalysisScope(value.trim());
+    if (!normalized) {
+      throw new Error(`${optionName} の値 "${value}" は不正です。使用できる値: all, source-only`);
+    }
+    return normalized;
+  }
+
+  private requireQualityProfile(optionName: string, value: string): QualityProfile {
+    const normalized = this.normalizeQualityProfile(value.trim());
+    if (!normalized) {
+      throw new Error(`${optionName} の値 "${value}" は不正です。使用できる値: application, library-repo`);
+    }
+    return normalized;
+  }
+
+  private parseOutputFormats(optionName: string, value: string): OutputFormat[] {
+    const formats = value.split(",").map((entry) => entry.trim()).filter(Boolean);
+    const invalid = formats.filter((entry) => !VALID_OUTPUT_FORMATS.has(entry as OutputFormat));
+    if (invalid.length > 0) {
+      throw new Error(
+        `${optionName} に不正な値が含まれています: ${invalid.map((entry) => `"${entry}"`).join(", ")}。使用できる値: ${Array.from(VALID_OUTPUT_FORMATS).join(", ")}`,
+      );
+    }
+    return formats as OutputFormat[];
+  }
+
+  private parseNonNegativeInteger(optionName: string, value: string): number {
+    const trimmed = value.trim();
+    if (!/^\d+$/u.test(trimmed)) {
+      throw new Error(`${optionName} には 0 以上の整数を指定してください (指定値: "${value}")`);
+    }
+    const parsed = Number.parseInt(trimmed, 10);
+    if (!Number.isFinite(parsed) || !Number.isSafeInteger(parsed) || parsed < 0) {
+      throw new Error(`${optionName} には 0 以上の整数を指定してください (指定値: "${value}")`);
+    }
+    return parsed;
+  }
+
+  private validateFileConfig(record: Record<string, unknown>, configPath: string): void {
+    const label = (key: string): string => `${configPath} の "${key}"`;
+
+    if (record.analysisScope !== undefined) {
+      if (typeof record.analysisScope !== "string") {
+        throw new Error(`${label("analysisScope")} は文字列で指定してください。使用できる値: all, source-only`);
+      }
+      this.requireAnalysisScope(label("analysisScope"), record.analysisScope);
+    }
+    if (record.qualityProfile !== undefined) {
+      if (typeof record.qualityProfile !== "string") {
+        throw new Error(`${label("qualityProfile")} は文字列で指定してください。使用できる値: application, library-repo`);
+      }
+      this.requireQualityProfile(label("qualityProfile"), record.qualityProfile);
+    }
+    if (record.outputFormats !== undefined) {
+      if (!Array.isArray(record.outputFormats) || record.outputFormats.some((entry) => typeof entry !== "string")) {
+        throw new Error(`${label("outputFormats")} は文字列の配列で指定してください。使用できる値: ${Array.from(VALID_OUTPUT_FORMATS).join(", ")}`);
+      }
+      this.parseOutputFormats(label("outputFormats"), (record.outputFormats as string[]).join(","));
+    }
+    for (const key of ["complexityThreshold", "impactScoreThreshold", "maxFileSizeBytes", "maxTypeCheckRootNames"] as const) {
+      const value = record[key];
+      if (value === undefined) {
+        continue;
+      }
+      if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+        throw new Error(`${label(key)} には 0 以上の整数を指定してください (指定値: ${JSON.stringify(value)})`);
+      }
+    }
   }
 
   private defaultTestPresenceSettings(): TestPresenceSettings {
