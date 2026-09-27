@@ -1,14 +1,15 @@
 import { classifyFileType, getFileTypePurpose } from "./FileConventions.js";
 import type {
   AnalysisResult,
+  Dependency,
   DirectoryPurposeAuditReport,
   PurposeAlignmentFinding,
   PurposeAlignmentSeverity,
 } from "../types/index.js";
 
-const ROUTE_COMPLEXITY_LIMIT = 12;
-const SHARED_CODE_LINES_LIMIT = 40;
-const SHARED_COMPLEXITY_LIMIT = 8;
+const DEFAULT_ROUTE_COMPLEXITY_LIMIT = 12;
+const DEFAULT_SHARED_CODE_LINES_LIMIT = 40;
+const DEFAULT_SHARED_COMPLEXITY_LIMIT = 8;
 const REACT_MODULE_PATTERN = /^react(?:-dom)?(?:\/|$)/u;
 
 const SEVERITY_ORDER: Record<PurposeAlignmentSeverity, number> = {
@@ -17,11 +18,67 @@ const SEVERITY_ORDER: Record<PurposeAlignmentSeverity, number> = {
   low: 2,
 };
 
+export interface DirectoryPurposeAuditOptions {
+  /**
+   * 解析設定の complexityThreshold。指定すると Route の複雑度上限 (routeComplexityLimit)
+   * の既定値になり、Shared の複雑度上限はその 2/3 (切り上げ) になる。
+   * 未指定のときは従来どおり Route 12 / Shared 8 を使う (ReportGenerator 側の配線は別途)。
+   */
+  complexityThreshold?: number;
+  /** Route に許容する overallComplexity の上限 (既定: complexityThreshold ?? 12) */
+  routeComplexityLimit?: number;
+  /** Shared に許容する overallComplexity の上限 (既定: ceil(complexityThreshold * 2 / 3) ?? 8) */
+  sharedComplexityLimit?: number;
+  /** Shared に許容するコード行数の上限 (既定: 40) */
+  sharedCodeLinesLimit?: number;
+}
+
+interface ResolvedThresholds {
+  routeComplexityLimit: number;
+  sharedComplexityLimit: number;
+  sharedCodeLinesLimit: number;
+}
+
+function resolveThresholds(options: DirectoryPurposeAuditOptions): ResolvedThresholds {
+  const configured = typeof options.complexityThreshold === "number" && options.complexityThreshold > 0
+    ? options.complexityThreshold
+    : undefined;
+  return {
+    routeComplexityLimit: options.routeComplexityLimit ?? configured ?? DEFAULT_ROUTE_COMPLEXITY_LIMIT,
+    sharedComplexityLimit: options.sharedComplexityLimit
+      ?? (configured !== undefined ? Math.max(1, Math.ceil(configured * 2 / 3)) : DEFAULT_SHARED_COMPLEXITY_LIMIT),
+    sharedCodeLinesLimit: options.sharedCodeLinesLimit ?? DEFAULT_SHARED_CODE_LINES_LIMIT,
+  };
+}
+
+// 型のみの import (`import type { ReactNode } from "react"`) は実行時依存を生まないため、
+// レイヤ違反の判定からは除外する
+function isRuntimeDependency(dependency: Dependency): boolean {
+  return !dependency.isTypeOnly;
+}
+
+function isPascalCase(name: string): boolean {
+  return /^[A-Z][A-Za-z0-9]*$/u.test(name);
+}
+
+// `components/Button/index.tsx` のように、PascalCase のフォルダ名と同名のコンポーネントを
+// index に直接定義するのは一般的なフォルダ型コンポーネントの構成なので Barrel 違反にしない
+function isComponentFolderIndex(displayPath: string, componentNames: string[]): boolean {
+  const segments = displayPath.split("/");
+  const folderName = segments.length >= 2 ? segments[segments.length - 2] ?? "" : "";
+  if (!folderName || !isPascalCase(folderName)) {
+    return false;
+  }
+  return componentNames.includes(folderName);
+}
+
 export function auditDirectoryPurposes(
   results: AnalysisResult[],
   toDisplayPath: (filePath: string) => string = (filePath) => filePath,
+  options: DirectoryPurposeAuditOptions = {},
 ): DirectoryPurposeAuditReport {
   const findings: PurposeAlignmentFinding[] = [];
+  const thresholds = resolveThresholds(options);
 
   const normalize = (filePath: string): string => toDisplayPath(filePath).replace(/\\/gu, "/");
 
@@ -32,8 +89,9 @@ export function auditDirectoryPurposes(
     const complexity = result.complexity;
     const hasComponents = complexity.components.length > 0;
     const hasFunctions = complexity.functions.length > 0;
+    const runtimeDependencies = result.dependencies.filter(isRuntimeDependency);
     const usesReact = complexity.hooks.length > 0
-      || result.dependencies.some((dependency) =>
+      || runtimeDependencies.some((dependency) =>
         dependency.isExternal && REACT_MODULE_PATTERN.test(dependency.modulePath));
 
     const report = (rule: string, severity: PurposeAlignmentSeverity, issue: string, suggestion: string): void => {
@@ -58,7 +116,11 @@ export function auditDirectoryPurposes(
       );
     }
 
-    if (fileType === "Barrel" && (hasFunctions || hasComponents)) {
+    if (
+      fileType === "Barrel"
+      && (hasFunctions || hasComponents)
+      && !isComponentFolderIndex(displayPath, complexity.components.map((component) => component.name))
+    ) {
       report(
         "implementation-in-barrel",
         "medium",
@@ -77,7 +139,7 @@ export function auditDirectoryPurposes(
     }
 
     if ((fileType === "UI component" || fileType === "Layout") && hasComponents) {
-      const infrastructureTargets = result.dependencies
+      const infrastructureTargets = runtimeDependencies
         .filter((dependency) => !dependency.isExternal)
         .map((dependency) => normalize(dependency.target))
         .filter((target) => classifyFileType(target) === "API/Infrastructure");
@@ -91,11 +153,11 @@ export function auditDirectoryPurposes(
       }
     }
 
-    if (fileType === "Route" && complexity.overallComplexity >= ROUTE_COMPLEXITY_LIMIT) {
+    if (fileType === "Route" && complexity.overallComplexity >= thresholds.routeComplexityLimit) {
       report(
         "heavy-logic-in-route",
         "medium",
-        `Route の複雑度が ${complexity.overallComplexity} に達しています`,
+        `Route の複雑度が ${complexity.overallComplexity} に達しています (上限 ${thresholds.routeComplexityLimit})`,
         "画面の組み立て以外のロジックを Feature / Hook へ抽出し、Route を薄く保ってください",
       );
     }
@@ -111,7 +173,8 @@ export function auditDirectoryPurposes(
 
     if (
       fileType === "Shared"
-      && (complexity.codeLines >= SHARED_CODE_LINES_LIMIT || complexity.overallComplexity >= SHARED_COMPLEXITY_LIMIT)
+      && (complexity.codeLines >= thresholds.sharedCodeLinesLimit
+        || complexity.overallComplexity >= thresholds.sharedComplexityLimit)
     ) {
       report(
         "unclassified-shared-growth",
